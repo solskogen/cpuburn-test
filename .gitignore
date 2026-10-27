@@ -1,0 +1,6 @@
+/build/
+/floppy.img
+/dist/
+/.work_*/
+/work_int/
+__pycache__/

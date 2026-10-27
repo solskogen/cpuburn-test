@@ -1,0 +1,724 @@
+# Bare-metal CPU/chipset burn-in for 86Box
+
+Version **0.1.0 preview**. Licensed under [MIT](LICENSE).
+
+## TL;DR
+
+- **Purpose:** check CPU/FPU correctness and collect benchmark data when
+  changing 86Box's interpreter or dynamic recompiler. No single overall score.
+- **Build:** run `make` (defaults to GCC on x86 Linux and Clang on aarch64 Linux).
+  See [build requirements](#build-and-boot); Python is not needed to build
+  or package the bootable `floppy.img`.
+- **Run:** boot the floppy in your chosen 86Box machine, with an i486 or newer
+  CPU. No guest OS or hard disk is needed; the same image works regardless
+  of the host architecture. Optional Intel, AMD and Cyrix instructions are
+  feature-gated; unsupported features produce `SKIP`.
+- **Collect:** capture COM1 at 115200 baud, 8N1. Wait for `SUMMARY` and `DONE`;
+  the guest then halts. VGA and port `0xE9` also show results.
+- **Read:** `PASS` means the checked cases passed; `FAIL` is an assertion
+  mismatch; `FAULT` is an unexpected exception/watchdog; `SKIP` is untested
+  coverage. `DONE` alone does not mean success.
+- **Timing:** guest cycles/time are not host throughput. Keep image, guest
+  configuration and host conditions consistent when comparing builds.
+  `python tools/perf_report.py serial.log --output report.json` summarizes
+  a complete log; users decide how to assess regressions.
+- **Shorter runs:** `make clean && make BURN_SECONDS=1 TEST_SECONDS=1` keeps the selected
+  test cases but reduces repetition/stress and timing confidence. Defaults
+  are 10 and 5 guest seconds; invocations are never cut short.
+
+Builds **`floppy.img`**, a raw 1.44 MiB bootable floppy image. No installed OS,
+filesystem, hard disk, network, or guest disk writes are required. Results go to
+COM1 (115200, 8N1), port `0xE9`, and VGA text; `0x80` carries progress checkpoints.
+
+The primary purpose is to provide correctness evidence and workload-specific
+benchmark data when changing **86Box CPU/FPU emulation**, including its
+interpreter and dynamic recompiler. Users choose which builds to run and how
+to assess changes; the guest does not decide regression policy or produce a
+single overall score. Host architecture is not a guest requirement.
+Pentium MMX 233 MHz on Raspberry Pi 5 is one useful performance target, not a
+restriction or an achieved performance claim. Pentium II and real-hardware
+testing remain supported. The instruction baseline is i486, including
+486SX configurations without an FPU. Optional coverage follows CPUs and
+instruction sets implemented by 86Box, not an Intel-only target: CPUID and
+exception probes gate MMX, P6 instructions, FXSAVE and AMD 3DNow!, while
+Cyrix EMMI uses a restricted vendor/model gate. No SSE/SSE2, later SIMD,
+64-bit execution or CPUs outside 86Box's supported range are targeted.
+
+Coverage includes exhaustive 8-bit arithmetic flags and BCD cases; sampled
+8/16/32-bit ALU, shifts, multiply/divide, bit/atomic/string/prefix operations;
+branches and self-modifying code; x87 formats, arithmetic, rounding, constants,
+transcendentals, environment/exception state, P6 compares and FXSAVE; scalar
+reference checks for baseline MMX, baseline/enhanced 3DNow! and Cyrix EMMI;
+descriptor/privilege/interrupt paths;
+4 KiB/4 MiB/PAE paging, demand faults, permissions, accessed/dirty bits, TLB
+remapping and global pages; memory patterns/bandwidth/latency/unaligned/locked
+access; safe MSR/control-register probes; PIC/PIT/RTC, A20-on alias checks,
+DMA snapshots, read-only ROM and PCI enumeration; and a mixed timed burn.
+The source registries `tests_*.c` list the precise workloads and feature gates.
+
+## Coverage boundaries
+
+| Area | Source modules | Evidence and limits |
+|---|---|---|
+| Integer execution and translation | `tests_int.c`, `tests_corpus.c`, `tests_sweeps.c` | Arithmetic/defined flags, decoding, branches, SMC and code footprints; exhaustive only where explicitly stated, otherwise deterministic samples. |
+| x87 and MMX | `tests_fpu.c`, `tests_fp_edges.c`, `tests_mmx.c` | Results, formats, rounding, status/environment and scalar/exact references; not full x87 transcendental precision certification. |
+| AMD/Cyrix extensions | `tests_vendor.c` | Feature-gated baseline/enhanced 3DNow! and all twelve Cyrix EMMI opcodes; integer-only references, finite dyadic floating-point cases and documented reciprocal precision bounds. Not exhaustive floating-point range/rounding certification. |
+| Privilege, exceptions and restart | `tests_pmode.c`, `tests_heavy_pmode.c`, `tests_priority.c`, `tests_restart_complex.c` | Protected-mode architectural transitions and selected fault precedence/restart cases; not every combination of instructions, exceptions or pending interrupts. |
+| Paging and translated memory | `tests_paging.c`, `tests_heavy_paging.c`, `tests_mem.c` | Permissions, aliases, TLB invalidation and checked accesses; selected memory sizes/alignments, not a proof over all physical mappings. |
+| CPU/system state and sustained interactions | `tests_sys.c`, `tests_heavy_state.c`, `tests_burn.c` | Feature-gated control state, interrupts and mixed repetition; safe probes do not establish complete model-specific MSR behavior. |
+| Supporting platform | `tests_chipset.c` | Legacy PIC/PIT/RTC, A20 and limited DMA/ROM/PCI checks; not comprehensive motherboard/chipset validation. Network, IDE and other peripheral throughput are outside the primary scope. |
+
+`req` in each `TEST` record is the hexadecimal requirement bitmask defined
+in `kernel.h`. It explains eligibility, not everything a test exercises.
+`SKIP` retains the missing feature or runtime precondition; it is not coverage
+or a pass. Inspect the selected machine, feature gates and actual result
+inventory rather than assuming every CPU runs the same cases. 808x/286 are
+not supported by this protected-mode image; 386 results are explicitly
+warned as unreliable. Availability is not inferred from a CPU's marketing
+name or its age: a K6 without 3DNow! does not run 3DNow! tests, and a
+6x86 without MMX/EMMI does not run EMMI tests. A supported CPU model is
+not a promise of exhaustive model-specific instruction/MSR coverage.
+
+### AMD and Cyrix instruction workloads
+
+The same i486-built image contains these optional workloads. Standard MMX
+and FPU gates still apply. `CPUID.80000001:EDX[31]` enables baseline
+3DNow! tests; bit 30 additionally enables the enhanced instructions
+implemented for K6-2+/K6-III+ in 86Box. This also permits other supported
+86Box CPUs advertising baseline 3DNow!, without assuming AMD ownership.
+Raw extended CPUID bits and decoded capabilities appear in `CPU` records.
+Later AMD extended-MMX/SSE instructions are deliberately not included.
+
+| Record | Instructions/behavior | Cases per invocation at scale 8 |
+|---|---|---:|
+| `3dnow_float` | PFADD/PFSUB/PFSUBR/PFMUL/PFACC, PFCMPEQ/PFCMPGE/PFCMPGT and PFMIN/PFMAX; signed finite integer inputs with exact binary32 references, including signed multiplication zero. | 30,720 |
+| `3dnow_convert` | PI2FD and PF2ID; exact conversion and fractional truncation with positive/negative lane values. | 6,144 |
+| `3dnow_integer` | PAVGUSB rounded unsigned-byte averages and AMD PMULHRW signed rounded products. | 6,144 |
+| `3dnow_reciprocal` | PFRCP/PFRSQRT low-lane broadcast, plus documented PFRCPIT1/PFRSQIT1/PFRCPIT2 refinement sequences. Positive powers of four; initial relative-error bounds of 2^-14 (reciprocal) / 2^-15 (reciprocal square root), final bounds of 2^-23. | 2,048 sequences |
+| `3dnow_state` | FEMMS empties MMX tags and permits exact x87 integer use; PREFETCH/PREFETCHW preserve flags and the referenced bytes. Cache-hit/timing effects are not asserted. | 1,024 transitions |
+| `3dnow_enhanced_float` | PFNACC/PFPNACC horizontal subtraction/mixed accumulation. | 6,144 |
+| `3dnow_word_convert` | PI2FW word selection and PF2IW truncation, signed saturation and sign extension into both dwords; poisoned unused input words and destination bits expose lane/preservation mistakes. | 6,144 |
+| `3dnow_swap` | PSWAPD swaps both dwords, including arbitrary bit patterns. | 3,072 |
+| `cyrix_emmi_arithmetic` | PAVEB, PADDSIW, PMAGW, PDISTIB, PSUBSIW, PMULHRWC, PMULHRIW and PMACHRIW; rounding, saturation, implicit destinations and unchanged source registers. | 28,672 |
+| `cyrix_emmi_moves` | PMVZB/PMVNZB/PMVLZB/PMVGEZB byte masks, preserving unselected bytes, mask and source. | 8,192 |
+
+`ops` counts packed instruction cases or the sequences/transitions shown
+above, not scalar lanes or a universal instruction count. 3DNow! arithmetic
+and conversion tests include register, memory and same-register source/destination
+forms. EMMI checks both even/odd specified registers and their implicit partners;
+memory-only instructions are never tested with invalid register operands.
+
+EMMI has no ordinary CPUID feature bit. Only `CyrixInstead`, family 6,
+model 0 with MMX (6x86MX/MII) may access Cyrix configuration ports.
+The workloads temporarily enable CCR7.EMMX, preserving CCR3 mapping and
+restoring both configuration registers even after a guarded fault/watchdog.
+Other CPUs skip without touching these ports. Tests do not enable CPUID
+on CPUs whose firmware has disabled it; those cannot satisfy this EMMI gate.
+Equal/opposite PMAGW magnitude ties are avoided because the reference used
+here does not specify their tie-breaking rule.
+
+The integer-only references follow AMD's
+[3DNow! manual, 21928G](https://kib.kiev.ua/x86docs/AMD/AMD-3DNow/21928G.pdf)
+and [extension manual, 22466D](https://kib.kiev.ua/x86docs/AMD/AMD-3DNow/22466D.pdf),
+and the Cyrix instruction descriptions in the
+[NASM 0.98.39 manual](https://github.com/netwide-assembler/nasm/blob/nasm-0.98.39/doc/nasmdoc.src).
+They do not use 86Box results as expected values. NaNs, infinities, denormal
+range/underflow cases, general reciprocal inputs and all rounding cases are
+not exhaustively covered. A mismatch remains `FAIL`, not an emulator-specific
+exception to the reference.
+
+## Heavy interaction workloads
+
+### CPU execution-boundary workloads
+
+These five records target execution/state boundaries that matter to 86Box's
+interpreter and recompiler. They assert architectural results independently;
+agreement between two emulators or execution engines is not their oracle.
+The same static instruction sites are reused, but the guest cannot prove
+that a particular instruction was translated or linked by the host.
+
+| Record | Checked behavior | Cases per invocation at scale 8 |
+|---|---|---:|
+| `int_flags_boundaries` | ADD/SUB result and all six defined arithmetic flags across taken JMP and CALL/RET, then SETcc and ADC/SBB consumers; edge values plus seeded inputs. | 4,096 producer/consumer cases |
+| `int_partial_boundaries` | AL, AH and AX writes preserve the other EAX bits across branches/calls; full-width snapshots and an AH-dependent result. | 8,192 cases |
+| `int_divide_state` | DIV by zero, unsigned quotient overflow and signed quotient overflow deliver #DE at the faulting EIP, preserving dividend and divisor registers both in the exception frame and after handler return. Undefined division flags are not asserted. | 3,072 faults |
+| `mmx_x87_transitions` | FNSAVE/FRSTOR around MMX arithmetic and EMMS, MMX tag/TOP state, empty tags after EMMS, and exact integer x87 results plus final tags/TOP. | 2,048 transitions |
+| `heavy_pm_code_context` | Repeated far calls to identical code bytes at the same offset/base/selector while alternating the code descriptor's default operand size. Both 16- and 32-bit decoding paths must return the correct result. | 32,768 calls |
+
+`ops` counts the cases/faults/transitions/calls in this table, **not guest
+instructions**. The first three and code-context record require i486;
+MMX/x87 transitions require both features and otherwise explicitly skip.
+Context changes use guarded descriptor restoration; the divide handler is
+restored after the workload. These additions do not claim new coverage of
+all Jcc conditions, page-fault commit rules, real-mode transitions, SMM or
+every x87 exception. Existing paging/restart and FPU tests cover separate cases.
+Use `ONLY` with these exact names for an isolated diagnostic image.
+
+`corpus_integer_sequences` generates deterministic 32-instruction programs
+mixing 8/16/32-bit ADD/ADC/SUB/SBB/CMP, AND/OR/XOR, ROL/ROR, NOT and INC/DEC
+across four registers. At default scale it regenerates 16,384 blocks at
+64 instruction alignments and executes each eight times: **4,194,304 corpus
+instructions**, with four register/flag checkpoints per block execution.
+These counts describe one invocation; the sustained harness repeats it.
+Every opcode-group/width combination must occur. Arithmetic results and
+carry/borrow use an independent bit-serial reference; only architecturally
+defined flags are compared. A failure logs the global seed, vector seed,
+block/reuse/checkpoint, initial registers and the full instruction prefix
+needed to reproduce it. This is a constrained, safe instruction corpus,
+not unconstrained random privileged/invalid-opcode fuzzing.
+
+The `fdiv_v*_rn/rd/ru/rz` records add the notorious 4,195,835 / 3,145,727 Pentium FDIV case,
+nearby mantissas and scaled/signed ratios with exact raw x87 reference values
+under all four rounding controls. `fprem_v*` and `fprem1_v*` exercise FPREM and FPREM1
+with extreme extended-range exponents, signed zeros, nearest-even ties,
+denormals and nonfinite status checks. Each of the 15 FDIV vectors and four
+rounding controls has its own record (60 total); each of 11 remainder
+vectors/instructions has its own record (22 total). Four classification records
+independently exercise FPREM/FPREM1 denormals, finite/infinity and invalid
+infinity/finite. A failure in one record cannot hide any other vector or
+rounding mode. Default totals on a passing CPU are 122,880 divisions,
+45,056 remainder cases and 32,768 classification cases. Individual records
+still fail fast on their first bad iteration. Iterative C2 completion is bounded at 2,048
+steps: noncompletion is a reported failure, not an infinite spin.
+The embedded tables can be independently rechecked without floating-point
+arithmetic using `python tools/check_fp_edges.py` (exact integer/rational
+rounding and remainder identities).
+Negative-quotient condition bits are diagnostic only because their signed
+encoding is ambiguous in the reference wording; exact signed remainders and
+nonnegative quotient bits are still asserted.
+
+`heavy_decode_align` sweeps offsets 0–63 and 4093–4095 with prefixed,
+variable-length i486 code and both branch paths (1,852,416 instructions at
+default scale). `heavy_decode_worksets` covers executable footprints from
+4 KiB to 4 MiB, contrasting code rewrite/taken-branch invalidation with
+unchanged reuse (1,245,168 instructions with full-size owned RAM).
+`heavy_mem_align` covers 13 footprints from 1 KiB to 4 MiB, the same 67
+offsets, and 1/2/4/8-byte accesses with bytewise reference checks
+(1,363,584 operations). Eight-byte accesses use integer halves, not optional
+MMX/SSE. Available owned RAM caps the largest footprint and is logged.
+Timing notes give per-size results and the worst alignment; memory timings
+include the checked loop's initialization/reference overhead, not pure
+load/store latency. The sweep is substantial on slow hardware (about
+62 seconds for the memory record on the tested 33 MHz 86Box 486).
+
+The paged-code/restart additions include six separate records: code modified
+through physical aliases and remapped execution pages; linked direct/indirect
+code blocks; cross-page instruction fetch and data access; partially completed
+forward/backward REP MOVSD; and split-stack PUSH/POP fault restart. Assertions
+check final results and fault-time architectural state, including preserved
+registers. At the default scale these execute 53,477,376 SMC instructions,
+1,048,576 linked blocks, 81,920 real page faults and 2,097,152 MOVSD elements.
+These are workloads with fixed counts; they do not merely sleep for a duration.
+They use owned memory and restore mappings/hooks after guarded failures.
+
+Six exception-priority records add 98,304 default cases: segment-limit #GP
+before operand paging; LGDT/LIDT privilege #GP; invalid LOCK MOV #UD;
+nonpresent/protection page-fault error bits; instruction-fetch faults before
+operand access; and mapped ring-3 alignment controls. They check defined
+exception/state outcomes rather than unspecified overlaps; in particular,
+same-data-access #AC versus #PF ordering is not asserted. Missing mandatory
+traps remain failures. Setup and execution are guarded with mapping/hook cleanup.
+
+Complex restart records exercise mixed 16/32-bit PUSHA/POPA, ENTER/LEAVE,
+same-privilege far CALL/RETF and same-ring IRET across page boundaries.
+The faulting stacks belong to ring 3 so faults can use a safe ring-0 TSS
+stack. Checks cover restart EIP, CPL, CR2, defined page-fault bits, final
+registers/frames and guard bytes. They deliberately do not require rollback
+of intermediate memory stores or assert unspecified fault-time registers.
+Default scale runs 32,768 cases per complex record (131,072 total), with
+mode-specific instruction/fault counts logged separately.
+
+Eight protected-mode stress records add 16-bit code/stack/address-size paths,
+LDT/TI descriptor use, expand-down boundaries, ring-3 call gates with parameter
+copying and RETF, privilege checks, VME/PVI virtual flags/VIP faults, and
+interrupt shadows. Default coverage includes about 4.2 million 16-bit operations
+and 16,384 call-gate transitions. STI/IRET use 64 actual pending IRQ samples;
+MOV SS/POP SS use pending single-step debug traps (not a claim to test every
+asynchronous IRQ ordering). Unsupported VME/PVI is skipped through feature gates.
+
+Mixed-state stress alternates seeded integer/memory work, page remaps, x87 and
+MMX with software interrupts, checking preserved state against scalar references.
+At default scale it performs 131,072 iterations (about 1.84 million operations
+on a 486 and 2.36 million with MMX). Separate state tests exercise
+FNSAVE/FRSTOR and feature-gated FXSAVE/FXRSTOR. Active LAPIC tests exercise
+periodic and one-shot interrupt delivery with PIT deadlines and explicit EOI;
+they skip absent/disabled/relocated/x2APIC configurations and a preexisting
+active timer rather than taking it over. They do not reroute the PIC, send
+IPIs, or test other processors.
+At default scale the interrupt-state test delivers 32,768 software interrupts;
+each save/restore record runs 65,536 checked iterations. LAPIC periodic stress
+requires at least 2,048 deliveries over at least two seconds; one-shot stress
+rearms and checks 1,024 deliveries. Actual periodic count varies with timing.
+
+## Build and boot
+
+Requirements: GNU make, GNU coreutils, NASM and a C compiler/linker/objcopy
+targeting i386 ELF. Local release packaging also uses GNU tar and gzip. Python is **not**
+used to build or package the image; Python 3.10+ is only needed for the
+optional host tests, runner and reporting tools. Native
+x86 Linux can use GCC and GNU binutils; Clang uses LLVM tools. The supplied
+Makefile targets a Unix-like build environment and supports both x86-64 and
+aarch64 Linux build hosts.
+No multilib C library or cross-compiled OS is needed. Compiler support
+routines (64-bit division, `memset`/`memcpy`/`memmove`/`memcmp`) are built from
+source with the same i486 instruction baseline.
+
+```sh
+make
+make clean && make CC=clang
+make run-qemu CPU=pentium2
+```
+
+On **aarch64 Linux**, `make` defaults to Clang's built-in cross-target support:
+
+```sh
+# Install host-native clang, lld, llvm (including llvm-objcopy), NASM,
+# GNU make and GNU coreutils (plus tar/gzip for packaging), then:
+make
+make release
+```
+
+The Makefile explicitly selects `--target=i386-unknown-linux-gnu`,
+`ld.lld -m elf_i386` and `llvm-objcopy`; it never asks an aarch64 system
+linker to link i386 objects. NASM runs on the build host and emits x86 code.
+No x86 runtime, multilib libc, target sysroot or emulator is required to build.
+
+Alternatively, install an i386/i686-targeting GNU cross-toolchain:
+
+```sh
+# Debian/Ubuntu tool names (also available as aarch64-host packages):
+make CROSS_COMPILE=i686-linux-gnu-
+make release CROSS_COMPILE=i686-linux-gnu-
+# A bare-metal toolchain can use CROSS_COMPILE=i686-elf- instead.
+```
+
+`CROSS_COMPILE` supplies the default GCC, linker and objcopy prefixes.
+Explicit `CC`, `LD`, `OBJCOPY` and `NASM` settings take precedence,
+including tool installations with versioned executable names. Do not select
+an aarch64-targeting GCC: the **host** may be aarch64, but the **output**
+must remain 32-bit i486-compatible x86. Building and running the image are
+separate: the image still boots inside an x86 PC emulated by 86Box on either host.
+
+Run `make clean` when changing compilers, flags or test settings; make tracks
+source/header dependencies, not command-line changes. Compilation, linking,
+image creation and packaging are direct Makefile recipes, without helper
+scripts or generated provenance headers. `VERSION` supplies the guest version;
+the compiler's built-in version string supplies its `BUILD` identification.
+Serial parsers/reports retain this record, including with plain COM1 logs.
+
+Boot the image as a **legacy BIOS floppy**, preferably write-protected, with
+at least 576 KiB conventional RAM and 8 MiB total RAM (16–32 MiB recommended).
+Smaller extended-memory configurations skip workloads requiring larger buffers.
+This is not a FAT filesystem image; do not mount it or copy files onto it.
+
+The same legacy-PC BIOS boot path is intended for real PCs and VMs. Use a
+BIOS/CSM-capable machine, a Hyper-V Generation 1 VM, or the BIOS firmware option
+in VMware/VirtualBox. UEFI-only systems and Hyper-V Generation 2 cannot boot this
+image directly. A floppy controller, legacy PIC/PIT, and PC-compatible port I/O
+are assumed; this is not a UEFI, ARM, or SMP test.
+
+There is **one unified run**, with no correctness/profiling mode switch.
+Each supported workload gets a checked warm-up invocation, followed by repeated
+checked invocations in a window lasting **at least `TEST_SECONDS` (default 5)
+guest seconds**.
+Assertions remain active throughout. Warm-up failures remain FAIL even when
+later invocations pass, preserving cold dynarec/cache bugs. Assertion failures
+do not terminate the sustained window; unexpected faults or unavailable safe
+preconditions do. Feature-gated skips do not wait for a sample window.
+
+The default is one suite round and the final mixed burn, whose individual
+invocations last 10 seconds. Heavy workloads use `HEAVY_SCALE=8`; each invocation
+does real fixed-count work, rather than sleeping to fill its window.
+The default inventory is 281 records, including unavailable-feature skips.
+Suite duration varies with CPU, applicable features and invocation lengths;
+it is not a fixed wall-clock deadline. Guest `ms`/`cyc` are emulated time; emulator speed is measured on
+the host side by the controller below. The host controller below can extend this
+to obtain enough actual emulator CPU time. Standalone real hardware needs no
+controller and ends automatically. Overall duration depends on emulation speed
+and CPU model.
+Overrides rebuild the affected code automatically:
+
+```sh
+make clean && make ROUNDS=1 BURN_SECONDS=5 WATCHDOG_SECONDS=90
+make clean && make ROUNDS=4 HEAVY_SCALE=8 BURN_SECONDS=20
+# Shorter validation build; identical algorithm and checks, less sampling time:
+make clean && make ROUNDS=1 BURN_SECONDS=1 TEST_SECONDS=1
+# Only the named tests (comma-separated, exact names); ids match a full run:
+make clean && make ONLY=corpus_integer_sequences,int_smc
+```
+
+`HEAVY_SCALE` accepts 1–32 and scales the new stress workloads, not every legacy
+test. The deterministic seed is defined in `kernel.h`, not exposed as a
+normal Makefile setting; it is logged with the scale in
+`CFG` so a failing vector can be reproduced. `ROUNDS` accepts 1–32. Larger
+scales on a slow 486 may need a larger `WATCHDOG_SECONDS`; a watchdog abort is
+a `FAULT`, not a successful shortened benchmark. The watchdog applies to each
+invocation, not the whole sustained window. `TEST_SECONDS` accepts 1–3600;
+use the default 5 or more for profiling, not the shortened validation build.
+`ONLY` runs just the listed tests and logs them as `CFG only=`; `SUMMARY`
+counts only those. A clean default rebuild selects the full suite.
+
+After printing `SUMMARY` and `DONE`, the guest **halts**. It does not reset or
+write magic shutdown ports. Stop the VM externally after collecting its log.
+
+## Results for automation
+
+Example record (numbers are illustrative):
+
+```text
+BEGIN r=1 name=workload phase=first
+WORK phase=warmup r=1 id=1 name=workload
+WORK phase=sample r=1 id=1 name=workload
+WORK phase=end r=1 id=1 name=workload
+NOTE test=workload detail=value
+TEST r=1 name=workload status=PASS ms=30000 cyc=123456789 unit=tsc ops=100000000 sum=12345678 iterations=1000 warmup_ms=30 warmup_failed=0 failed_iterations=0 id=1 iteration_ops=100000
+RUNTIME scope=test r=1 id=1 name=workload total_ms=30120 warmup_ms=30 sample_ms=30000 overhead_ms=90 resolution_ms=10
+SUMMARY rounds=2 tests=100 pass=80 fail=0 skip=20 fault=0 ms=2500000
+RUNTIME scope=suite total_ms=2500000 warmup_ms=3000 sample_ms=2400000 overhead_ms=96000 suite_overhead_ms=1000 resolution_ms=10
+DONE
+```
+
+`RUNTIME` records show where **guest time** goes, measured with the guest's
+100 Hz timer on any host. Per test, `total_ms` covers the whole test,
+including skip handling, notes and result output. `warmup_ms` and `sample_ms`
+time only the test invocations; `overhead_ms` is the remainder, including state
+restoration, arena reset, dispatch and serial output. Individual invocation
+times have 10 ms quantization error, which can accumulate across repetitions;
+for tiny tests, the remainder is not a precise measurement of framework cost.
+The suite record sums these, and `suite_overhead_ms` covers work between tests
+and the runtime records themselves. Use total durations to find which tests
+dominate a full run before trimming anything. Guest time is not host cost;
+host CPU per workload comes from the 86Box runner. `perf_report.py` validates
+and prints the breakdown, including skips and failed tests. These records
+do not change correctness checks, warm-up, sampling duration or test scale.
+
+Collect a complete COM1 log in 86Box on any host, then summarize it with
+Python 3 (no QEMU or host profiler required):
+
+```sh
+python tools/perf_report.py serial.log --output runtime-report.json
+```
+
+The report lists the ten longest test records and retains every runtime
+record in JSON. Older logs remain supported, with the breakdown marked
+unavailable. The guest totals exclude firmware boot and guest initialization.
+
+`PASS` means the workload's assertions passed, **not** exhaustive ISA compliance.
+`SKIP` gives the reason a feature or safe test precondition is unavailable.
+`FAIL` is an assertion mismatch (`FAILDETAIL` provides context); `FAULT` is an
+unexpected CPU exception or a watchdog recovery, with vector, error code, EIP,
+and CR2. Missing `DONE`, `FATAL`, or a nonzero fault/fail count is not success.
+On the supported i486+ baseline, missing required alignment-check and hardware
+breakpoint traps are now **FAIL**, with `required_trap_missing=AC/DB`
+diagnostics, rather than SKIP. Optional instruction/feature absence remains
+SKIP through the existing requirement gates. More FAIL records after splitting
+the FP vectors or tightening trap accounting do not by themselves imply a
+new emulator regression: the coverage and record inventory changed.
+
+`cyc` is a guest TSC delta where available, otherwise a PIT count delta
+(1,193,182 Hz). `ms` comes from the 100 Hz guest timer and has 10 ms granularity.
+TSC timestamps are bracketed by CPUID serialization; this adds fixed overhead
+and may trap to the host hypervisor. A counter regression invalidates timing,
+not the workload's correctness result.
+TSC rate need not equal the configured/emulated clock; on VMs it may be a
+host-derived invariant counter. A logged MHz value is a PIT calibration, not a
+claim about emulation throughput. `ops` is a workload-specific operation count,
+not a universally comparable instruction count. Checksums may intentionally
+include CPU-specific results and must not replace the individual assertions.
+`ms`, `cyc`, and 64-bit `ops` aggregate measured invocations, excluding warm-up.
+`iterations` counts measured invocations; `iteration_ops` is their constant
+operation count, or zero if it varied. `failed_iterations` includes warm-up.
+On failure, the final `TEST` record also retains the first failing invocation:
+`failure_iteration=0` is warm-up, `1` is the first measured invocation,
+and `failure_phase` names the phase. `seed` repeats the configured seed.
+For `CHECK_EQ`, `got` and `want` retain the first mismatching 32-bit values
+even if the failure first occurs during quiet sampling. Plain `CHECK` has
+no automatic operand values; its expression and line are retained.
+These are not an automatic instruction/register trace: detailed case indices,
+input operands and initial state are supplied by workload-specific diagnostics
+where implemented. The seed does not control every legacy test's fixed vectors.
+Full logs remain the authoritative evidence; the shared parser preserves
+warm-up `FAILDETAIL` lines as `failure_details` in each parsed test record.
+Repeated checks and failure counts are unchanged.
+
+`ops_constant=1` means measured invocations had one identical nonzero operation
+count. It is not a claim that different workloads count equivalent operations.
+`ms_resolution=10`, `ms_unresolved=1`, and `counter_unresolved=1` explicitly
+describe coarse or zero timing. Absence of a resolved duration is not zero
+cost. Reports retain per-record `measurement_notes` for unavailable/invalid
+timing, missing or inconsistent operation counts, and non-PASS results;
+these notes describe data quality, not master-versus-branch policy.
+Workload IDs are unique across rounds. `WORK` boundaries distinguish warm-up
+from sampling and exclude buffered diagnostics from host attribution.
+
+Compare runs with identical image, machine/chipset configuration, CPU selection,
+RAM, emulator version, dynamic-recompiler mode, and host conditions. Keep both
+**host elapsed time** and guest timing: 86Box may maintain a configured guest
+clock while using different amounts of host CPU. Neither timing source alone
+establishes a speedup. Benchmark intervals include checking/dispatch overhead;
+`NOTE` output is buffered until the interval ends. Repeated diagnostics are
+suppressed during sampling, not the checks themselves. State restoration,
+arena reset and dispatch occur between invocations; the
+configured minimum and `sample_window_ms` include them, whereas guest invocation
+counters do not. This prevents tiny or fail-fast invocations from stretching a
+window indefinitely just because the guest timer cannot resolve each call.
+
+For a QEMU smoke matrix and JSON records:
+
+```sh
+python tools/qemu_smoke.py
+python tools/qemu_smoke.py --cpus 486 pentium2 --memory 8 --output build/low-memory
+python tools/qemu_smoke.py --cpus host --accel kvm --output build/kvm
+```
+
+The runner boots the actual image read-only, requires nonempty test results,
+`SUMMARY`, and `DONE`, rejects FAIL/FAULT/FATAL, terminates the halted VM, and
+retains serial logs, QEMU diagnostics, host duration, and parsed records.
+`build/kernel.elf` and `build/kernel.map` retain symbols for fault investigation.
+
+For distributions and automated regression comparisons, build with four or
+more rounds, then discard the first round from timing:
+
+```sh
+python tools/qemu_smoke.py --cpus host --accel kvm --output build/perf-a
+python tools/perf_report.py build/perf-a/results.json --discard-rounds 1 \
+  --output build/baseline.json
+python tools/qemu_smoke.py --cpus host --accel kvm --output build/perf-b
+python tools/perf_report.py build/perf-b/results.json --discard-rounds 1 \
+  --baseline build/baseline.json --output build/comparison.json
+```
+
+The report contains min/median/p95/max guest counter and millisecond costs per
+operation, correctness failures, source/image hashes, configuration, and host
+boot-to-DONE durations. `--cpu` selects one CPU from a matrix JSON. Complete
+serial logs are also accepted, but do not establish an image hash. The first
+round is labeled `phase=first` and later rounds `phase=repeat`: these are not
+claims of cold caches or a clean dynarec cache. Compare the explicit
+code-generation/invalidation workloads to distinguish those paths.
+
+Baseline gating requires matching workload inventory, configuration (including
+seed/scale/duration), timer units, and fixed operation counts per invocation.
+The sustained protocol permits different numbers of identical invocations and
+normalizes by their total operations; variable-count workloads cannot establish
+this comparison. Legacy logs still require equal total operation counts. Image and environment
+changes require explicit `--allow-image-change` / `--allow-environment-change`;
+the latter is appropriate for an intentional interpreter-versus-dynarec
+comparison. Different emulator builds/labels may be compared, but cannot be
+pooled into a single distribution. Default regression threshold is 10% with
+at least three timing samples on each side. Exit codes are 0 for success,
+1 for correctness failures or measured regressions, and 2 for invalid input
+or an inconclusive baseline gate. Discarding warm-up timing never hides a
+correctness failure. SKIP/FAULT/FAIL, zero-operation, and invalid-counter
+records cannot establish a passing performance comparison.
+Host median comparisons are also reported; `--gate-host-time` additionally
+enforces the threshold on host time and requires the minimum number of
+independent boots on both sides (multiple rounds are not independent boots).
+Host metadata, CPU-time targets and perf enablement must match when pooling
+86Box captures. With host-controlled sampling, faster emulation can simply do
+more invocations within the same CPU budget: prefer per-phase capacity and
+counter/operation data, not boot-to-DONE time, as the optimization signal.
+
+Guest cycles are **not host throughput**. Host durations include boot and
+logging; 86Box durations also include automation stepping/capture overhead.
+Keep the step size and host conditions identical, collect several independent
+boots for host-time distributions, and do not interpret a single small timing
+change as a regression.
+
+For an automation-enabled local 86Box build with installed ROMs:
+
+```sh
+python tools/run_86box.py --profile 486dx --bios-f1 \
+  --expect DONE
+python tools/run_86box.py --profile pentium --dynarec off --label interpreter \
+  --bios-f1 --expect DONE
+# Primary target; run this on the Pi 5 to measure its actual capacity:
+python tools/run_86box.py --profile mmx --bios-f1 --perf
+```
+
+Profiles are `486dx`, `486sx`, `pentium`, `mmx`, `pii`, `pii-bf6`, `k6-2`,
+`k6-2+` and `6x86mx`; use `--rompath` if
+ROMs are not in a standard local location. Firmware is never downloaded.
+This optional runner requires **Linux**, Xvfb, Python 3.10+, installed local
+ROMs and a compatible AUTOMATION-enabled 86Box binary. Supply `--emulator`
+when 86Box is not in the default sibling checkout location. It is not required
+to boot the floppy manually on Windows, macOS or Linux hosts.
+The runner uses an isolated copied floppy/configuration, captures COM1,
+screen state, emulator information and host elapsed time under `build/86box-*`.
+It requires this 86Box checkout's automation interface, not necessarily an
+unmodified upstream binary. `--expect DONE` checks completion, **not zero
+assertion failures**: inspect `serial.log` and `SUMMARY`. Correctness mismatches
+in 86Box are intentional useful output; do not silently remove checks to make
+an emulator appear correct. BIOS configuration/fresh CMOS can require F1.
+
+### Sustained host profiling
+
+The runner defaults to Pentium MMX **233 MHz**, 250 guest-ms automation steps,
+and **30 actual process CPU seconds per sampled workload**, with 24 guest-hour
+and eight host-hour overall deadlines. `--sample-cpu-seconds` changes that
+minimum; `--step-ms` controls boundary uncertainty. Linux `/proc/PID/stat`
+accounts for **all emulator threads**, not just the CPU core thread. Runs
+require the local automation-enabled 86Box build; standalone floppy boot does
+not require this interface.
+
+The runner renews a 30-guest-second serial lease while more host CPU time is
+needed, then releases it. A release never shortens the guest minimum. If the
+controller disappears, the last lease expires, so the guest does not wait
+forever. The timer interrupt drains serial control frames to avoid overrunning
+the UART during long invocations; releases are retransmitted until the phase
+ends. Interrupt-disabled intervals can defer receipt, and complete invocations
+can overshoot the requested minimum. Frames are `+IIIIIIII\n` / `-IIIIIIII\n`, using eight
+hexadecimal digits for the current workload ID. Malformed and stale frames
+cannot extend a different workload.
+
+`result.json` includes `workload_capture`: separate warm-up/sample phases,
+interior-step host wall time, process CPU time, guest milliseconds, aggregated
+workloads, and explicit undersampling warnings. Steps containing a phase
+boundary or partial serial line are excluded, not assigned speculatively.
+`full_speed_capacity_percent` is guest time / unthrottled step wall time × 100:
+below 100 identifies a path unable to keep up on that host under these
+conditions. It is **capacity, not the GUI's actual-speed reading**, and is not
+a Pi 5 measurement unless run there. The CPU-normalized ratio additionally
+charges every emulator thread; it is not a single-thread cycle estimate.
+Boot, serial capture and non-step control time are recorded separately.
+
+`--perf` explicitly attaches Linux `perf record` at 99 Hz with callchains and
+`CLOCK_MONOTONIC` timestamps. It saves `perf.data`, `perf.script`, diagnostics,
+and per-ID leaf/inclusive hotpaths aligned only to interior sampling steps.
+Unresolved symbols retain their instruction addresses instead of collapsing
+every JIT location into one `[unknown]` bucket. Useful callchains still depend
+on emulator symbols and host unwinding support; raw samples remain in
+`perf.data`.
+Missing tools, event permissions and recording failures are explicit errors;
+there is no pretend-success fallback. Without `--perf`, the same guest run and
+host CPU-time attribution still operate. Host architecture/kernel, CPU,
+emulator hash and image hash accompany results.
+
+Use passing, sufficiently sampled workloads to evaluate performance; inspect
+FAIL records to fix correctness first. A fail-fast vector may repeatedly
+exercise only its failing path, not the complete intended instruction mix.
+Unexpected FAULT/early SKIP and missing COM1 output cannot establish a useful
+profile. The AL440LX/Pentium II profile may need BIOS serial setup before
+per-workload host attribution is available, although the floppy itself can
+still complete with VGA output. No Pi 5 or physical Pentium II result is
+claimed from local desktop-emulator validation.
+
+## Safety and limits
+
+Only the boot loader uses BIOS disk reads. The protected-mode kernel does not
+access disk controllers or issue storage writes. Memory patterns are restricted
+to firmware-reported usable extended RAM owned by the test. PCI configuration
+and ROM inspection are read-only. The suite does not reprogram MTRRs, initiate
+DMA transfers, write-probe option ROMs, disable A20 during workloads, invoke SMM,
+or run destructive board-specific chipset configuration tests. Device absence
+is reported rather than treated as a benchmark failure.
+
+Exception guards, a separate double-fault stack, and a timer watchdog contain
+ordinary probing faults. **They cannot guarantee recovery from arbitrary
+hardware/emulator failures**, a broken interrupt controller, a hard lockup with
+interrupts disabled, or corruption of the kernel's own mappings. Double faults
+produce a fatal diagnostic and halt rather than continuing in an unknown state.
+Real-hardware compatibility cannot be established solely by VM results.
+
+Legacy chipset tests necessarily exercise PIC/PIT/RTC state and owned CPU
+control state. Run on a dedicated test machine or VM, not as a resident program
+alongside an OS. Cache, TLB, instruction, and floating-point checks are not
+electrical stress certification, exhaustive memory testing, or universal x86
+conformance validation.
+
+## Interpreting emulator differences
+
+QEMU TCG and 86Box are not correctness oracles for each other. For example,
+some QEMU TCG CPU models return zero from a successful TSC MSR read while
+RDTSC advances; `sys_msr_probe` intentionally reports that mismatch. TCG's
+missing x87 stack-fault/MMX-tag metadata checks have explicit, narrowly scoped
+SKIP records that retain the raw state; transcendental checks allow a documented
+TCG precision tolerance. Ordinary arithmetic and memory assertions are not
+silently relaxed.
+
+Local K6-2+ validation of the vendor workloads exposed PI2FW using the wrong
+word for the upper lane and PF2IW failing to produce two sign-extended dword
+results in both 86Box execution engines. AMD 22466D specifies the checked
+lane layout. These remain `FAIL` in `3dnow_word_convert`; the tests are not
+adjusted to agree with the emulator.
+
+The heavy expand-down test uses byte-granularity descriptors: valid offsets
+must be strictly greater than the limit and the entire operand must fit below
+the B-bit-selected upper bound. It expects #GP(0) through FS and #SS(0)
+through SS. TCG and the tested 86Box engines omit some of those faults;
+the assertions remain strict (KVM passes). The paged SMC alias workload also
+exposes a dynarec invalidation mismatch in 86Box, and split POP reports a
+fault-time EAX preservation mismatch in both tested 86Box engines. These
+are FAIL records rather than unexpected exceptions or reasons to mask checks.
+Some workloads fail fast on their first bad vector and consequently report
+zero completed operations; that is not a valid performance sample.
+The added FDIV raw extended-precision checks can expose loss of mantissa bits
+in a host-double FPU implementation, and extreme-range FPREM cases distinguish
+80-bit exponent handling from host-double overflow. Nonfinite/denormal status
+checks remain strict. Remainder correctness and quotient status are separate
+checks; do not treat emulator agreement as an arithmetic oracle.
+
+86Box configurations using a host-double x87 implementation can differ from
+80-bit x87 in precision, exponent range, denormal classification and exception
+delivery. Those are retained as assertion failures, not treated as a reason
+to crash the suite or remove its checks. Compare with a hardware-backed KVM
+run and the instruction's architectural semantics before changing either test
+or emulator.
+
+## Validation scope
+
+The current inventory is **281 records** with default `ROUNDS=1`,
+`HEAVY_SCALE=8`, `TEST_SECONDS=5` and `BURN_SECONDS=10`.
+The vendor-integrated image completed a full default 86Box Pentium
+MMX/dynarec run: 187 PASS, 72 FAIL, 22 SKIP, no FAULT.
+All 271 pre-vendor outcomes stayed unchanged; ten vendor records skipped.
+All 266 pre-boundary outcomes also stayed unchanged; all five boundary
+additions passed. The strengthened boundary assertions passed focused interpreter
+and dynarec runs; 486DX correctly skipped the MMX-specific record.
+
+Focused vendor checks exercised both 86Box engines on K6-2, K6-2+ and
+6x86MX, plus negative feature gates on Pentium MMX, 486DX and 486SX.
+K6-2 baseline 3DNow! and all selected Cyrix EMMI cases passed. K6-2+
+retains the PI2FW/PF2IW mismatch described above; its other selected
+3DNow! records passed. These focused runs used default guest durations
+and a short host sampling minimum for correctness, not benchmark precision.
+
+Earlier images were also exercised on QEMU TCG/KVM and other 86Box CPU
+profiles. Those older inventories and results are not validation of the
+current release image. No fresh full current-image KVM result is claimed.
+The AL440LX/Pentium II profile can require BIOS serial configuration;
+VGA-only completion cannot establish a complete per-workload baseline.
+Physical PCs, Raspberry Pi hosts, VMware, VirtualBox and Hyper-V are
+not certified by these local x86-64 Linux runs.
+
+## Local release preparation
+
+```sh
+make test
+make clean && make release CC=gcc
+cd dist/cpuburn-test-0.1.0
+sha256sum -c SHA256SUMS
+```
+
+`make release` **only writes local artifacts**; it never creates a GitHub
+release, pushes Git commits, downloads ROMs or uploads results.
+Packaging uses ordinary Makefile recipes and GNU utilities, not Python.
+The directory contains `floppy.img`, `BUILD.txt`, a source tarball,
+README, release notes, MIT license and checksums for every artifact.
+`BUILD.txt` records the release settings and compiler/tool versions.
+Use `SHA256SUMS` for the actual image identity rather
+than copying a hash from an older README.
+
+The source tarball contains build sources, host tools, documentation and CI;
+it excludes Git metadata, build products, VM state, captured logs and ROMs.
+Rebuild it with the same tool versions/settings as the original release. With matching
+inputs/toolchain, artifacts contain no build timestamp or absolute build
+directory. Builds do not inspect Git or generate source/build digest headers.
+This is not a claim that different compiler versions produce identical images.
+
+The CI workflow includes x86-64 GCC/Clang and aarch64 Clang/GNU-cross builds,
+runs the Python tool tests and checks packaged hashes. These aarch64 jobs
+are configured for future runs, not evidence of already executed CI.
+It does not run 86Box regression comparisons or
+decide which emulator failures are acceptable. Guest execution still requires
+the user's selected emulator, machine and locally supplied ROMs.
+See [RELEASE_NOTES.md](RELEASE_NOTES.md) for preview limitations.

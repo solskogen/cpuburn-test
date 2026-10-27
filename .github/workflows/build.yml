@@ -1,0 +1,46 @@
+name: Build and tool tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            toolchain: gcc
+            make_args: CC=gcc
+            packages: gcc binutils
+          - runner: ubuntu-latest
+            toolchain: clang
+            make_args: CC=clang
+            packages: clang lld llvm
+          - runner: ubuntu-24.04-arm
+            toolchain: clang
+            make_args: ""
+            packages: clang lld llvm
+          - runner: ubuntu-24.04-arm
+            toolchain: cross-gcc
+            make_args: CROSS_COMPILE=i686-linux-gnu-
+            packages: gcc-i686-linux-gnu binutils-i686-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: sudo apt-get update -qq && sudo apt-get install -y make nasm python3 ${{ matrix.packages }}
+      - name: Test host tools
+        run: make test
+      - name: Build preview artifacts
+        run: make release PYTHON=false ${{ matrix.make_args }}
+      - name: Verify artifact checksums
+        run: cd "dist/cpuburn-test-$(cat VERSION)" && sha256sum -c SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cpuburn-test-${{ matrix.runner }}-${{ matrix.toolchain }}
+          path: dist/
