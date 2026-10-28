@@ -25,14 +25,123 @@ Version **0.1.0 preview**. Licensed under [MIT](LICENSE).
 - **Shorter runs:** `make clean && make BURN_SECONDS=1 TEST_SECONDS=1` keeps the selected
   test cases but reduces repetition/stress and timing confidence. Defaults
   are 10 and 5 guest seconds; invocations are never cut short.
+- **Correctness only:** `make -B BENCHMARKS=0` removes timed harness repetition,
+  not test cases or assertions. See [accuracy-only builds](#accuracy-only-builds).
 
 ## Usage
 
+### Choose what to build
+
+```sh
+make                         # correctness checks plus benchmark sampling (default)
+make -B BENCHMARKS=0          # correctness checks without benchmark sampling
+make -B BENCHMARKS=1          # restore benchmark sampling
+```
+
+The accuracy-only build keeps the same selected workloads, vectors, scale and
+assertions. Each eligible workload normally runs a checked warm-up and one
+checked invocation per round, rather than repeating for `TEST_SECONDS`.
+Intrinsic stress durations still apply, so this is not an instantaneous run.
+See [accuracy-only builds](#accuracy-only-builds) for details.
+
+### Choose how to collect results
+
+| Goal | Tool |
+|---|---|
+| Display and save serial results from your existing VM | [`capture_serial.py`](#boot-and-capture-results) |
+| Measure each test's ability to sustain the configured emulation speed | [`run_86box.py`](#measure-per-test-emulation-capacity) |
+
+Serial capture and guest timing alone do **not** measure host emulation
+capacity. Use the performance runner below to find workloads that cannot
+keep up with the configured CPU speed.
+
+### Measure per-test emulation capacity
+
+On Linux, with Python 3.10+, Xvfb, installed ROMs and an
+`AUTOMATION=ON` 86Box build:
+
+```sh
+make -B BENCHMARKS=1
+python3 tools/run_86box.py --emulator ../86Box/build/src/86Box \
+  --profile mmx --bios-f1 --label dynarec
+python3 tools/run_86box.py --emulator ../86Box/build/src/86Box \
+  --profile mmx --dynarec off --bios-f1 --label interpreter
+```
+
+The runner launches isolated VMs sequentially; do not start a VM or the serial
+capture script separately for these commands. `mmx` selects Pentium MMX
+233 MHz; choose a different supported profile for your target CPU.
+Use `--rompath /path/to/roms` if needed. No firmware is downloaded.
+
+Each run saves `serial.log` and `result.json` under `build/86box-*`.
+In `result.json`, **each sampled test** has an entry under
+`workload_capture.workloads`, identified by `name` and `id`:
+
+- `full_speed_capacity_percent`: guest time advanced divided by unthrottled
+  host step time, multiplied by 100. Sustained values below approximately
+  **100%** indicate that test could not maintain the configured guest speed
+  on this host.
+- `under_sampled`: true when the test did not reach the requested host
+  CPU-time minimum; do not treat a short sample as a firm performance result.
+
+This is measured capacity, not the GUI speed reading or an automatic
+slowdown verdict. Correctness remains separate: check FAIL/FAULT records,
+and compare repeated runs under matching host conditions. Accuracy-only
+images do not provide sustained benchmark samples.
+See [Sustained host profiling](#sustained-host-profiling) for sampling limits,
+other profiles and optional host profiling; `--perf` is not required.
+
+#### Example: passing and keeping up versus passing but too slow
+
+These are **illustrative excerpts**, not measured results or complete records.
+For the same test, both runs might print this in `serial.log`:
+
+```text
+TEST r=1 name=int_alu status=PASS ...
+```
+
+The assertions passed in both runs. The speed difference appears in
+`result.json`, under `workload_capture.workloads`, not in that serial line.
+A run with enough capacity to maintain real time might contain:
+
+```json
+{
+  "name": "int_alu",
+  "emulated_ms": 40000,
+  "step_wall_seconds": 30.0,
+  "process_cpu_seconds": 30.0,
+  "full_speed_capacity_percent": 133.33333333333334,
+  "under_sampled": false
+}
+```
+
+It advanced 40 guest seconds in 30 host seconds: **133% capacity**, with
+headroom above the configured speed. Together with PASS, this is the desired
+result for the checked workload, not proof of perfect emulation.
+
+A slower run could instead contain:
+
+```json
+{
+  "name": "int_alu",
+  "emulated_ms": 22500,
+  "step_wall_seconds": 30.0,
+  "process_cpu_seconds": 30.0,
+  "full_speed_capacity_percent": 75.0,
+  "under_sampled": false
+}
+```
+
+It advanced only 22.5 guest seconds in 30 host seconds: **75% capacity**.
+The checked results are still correct, but this host cannot sustain the
+configured CPU speed during that workload. A FAIL at 133% would mean the
+opposite problem: sufficient speed, incorrect results. Capacity near 100%
+needs repeated measurements before drawing conclusions.
+
 ### Boot and capture results
 
-Run `make`, insert `floppy.img` into drive A: of an i486-or-newer VM, and
-boot from the floppy. Results appear on the VGA screen and COM1 (115200, 8N1).
-No guest OS or hard disk is required.
+Insert the built `floppy.img` into drive A: of an i486-or-newer VM and boot
+from the floppy. No guest OS or hard disk is required.
 
 To display and save serial output with the supplied Python 3 script, use
 an 86Box build with `AUTOMATION=ON`. With 86Box stopped, enable COM1 capture
@@ -80,15 +189,10 @@ COM1. For automatic handling of supported BIOS F1 prompts, use
 
 ## Overview
 
-Builds **`floppy.img`**, a raw 1.44 MiB bootable floppy image. No installed OS,
-filesystem, hard disk, network, or guest disk writes are required. Results go to
-COM1 (115200, 8N1), port `0xE9`, and VGA text; `0x80` carries progress checkpoints.
+The output is a raw 1.44 MiB bootable floppy image, without a filesystem.
+Port `0x80` carries progress checkpoints in addition to the result outputs
+listed above.
 
-The primary purpose is to provide correctness evidence and workload-specific
-benchmark data when changing **86Box CPU/FPU emulation**, including its
-interpreter and dynamic recompiler. Users choose which builds to run and how
-to assess changes; the guest does not decide regression policy or produce a
-single overall score. Host architecture is not a guest requirement.
 Pentium MMX 233 MHz on Raspberry Pi 5 is one useful performance target, not a
 restriction or an achieved performance claim. Pentium II and real-hardware
 testing remain supported. The instruction baseline is i486, including
@@ -98,19 +202,10 @@ exception probes gate MMX, P6 instructions, FXSAVE and AMD 3DNow!, while
 Cyrix EMMI uses a restricted vendor/model gate. No SSE/SSE2, later SIMD,
 64-bit execution or CPUs outside 86Box's supported range are targeted.
 
-Coverage includes exhaustive 8-bit arithmetic flags and BCD cases; sampled
-8/16/32-bit ALU, shifts, multiply/divide, bit/atomic/string/prefix operations;
-branches and self-modifying code; x87 formats, arithmetic, rounding, constants,
-transcendentals, environment/exception state, P6 compares and FXSAVE; scalar
-reference checks for baseline MMX, baseline/enhanced 3DNow! and Cyrix EMMI;
-descriptor/privilege/interrupt paths;
-4 KiB/4 MiB/PAE paging, demand faults, permissions, accessed/dirty bits, TLB
-remapping and global pages; memory patterns/bandwidth/latency/unaligned/locked
-access; safe MSR/control-register probes; PIC/PIT/RTC, A20-on alias checks,
-DMA snapshots, read-only ROM and PCI enumeration; and a mixed timed burn.
-The source registries `tests_*.c` list the precise workloads and feature gates.
-
 ## Coverage boundaries
+
+The source registries `tests_*.c` list the precise workloads and feature gates;
+the following sections describe their checked behavior and limits.
 
 | Area | Source modules | Evidence and limits |
 |---|---|---|
@@ -339,24 +434,25 @@ FAIL/FAULT results give the runner a nonzero exit. Host timeouts remain
 incomplete runs, not architectural failures. Fast-forward and host emulation
 capacity do not determine architectural verdicts. The performance report
 retains these correctness outcomes but does not treat them as benchmark samples.
-Without `--accuracy`, sustained benchmarking remains the default.
+With a benchmark-enabled image, sustained benchmarking remains the default
+unless `--accuracy` is selected.
 
-To build a correctness-only image, disable benchmarks in the normal Makefile:
-
-```sh
-make -B BENCHMARKS=0
-make -B BENCHMARKS=1 # restore the default benchmark-enabled build
-```
+### Accuracy-only builds
 
 `BENCHMARKS` defaults to `1` and accepts only `0` or `1`. With `0`, the timed
 sampling/repetition loop is compiled out, the image always uses accuracy mode,
-and host sampling leases cannot extend a test. No `--accuracy` argument or
-host controller is needed. The 86Box runner recognizes this build automatically.
+and `TEST_SECONDS` and host sampling leases cannot extend a test.
+No `--accuracy` argument or host controller is needed. The 86Box runner
+recognizes this build automatically.
 Correctness cases, including assertions in burn-named workloads, remain intact;
 their intrinsic stress durations are not removed. Warmup and one checked
-invocation still run, but their times are diagnostic data, not benchmark samples.
+invocation still run unless a fault or skip prevents completion, but their
+times are diagnostic data, not benchmark samples. `ROUNDS`, `ONLY`,
+`HEAVY_SCALE`, `BURN_SECONDS` and watchdog behavior still apply.
 BUILD/CFG records and release BUILD.txt identify the setting. Use `-B` when
 changing it, just as for the other Makefile build settings.
+
+### Model coverage and matrices
 
 `cpu_models.h` contains minimum contracts for all 66 currently active 486+
 families, plus the two build-conditional K5 families. The catalogue includes
@@ -519,26 +615,27 @@ in VMware/VirtualBox. UEFI-only systems and Hyper-V Generation 2 cannot boot thi
 image directly. A floppy controller, legacy PIC/PIT, and PC-compatible port I/O
 are assumed; this is not a UEFI, ARM, or SMP test.
 
-There is **one unified run**, with no correctness/profiling mode switch.
-Each supported workload gets a checked warm-up invocation, followed by repeated
+In the default **benchmark-enabled** run, each supported workload gets a
+checked warm-up invocation, followed by repeated
 checked invocations in a window lasting **at least `TEST_SECONDS` (default 5)
 guest seconds**.
 Assertions remain active throughout. Warm-up failures remain FAIL even when
 later invocations pass, preserving cold dynarec/cache bugs. Assertion failures
 do not terminate the sustained window; unexpected faults or unavailable safe
 preconditions do. Feature-gated skips do not wait for a sample window.
+For execution without timed harness repetition, use
+[`BENCHMARKS=0`](#accuracy-only-builds) or the runner's `--accuracy` option.
 
 The default is one suite round and the final mixed burn, whose individual
 invocations last 10 seconds. Heavy workloads use `HEAVY_SCALE=8`; each invocation
 does real fixed-count work, rather than sleeping to fill its window.
-The default inventory is 281 records, including unavailable-feature skips.
+The default inventory is 306 records, including unavailable-feature skips.
 Suite duration varies with CPU, applicable features and invocation lengths;
-it is not a fixed wall-clock deadline. Guest `ms`/`cyc` are emulated time; emulator speed is measured on
-the host side by the controller below. The host controller below can extend this
-to obtain enough actual emulator CPU time. Standalone real hardware needs no
-controller and ends automatically. Overall duration depends on emulation speed
-and CPU model.
-Overrides rebuild the affected code automatically:
+it is not a fixed wall-clock deadline. In benchmark mode, the
+[host profiling runner](#sustained-host-profiling) can extend sampling to
+obtain enough actual emulator CPU time. Standalone runs need no controller
+and end automatically.
+Clean-rebuild when changing settings, for example:
 
 ```sh
 make clean && make ROUNDS=1 BURN_SECONDS=5 WATCHDOG_SECONDS=90
@@ -559,9 +656,6 @@ invocation, not the whole sustained window. `TEST_SECONDS` accepts 1–3600;
 use the default 5 or more for profiling, not the shortened validation build.
 `ONLY` runs just the listed tests and logs them as `CFG only=`; `SUMMARY`
 counts only those. A clean default rebuild selects the full suite.
-
-After printing `SUMMARY` and `DONE`, the guest **halts**. It does not reset or
-write magic shutdown ports. Stop the VM externally after collecting its log.
 
 ## Results for automation
 
@@ -594,15 +688,10 @@ host CPU per workload comes from the 86Box runner. `perf_report.py` validates
 and prints the breakdown, including skips and failed tests. These records
 do not change correctness checks, warm-up, sampling duration or test scale.
 
-Collect a complete COM1 log in 86Box on any host, then summarize it with
-Python 3 (no QEMU or host profiler required):
-
-```sh
-python tools/perf_report.py serial.log --output runtime-report.json
-```
-
-The report lists the ten longest test records and retains every runtime
-record in JSON. Older logs remain supported, with the breakdown marked
+The [Usage commands](#boot-and-capture-results) capture and summarize a complete
+COM1 log without QEMU or a host profiler. The report lists the ten longest
+test records and retains every runtime record in JSON. Older logs remain
+supported, with the breakdown marked
 unavailable. The guest totals exclude firmware boot and guest initialization.
 
 `PASS` means the workload's assertions passed, **not** exhaustive ISA compliance.
@@ -725,11 +814,9 @@ Host metadata, CPU-time targets and perf enablement must match when pooling
 more invocations within the same CPU budget: prefer per-phase capacity and
 counter/operation data, not boot-to-DONE time, as the optimization signal.
 
-Guest cycles are **not host throughput**. Host durations include boot and
-logging; 86Box durations also include automation stepping/capture overhead.
-Keep the step size and host conditions identical, collect several independent
-boots for host-time distributions, and do not interpret a single small timing
-change as a regression.
+Host durations include boot and logging; 86Box durations also include
+automation stepping/capture overhead. Keep the step size identical between
+runs and collect several independent boots for host-time distributions.
 
 For an automation-enabled local 86Box build with installed ROMs:
 
@@ -873,27 +960,26 @@ or emulator.
 
 ## Validation scope
 
-The current inventory is **281 records** with default `ROUNDS=1`,
-`HEAVY_SCALE=8`, `TEST_SECONDS=5` and `BURN_SECONDS=10`.
-The vendor-integrated image completed a full default 86Box Pentium
-MMX/dynarec run: 187 PASS, 72 FAIL, 22 SKIP, no FAULT.
-All 271 pre-vendor outcomes stayed unchanged; ten vendor records skipped.
-All 266 pre-boundary outcomes also stayed unchanged; all five boundary
-additions passed. The strengthened boundary assertions passed focused interpreter
-and dynarec runs; 486DX correctly skipped the MMX-specific record.
+Validation results apply to the particular image, CPU, execution engine and
+FPU backend tested, not automatically to later builds or packaged artifacts.
+The earlier 281-record vendor-integrated image completed a full default
+86Box Pentium MMX/dynarec run: 187 PASS, 72 FAIL, 22 SKIP, no FAULT.
+All earlier outcomes stayed unchanged by the vendor and boundary additions.
+The strengthened boundary assertions passed focused interpreter and dynarec
+runs; 486DX correctly skipped the MMX-specific record.
+See [release notes](RELEASE_NOTES.md#known-results-and-limitations) for
+additional image-specific results.
 
 Focused vendor checks exercised both 86Box engines on K6-2, K6-2+ and
 6x86MX, plus negative feature gates on Pentium MMX, 486DX and 486SX.
-K6-2 baseline 3DNow! and all selected Cyrix EMMI cases passed. K6-2+
-retains the PI2FW/PF2IW mismatch described above; its other selected
-3DNow! records passed. These focused runs used default guest durations
+K6-2 baseline 3DNow! and all selected Cyrix EMMI cases passed. The K6-2+
+exception is described under [emulator differences](#interpreting-emulator-differences).
+These focused runs used default guest durations
 and a short host sampling minimum for correctness, not benchmark precision.
 
 Earlier images were also exercised on QEMU TCG/KVM and other 86Box CPU
 profiles. Those older inventories and results are not validation of the
 current release image. No fresh full current-image KVM result is claimed.
-The AL440LX/Pentium II profile can require BIOS serial configuration;
-VGA-only completion cannot establish a complete per-workload baseline.
 Physical PCs, Raspberry Pi hosts, VMware, VirtualBox and Hyper-V are
 not certified by these local x86-64 Linux runs.
 
@@ -908,7 +994,6 @@ sha256sum -c SHA256SUMS
 
 `make release` **only writes local artifacts**; it never creates a GitHub
 release, pushes Git commits, downloads ROMs or uploads results.
-Packaging uses ordinary Makefile recipes and GNU utilities, not Python.
 The directory contains `floppy.img`, `BUILD.txt`, a source tarball,
 README, release notes, MIT license and checksums for every artifact.
 `BUILD.txt` records the release settings and compiler/tool versions.
