@@ -302,7 +302,7 @@ class RunnerTests(unittest.TestCase):
             self.assertTrue((run_dir / "result.json").is_file())
 
     def test_defaults_and_mmx_233_and_pii(self):
-        with patch("sys.argv", ["run_86box.py"]):
+        with patch("sys.argv", ["run_86box.py", "--profile", "mmx"]):
             args = arguments()
         self.assertEqual((args.profile, args.sample_cpu_seconds, args.emulated_ms,
                           args.wall_seconds), ("mmx", 30, 86400000, 28800))

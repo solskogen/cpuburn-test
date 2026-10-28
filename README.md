@@ -33,10 +33,18 @@ Version **0.1.0 preview**. Licensed under [MIT](LICENSE).
 ### Choose what to build
 
 ```sh
-make                         # correctness checks plus benchmark sampling (default)
-make -B BENCHMARKS=0          # correctness checks without benchmark sampling
-make -B BENCHMARKS=1          # restore benchmark sampling
+make                         # initial build; benchmarks enabled by default
+make -B BENCHMARKS=0          # force rebuild without benchmark sampling
+make -B BENCHMARKS=1          # force rebuild with benchmark sampling
 ```
+
+**Keep `-B` when switching settings.** Make tracks file timestamps, not
+changes to command-line variables. Once an image exists, `make BENCHMARKS=0`
+or `make BENCHMARKS=1` alone may say "Nothing to be done" and leave the
+existing image unchanged. Plain `make` does not restore defaults in an
+already-built image either. Use `make -B` to rebuild with defaults, or
+`make -B BENCHMARKS=0` for accuracy only. Unlike `make clean`, `-B` preserves
+saved run results under `build/`.
 
 The accuracy-only build keeps the same selected workloads, vectors, scale and
 assertions. Each eligible workload normally runs a checked warm-up and one
@@ -62,16 +70,54 @@ On Linux, with Python 3.10+, Xvfb, installed ROMs and an
 
 ```sh
 make -B BENCHMARKS=1
-python3 tools/run_86box.py --emulator ../86Box/build/src/86Box \
-  --profile mmx --bios-f1 --label dynarec
-python3 tools/run_86box.py --emulator ../86Box/build/src/86Box \
-  --profile mmx --dynarec off --bios-f1 --label interpreter
+python3 tools/run_86box.py --vm "/path/to/My VM"
 ```
 
 The runner launches isolated VMs sequentially; do not start a VM or the serial
-capture script separately for these commands. `mmx` selects Pentium MMX
-233 MHz; choose a different supported profile for your target CPU.
-Use `--rompath /path/to/roms` if needed. No firmware is downloaded.
+capture script separately for these commands. `--vm` accepts any VM directory
+containing `86box.cfg`, or a configuration file such as
+`--vm "/another/location/custom.cfg"`. There is no required VM storage location.
+CPU family, clock, multiplier, RAM, FPU and the primary video card come from
+that configuration. Omit `--dynarec` to preserve its engine selection; use
+`--dynarec on|off` to override it for this run only.
+The runner uses `86Box` from `PATH` by default; `--emulator /path/to/86Box`
+selects another binary.
+
+To compare execution engines, run the same VM twice:
+
+```sh
+python3 tools/run_86box.py --vm "/path/to/My VM" --dynarec on
+python3 tools/run_86box.py --vm "/path/to/My VM" --dynarec off
+```
+
+Other optional switches:
+
+| Option | When to use it |
+|---|---|
+| `--bios-f1` | Automatically press F1 when a recognized text-mode BIOS prompt asks to resume/continue, such as after a CMOS configuration change. It does not configure the BIOS and cannot detect graphical prompts. |
+| `--label interpreter` | Add an arbitrary descriptive label to `result.json` for identifying comparisons. It does **not** select the interpreter; only `--dynarec off` does that. Omit it unless you want a label. |
+| `--key 20000:0x3c` | Press F2 at 20,000 emulated milliseconds, only for firmware that explicitly offers F2 to load defaults and continue. General syntax is `EMULATED_MS:SET1_SCANCODE`; this is not automatic BIOS configuration. |
+
+The source configuration and its adjacent `nvr/` directory are copied into
+the private run directory. BIOS selections are retained. The VM should be
+stopped while its inputs are copied. Source files are never modified.
+Relative NVRAM locations are resolved beside the supplied configuration;
+original floppy, CD and hard-disk paths are deliberately **not opened**,
+whether relative or absolute.
+
+This is a CPU-test fixture, not a full clone of the original VM: storage is
+replaced with the write-protected test floppy, sound/network/host passthrough
+and other peripheral-specific settings are discarded, COM1 capture is
+enabled, host time synchronization is disabled, and software rendering is
+used. Thus peripherals and storage differ from the original machine.
+Firmware must support booting that floppy; copied CMOS may still require
+boot-order setup or acknowledgement of removed storage. Inspect `screen.log`
+or `screen.png` when boot stalls; the runner never blindly accepts firmware
+defaults. NVRAM symlinks are rejected rather than followed.
+Use `--rompath /path/to/roms` for firmware outside standard locations.
+Missing configuration or required CPU/RAM settings produce an error;
+firmware/boot problems remain explicit errors or incomplete runs, not passes.
+No firmware is downloaded.
 
 Each run saves `serial.log` and `result.json` under `build/86box-*`.
 In `result.json`, **each sampled test** has an entry under
@@ -89,7 +135,7 @@ slowdown verdict. Correctness remains separate: check FAIL/FAULT records,
 and compare repeated runs under matching host conditions. Accuracy-only
 images do not provide sustained benchmark samples.
 See [Sustained host profiling](#sustained-host-profiling) for sampling limits,
-other profiles and optional host profiling; `--perf` is not required.
+optional host profiling; `--perf` is not required.
 
 #### Example: passing and keeping up versus passing but too slow
 
@@ -422,7 +468,7 @@ Non-CPU requirements such as sufficient RAM and PCI availability still gate
 tests normally. A configured FPU cannot remove an integrated FPU requirement.
 
 ```sh
-python3 tools/run_86box.py --emulator ../86Box/build/src/86Box --profile k6-2 --accuracy
+python3 tools/run_86box.py --vm "/path/to/My VM" --accuracy
 ```
 
 `--accuracy` runs one warmup and one checked invocation per selected test,
@@ -557,8 +603,10 @@ an aarch64-targeting GCC: the **host** may be aarch64, but the **output**
 must remain 32-bit i486-compatible x86. Building and running the image are
 separate: the image still boots inside an x86 PC emulated by 86Box on either host.
 
-Run `make clean` when changing compilers, flags or test settings; make tracks
-source/header dependencies, not command-line changes. Compilation, linking,
+Force a rebuild with `make -B` when changing compilers, flags or test settings
+(or clean first, noting that `make clean` also removes `build/` results and
+`dist/`). Make tracks file dependencies, not command-line changes.
+Compilation, linking,
 image creation and packaging are direct Makefile recipes, without helper
 scripts or generated provenance headers. `VERSION` supplies the guest version;
 the compiler's built-in version string supplies its `BUILD` identification.
@@ -818,35 +866,16 @@ Host durations include boot and logging; 86Box durations also include
 automation stepping/capture overhead. Keep the step size identical between
 runs and collect several independent boots for host-time distributions.
 
-For an automation-enabled local 86Box build with installed ROMs:
-
-```sh
-python tools/run_86box.py --profile 486dx --bios-f1 \
-  --expect DONE
-python tools/run_86box.py --profile pentium --dynarec off --label interpreter \
-  --bios-f1 --expect DONE
-# Primary target; run this on the Pi 5 to measure its actual capacity:
-python tools/run_86box.py --profile mmx --bios-f1 --perf
-```
-
-Profiles are `486dx`, `486sx`, `pentium`, `mmx`, `pii`, `pii-bf6`, `k6-2`,
-`k6-2+` and `6x86mx`; use `--rompath` if
-ROMs are not in a standard local location. Firmware is never downloaded.
-This optional runner requires **Linux**, Xvfb, Python 3.10+, installed local
-ROMs and a compatible AUTOMATION-enabled 86Box binary. Supply `--emulator`
-when 86Box is not in the default sibling checkout location. It is not required
-to boot the floppy manually on Windows, macOS or Linux hosts.
-The runner uses an isolated copied floppy/configuration, captures COM1,
-screen state, emulator information and host elapsed time under `build/86box-*`.
-It requires this 86Box checkout's automation interface, not necessarily an
-unmodified upstream binary. `--expect DONE` checks completion, **not zero
-assertion failures**: inspect `serial.log` and `SUMMARY`. Correctness mismatches
-in 86Box are intentional useful output; do not silently remove checks to make
-an emulator appear correct. BIOS configuration/fresh CMOS can require F1.
+See [per-test emulation capacity](#measure-per-test-emulation-capacity) for
+VM-based runner commands and prerequisites. Captures also include screen
+state, emulator information and host elapsed time. The runner requires this
+86Box checkout's automation interface, not necessarily an unmodified upstream
+binary. `--expect DONE` checks completion, **not zero assertion failures**:
+inspect `serial.log` and `SUMMARY`.
 
 ### Sustained host profiling
 
-The runner defaults to Pentium MMX **233 MHz**, 250 guest-ms automation steps,
+The runner uses your VM's CPU settings, 250 guest-ms automation steps,
 and **30 actual process CPU seconds per sampled workload**, with 24 guest-hour
 and eight host-hour overall deadlines. `--sample-cpu-seconds` changes that
 minimum; `--step-ms` controls boundary uncertainty. Linux `/proc/PID/stat`
@@ -891,7 +920,7 @@ Use passing, sufficiently sampled workloads to evaluate performance; inspect
 FAIL records to fix correctness first. A fail-fast vector may repeatedly
 exercise only its failing path, not the complete intended instruction mix.
 Unexpected FAULT/early SKIP and missing COM1 output cannot establish a useful
-profile. The AL440LX/Pentium II profile may need BIOS serial setup before
+profile. An AL440LX/Pentium II VM may need BIOS serial setup before
 per-workload host attribution is available, although the floppy itself can
 still complete with VGA output. No Pi 5 or physical Pentium II result is
 claimed from local desktop-emulator validation.

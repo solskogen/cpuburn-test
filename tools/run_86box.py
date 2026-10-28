@@ -73,18 +73,22 @@ def arguments():
         "captured; port 0xE9 is not an automation capture source. Fresh CMOS "
         "may require --bios-f1. Graphical BIOS prompts cannot be read by 'text'; "
         "AL440LX needs --key 20000:0x3b to resume its fresh-CMOS F1 prompt and "
-        "may leave COM1 inaccessible (use screen.log). --config imports only Machine and Video keys; "
-        "disks, networking, host backends and other peripheral settings are discarded."
+        "may leave COM1 inaccessible (use screen.log). --vm accepts a VM directory "
+        "(containing 86box.cfg) or a configuration file. CPU/RAM/video and BIOS "
+        "selectors are imported; NVRAM is copied privately. Disks, networking, "
+        "host backends and other peripheral settings are discarded."
     ))
-    parser.add_argument("--emulator", type=Path,
-                        default=ROOT.parent / "86Box/build/src/86Box")
+    parser.add_argument("--emulator", default="86Box",
+                        help="executable name or path (default: 86Box on PATH)")
     parser.add_argument("--image", type=Path, default=ROOT / "floppy.img")
     parser.add_argument("--rompath", type=Path,
                         help="local ROM directory (normally containing machines/ and video/)")
-    parser.add_argument("--profile", choices=PROFILES, default="mmx",
-                        help="generated machine/CPU profile; ignored with --config")
-    parser.add_argument("--config", type=Path,
-                        help="explicit source config; snapshot and import safe machine/video keys only")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--vm", type=Path, help="existing VM directory or configuration file")
+    source.add_argument("--profile", choices=PROFILES,
+                        help="generate a fixture instead of using an existing VM")
+    source.add_argument("--config", type=Path,
+                        help="source config for generated matrix fixtures (legacy interface)")
     parser.add_argument("--dynarec", choices=("on", "off"),
                         help="override the profile/config execution mode")
     parser.add_argument("--accuracy", action="store_true",
@@ -96,8 +100,10 @@ def arguments():
     parser.add_argument("--expected-model-name", help="expected automation CPU speed/model label")
     parser.add_argument("--fpu-backend", choices=("host", "softfloat"),
                         help="request host FPU or software floating-point implementation")
-    parser.add_argument("--label", default="", help="emulator build/mode identifier")
-    parser.add_argument("--memory-mb", type=positive_int, default=16)
+    parser.add_argument("--label", default="",
+                        help="descriptive result label only; does not change CPU engine/settings")
+    parser.add_argument("--memory-mb", type=positive_int,
+                        help="override RAM; otherwise preserve VM RAM (generated profiles: 16 MiB)")
     parser.add_argument("--emulated-ms", type=positive_int, default=86400000)
     parser.add_argument("--wall-seconds", type=positive, default=28800)
     parser.add_argument("--step-ms", type=positive_int, default=250,
@@ -111,7 +117,8 @@ def arguments():
     parser.add_argument("--reject", action="append", default=["FATAL"],
                         help="fail immediately on a literal marker (default: FATAL); repeatable")
     parser.add_argument("--bios-f1", action="store_true",
-                        help="press F1 when the BIOS screen requests it")
+                        help="press F1 at recognized text-mode resume/continue BIOS prompts; "
+                             "does not configure firmware or detect graphical prompts")
     parser.add_argument("--key", type=boot_key, action="append", default=[],
                         help="press/release set-1 key at EMULATED_MS:SCANCODE; repeatable")
     parser.add_argument("--prepare-only", action="store_true",
@@ -136,30 +143,86 @@ def rom_directory(explicit):
     raise RuntimeError("No local ROM tree found; provide --rompath. Firmware is not downloaded.")
 
 
+def vm_config(path):
+    path = path.expanduser().absolute()
+    if path.is_dir():
+        path /= "86box.cfg"
+    if not path.is_file():
+        raise RuntimeError(f"VM configuration not found: {path}")
+    return path
+
+
+def emulator_binary(value):
+    executable = shutil.which(value)
+    if executable is None:
+        raise RuntimeError(f"86Box executable not found or not executable: {value}; "
+                           "install 86Box on PATH or supply --emulator /path/to/86Box")
+    return Path(executable).resolve(strict=True)
+
+
+def copy_nvram(source, destination):
+    if source.is_symlink():
+        raise RuntimeError(f"NVRAM directory must not be a symlink: {source}")
+    if not source.exists():
+        return
+    for path in source.rglob("*"):
+        if path.is_symlink() or not (path.is_file() or path.is_dir()):
+            raise RuntimeError(f"unsupported NVRAM entry: {path}")
+    shutil.copytree(source, destination)
+
+
 def write_config(args, run_dir):
-    machine, family, speed, multiplier, fpu = PROFILES[args.profile]
+    source = getattr(args, "vm", None) or args.config
     config = configparser.ConfigParser(interpolation=None)
-    config["Machine"] = {
-        "machine": machine, "cpu_family": family, "cpu_speed": str(speed),
-        "cpu_multi": str(multiplier), "fpu_type": fpu,
-        "cpu_use_dynarec": "1", "time_sync": "disabled",
-    }
     config["Video"] = {"gfxcard": "et4000ax"}
-    if args.config:
+    if source:
+        source = vm_config(source)
         snapshot = run_dir / "source.cfg"
-        shutil.copyfile(args.config.resolve(strict=True), snapshot)
+        shutil.copyfile(source, snapshot)
         original = configparser.ConfigParser(interpolation=None, strict=False)
-        original.read(snapshot)
+        with snapshot.open() as handle:
+            original.read_file(handle)
+        # Never inherit DEFAULT values: an arbitrary host backend/path could
+        # otherwise leak into the isolated configuration.
+        original.defaults().clear()
         if not original.has_option("Machine", "machine"):
-            raise RuntimeError("--config needs a [Machine] machine setting")
-        config["Machine"].clear()
+            raise RuntimeError("VM configuration needs a [Machine] machine setting")
+        config["Machine"] = {}
         for key in ("machine", "cpu_family", "cpu_speed", "cpu_multi", "fpu_type",
-                    "cpu_use_dynarec", "cpu_waitstates", "fpu_softfloat"):
+                    "cpu_use_dynarec", "cpu_waitstates", "fpu_softfloat", "mem_size",
+                    "cpu", "cpu_manufacturer", "cpu_override", "cpu_debug_regs_486"):
             if original.has_option("Machine", key):
                 config["Machine"][key] = original["Machine"][key]
+        if getattr(args, "vm", None):
+            for key in ("cpu_family", "cpu_speed", "mem_size"):
+                if key not in config["Machine"]:
+                    raise RuntimeError(f"VM configuration needs an explicit [Machine] {key}")
+            for key in ("cpu_speed", "mem_size"):
+                try:
+                    value = int(config["Machine"][key])
+                except ValueError:
+                    raise RuntimeError(f"invalid VM [Machine] {key}") from None
+                if value <= 0:
+                    raise RuntimeError(f"VM [Machine] {key} must be positive")
+            copy_nvram(source.parent / "nvr", run_dir / "nvr")
         if original.has_option("Video", "gfxcard"):
             config["Video"]["gfxcard"] = original["Video"]["gfxcard"]
-    config["Machine"]["mem_size"] = str(args.memory_mb * 1024)
+        for section in original.sections():
+            if section not in config and original.has_option(section, "bios"):
+                bios = original[section]["bios"]
+                if not re.fullmatch(r"[a-zA-Z0-9_.-]+", bios):
+                    raise RuntimeError(f"unsupported BIOS selector in [{section}]: {bios!r}")
+                config[section] = {"bios": bios}
+    else:
+        machine, family, speed, multiplier, fpu = PROFILES[args.profile]
+        config["Machine"] = {
+            "machine": machine, "cpu_family": family, "cpu_speed": str(speed),
+            "cpu_multi": str(multiplier), "fpu_type": fpu, "cpu_use_dynarec": "1",
+        }
+    if args.memory_mb is not None:
+        config["Machine"]["mem_size"] = str(args.memory_mb * 1024)
+    elif "mem_size" not in config["Machine"]:
+        config["Machine"]["mem_size"] = "16384"
     if args.dynarec is not None:
         config["Machine"]["cpu_use_dynarec"] = "1" if args.dynarec == "on" else "0"
     if getattr(args, "fpu_backend", None) is not None:
@@ -554,7 +617,7 @@ def execute(args, run_dir, command, machine):
 def main():
     args = arguments()
     try:
-        emulator = args.emulator.resolve(strict=True)
+        emulator = emulator_binary(args.emulator)
         image = args.image.resolve(strict=True)
         if not os.access(emulator, os.X_OK):
             raise RuntimeError(f"not executable: {emulator}")
@@ -565,7 +628,7 @@ def main():
         roms = rom_directory(args.rompath)
         (ROOT / "build").mkdir(exist_ok=True)
         run_dir = ROOT / "build" / (
-            f"86box-{args.profile}-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}")
+            f"86box-{args.profile or 'vm'}-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}")
         run_dir.mkdir(mode=0o700)
         if len(os.fsencode(run_dir / "automation.sock")) >= 108:
             raise RuntimeError("workspace path is too long for a UNIX automation socket")
@@ -589,6 +652,14 @@ def main():
                                 "accuracy": getattr(args, "accuracy", False),
                                 "perf": getattr(args, "perf", False)},
                     "host": host_metadata()}
+        if args.vm:
+            manifest["source_vm"] = str(vm_config(args.vm))
+            manifest["source_config_sha256"] = hashlib.sha256(
+                (run_dir / "source.cfg").read_bytes()).hexdigest()
+            manifest["isolation"] = (
+                "Private config/NVRAM, imported CPU/RAM/video/BIOS selectors; "
+                "floppy-only storage, no source disks or host backends. "
+                "Time sync disabled and software renderer selected.")
         (run_dir / "launch.json").write_text(json.dumps(manifest, indent=2) + "\n")
         if args.prepare_only:
             print(json.dumps({"status": "prepared", "directory": str(run_dir)}))

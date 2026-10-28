@@ -30,6 +30,14 @@ fixtures and the main stack retain their addresses. The 1.44 MB floppy format
 is unchanged. The current loader still stages the file below `0x70000`,
 with explicit size checks; BSS no longer consumes that staging budget.
 
+The optional 86Box runner accepts `--vm` with a VM directory or a direct
+configuration path, finds `86Box` on PATH by default, and preserves CPU,
+RAM, FPU and engine settings unless explicitly overridden. `--dynarec on|off`
+selects an engine for an isolated run. Config/NVRAM copies are private;
+original disks and host backends are excluded, not cloned. Firmware may
+require acknowledgement of the removed storage. Generated profiles and
+matrix configs remain available through explicit `--profile`/`--config`.
+
 ## Known results and limitations
 
 - The earlier 281-record MMX/dynarec integration image completed with 187 PASS,
