@@ -6,7 +6,7 @@ u64 __udivmoddi4(u64 n, u64 d, u64 *rem) {
     u64 q = 0, r = 0;
     if (!d) {
         __asm__ volatile("divl %0" :: "r"(0) : "eax", "edx", "cc");
-        return 0;
+        __builtin_unreachable();
     }
     for (int i = 63; i >= 0; i--) {
         u32 carry = (u32)(r >> 63);

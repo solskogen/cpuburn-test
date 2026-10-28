@@ -33,7 +33,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install build tools
-        run: sudo apt-get update -qq && sudo apt-get install -y make nasm python3 ${{ matrix.packages }}
+        run: sudo apt-get update -qq && sudo apt-get install -y make nasm python3 cpp ${{ matrix.packages }}
       - name: Test host tools
         run: make test
       - name: Build preview artifacts

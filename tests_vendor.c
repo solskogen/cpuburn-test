@@ -437,6 +437,7 @@ static u8 cyrix_read(u8 index) { outb(0x22, index); return inb(0x23); }
 static void cyrix_write(u8 index, u8 value) { outb(0x22, index); outb(0x23, value); }
 
 static u32 emmi_run(unsigned first, unsigned limit) {
+    t_work_unit("emmi_instruction_case");
     notes_left = 8;
     u32 flags = rd_eflags();
     cli();
@@ -469,6 +470,10 @@ static u32 emmi_run(unsigned first, unsigned limit) {
 static u32 emmi_arithmetic(void) { return emmi_run(emmi_paveb, emmi_pmvzb); }
 static u32 emmi_moves(void) { return emmi_run(emmi_pmvzb, emmi_end); }
 
+#define SINGLE(n, code) static u32 emmi_only_##n(void) { return emmi_run(emmi_##n, emmi_##n + 1); }
+EMMI_OPS(SINGLE)
+#undef SINGLE
+
 #define NOW_REQ (REQ_MMX | REQ_FPU | REQ_3DNOW)
 const test_t tests_vendor[] = {
     { "3dnow_float", now_float, NOW_REQ },
@@ -481,5 +486,8 @@ const test_t tests_vendor[] = {
     { "3dnow_swap", now_swap, NOW_REQ | REQ_3DNOWEXT },
     { "cyrix_emmi_arithmetic", emmi_arithmetic, REQ_MMX | REQ_EMMI },
     { "cyrix_emmi_moves", emmi_moves, REQ_MMX | REQ_EMMI },
+#define SINGLE(n, code) { "cyrix_emmi_" #n, emmi_only_##n, REQ_MMX | REQ_EMMI },
+    EMMI_OPS(SINGLE)
+#undef SINGLE
     { NULL, NULL, 0 }
 };

@@ -78,8 +78,8 @@ static void burn_body(void) {
     start_tick=pit_ticks;
     do {
         u64 t=stamp(); u32 v=integer_work(); record(CAT_INT,t,v);
-        if(cpu.has_fpu) { t=stamp(); v=x87_work(); record(CAT_X87,t,v); }
-        if(cpu.has_mmx) { t=stamp(); v=mmx_work(); record(CAT_MMX,t,v); }
+        if(cpu_test_feature(REQ_FPU)) { t=stamp(); v=x87_work(); record(CAT_X87,t,v); }
+        if(cpu_test_feature(REQ_MMX)) { t=stamp(); v=mmx_work(); record(CAT_MMX,t,v); }
         t=stamp(); v=memory_work(); record(CAT_MEM,t,v);
         t=stamp(); v=page_work(); record(CAT_PAGE,t,v);
         t=stamp(); v=int_work(); record(CAT_INT90,t,v);
@@ -122,16 +122,16 @@ static u32 burn_mixed(void) {
     isr_hook_t old_hook=int_hook[0x90];
     idt_set_gate(0x90,isr_stub[0x90],SEL_KCODE,0x8e);
     int_hook[0x90]=soft_hook;
-    if(cpu.has_fpu) __asm__ volatile("fninit");
+    if(cpu_test_feature(REQ_FPU)) __asm__ volatile("fninit");
     t_note("duration=%u watchdog=%u copy_bytes=%u remap_pages=%u fpu=%u mmx=%u timing=%s",
-           seconds,WATCHDOG_SECONDS,bytes,scratch_pt?16:0,cpu.has_fpu,cpu.has_mmx,stamp_is_tsc?"TSC_cycles":"PIT_counts");
+           seconds,WATCHDOG_SECONDS,bytes,scratch_pt?16:0,cpu_test_feature(REQ_FPU),cpu_test_feature(REQ_MMX),stamp_is_tsc?"TSC_cycles":"PIT_counts");
     /* Recover locally so a workload exception cannot strand our temporary PDE. */
     int rc=guard_call(burn_body);
     pg_dir[0x50000000>>22]=saved_pde;
     wr_cr3(rd_cr3());
     for(u32 i=0;i<16;i++) invlpg((void *)(0x50000000+i*4096));
     int_hook[0x90]=old_hook;
-    if(cpu.has_mmx) __asm__ volatile("emms");
+    if(cpu_test_feature(REQ_MMX)) __asm__ volatile("emms");
     CHECK_EQ(rc,GUARD_OK);
     u32 ticks=pit_ticks-start_tick;
     t_note("complete iterations=%u elapsed_ms=%u iterations_per_sec=%u checksum=%08x PDE_restored=%08x",

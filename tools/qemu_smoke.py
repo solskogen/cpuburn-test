@@ -33,6 +33,16 @@ def parse_log(text):
                                 for line in text.splitlines()
                                 if line.startswith("RUNTIME ")],
             "config": dict(re.findall(r"(\w+)=(\S+)", config_line)),
+            "cpu_control": [dict(re.findall(r"(\w+)=(\S+)", line))
+                            for line in text.splitlines() if line.startswith("CONTROL ")],
+            "conformance": [dict(re.findall(r"(\w+)=(\S+)", line))
+                            for line in text.splitlines() if line.startswith("CONFORMANCE ")],
+            "features": [dict(re.findall(r"(\w+)=(\S+)", line))
+                         for line in text.splitlines() if line.startswith("FEATURE ")],
+            "probes": [dict(re.findall(r"(\w+)=(\S+)", line))
+                       for line in text.splitlines() if line.startswith("PROBE ")],
+            "filtered_tests": [dict(re.findall(r"(\w+)=(\S+)", line))
+                               for line in text.splitlines() if line.startswith("FILTER ")],
             "fatal": any(x.startswith("FATAL") for x in text.splitlines()),
             "cpu_info": [x for x in text.splitlines()
                          if x.startswith("CPU ") and "mhz=" not in x]}

@@ -1,4 +1,4 @@
-/* Baseline Pentium-MMX only: no SSE integer or AMD extension instructions. */
+/* Baseline Pentium-MMX; MMX extensions have their own requirement gate. */
 #include "kernel.h"
 
 #define BINARY_OPS(X) \
@@ -33,7 +33,11 @@ static u64 sat(s64 v, unsigned w, int uns) {
     if (v > hi) v = hi;
     return (u64)v & ((1ull << w) - 1);
 }
-static u64 reference(unsigned op, u64 a, u64 b) {
+/* Avoid large per-opcode clones in the conventional-memory kernel. */
+#if __has_attribute(noclone)
+__attribute__((noclone))
+#endif
+static __attribute__((noinline)) u64 reference(unsigned op, u64 a, u64 b) {
     u64 out = 0, mask, v;
     unsigned w = 8, n, i;
     if (op <= op_packuswb) {
@@ -178,7 +182,7 @@ static u32 mmx_state(void) {
     CHECK(out==(u64)d); CHECK_EQ(r,d);
     __asm__ volatile("movq %1,%%mm0; movq %%mm0,%%mm1; movq %%mm1,%0; emms" : "=m"(out) : "m"(q) : "memory");
     CHECK(out==q);
-    if (cpu.has_fpu) {
+    if (cpu_test_feature(REQ_FPU)) {
         u32 env[7];
         __asm__ volatile("fninit; movq %1,%%mm0; emms; fnstenv %0" : "=m"(env) : "m"(q) : "memory");
         CHECK_EQ(env[2]&0xffff,0xffff);
@@ -190,7 +194,7 @@ static u32 mmx_state(void) {
     t_ops(40); return (u32)out;
 }
 static u32 mmx_alias(void) {
-    if(!cpu.has_fpu) SKIP("FPU alias checks require an FPU");
+    if(!cpu_test_feature(REQ_FPU)) SKIP("FPU alias checks require an FPU");
     u8 save[108]; u32 env[7]; u16 sw; u64 q=0x0123456789abcdefull; unsigned bad=0;
     __asm__ volatile("fninit; fld1; fldz; movq %1,%%mm0; movq %%mm0,%%mm1; movq %%mm0,%%mm2; movq %%mm0,%%mm3; movq %%mm0,%%mm4; movq %%mm0,%%mm5; movq %%mm0,%%mm6; movq %%mm0,%%mm7; fnstenv %0" : "=m"(env) : "m"(q) : "memory");
     unsigned basic_ok=(env[1]&0x3800)==0;
@@ -274,8 +278,13 @@ static u32 mmx_x87_transitions(void) {
             : "=m"(output), "=m"(result), "=m"(final_env), "=m"(saved),
               "=m"(mm_env), "=m"(empty_env)
             : "m"(input), "m"(a), "m"(b) : "memory");
+        /* FNSTENV may reconstruct valid/zero/special tags from register data.
+           MMX guarantees occupancy, not that every saved tag is 00. */
+        u32 empty = 0;
+        for (u32 j = 0; j < 8; j++)
+            empty += ((mm_env[2] >> (j * 2)) & 3) == 3;
         if ((u32)output != (u32)b * 2 || (u32)(output >> 32) != (u32)a * 2 ||
-            (mm_env[2] & 0xffff) != 0 || (mm_env[1] & 0x3800) != 0 ||
+            empty != 0 || (mm_env[1] & 0x3800) != 0 ||
             (empty_env[2] & 0xffff) != 0xffff || (empty_env[1] & 0x3800) != 0 ||
             result != a + b ||
             (final_env[2] & 0xffff) != 0xffff || (final_env[1] & 0x3841) != 0) {
@@ -283,7 +292,7 @@ static u32 mmx_x87_transitions(void) {
                    TEST_SEED, i, a, b, mm_env[2] & 0xffff, empty_env[2] & 0xffff,
                    final_env[1] & 0xffff);
             CHECK_EQ((u32)output, (u32)b * 2); CHECK_EQ(output >> 32, (u32)a * 2);
-            CHECK_EQ(mm_env[2] & 0xffff, 0); CHECK_EQ(mm_env[1] & 0x3800, 0);
+            CHECK_EQ(empty, 0); CHECK_EQ(mm_env[1] & 0x3800, 0);
             CHECK_EQ(empty_env[2] & 0xffff, 0xffff); CHECK_EQ(result, a + b);
             CHECK_EQ(empty_env[1] & 0x3800, 0);
             CHECK_EQ(final_env[2] & 0xffff, 0xffff); CHECK_EQ(final_env[1] & 0x3841, 0);
@@ -294,7 +303,99 @@ static u32 mmx_x87_transitions(void) {
     t_ops(256u * HEAVY_SCALE); return sum;
 }
 
+#define EXT_BINARY(X) X(pavgb) X(pavgw) X(pmaxsw) X(pminsw) X(pmaxub) X(pminub) X(pmulhuw) X(psadbw)
+#define EXT_ENUM(n) ext_##n,
+enum { EXT_BINARY(EXT_ENUM) ext_end };
+#undef EXT_ENUM
+
+static u64 extended_reference(u32 op, u64 a, u64 b) {
+    u64 result = 0;
+    if (op == ext_psadbw) {
+        for (u32 j = 0; j < 8; j++) {
+            u32 x = lane(a, j, 8), y = lane(b, j, 8);
+            result += x > y ? x - y : y - x;
+        }
+        return result;
+    }
+    u32 width = (op == ext_pavgb || op == ext_pmaxub || op == ext_pminub) ? 8 : 16;
+    for (u32 j = 0; j < 64 / width; j++) {
+        u32 x = lane(a, j, width), y = lane(b, j, width), value;
+        if (op == ext_pavgb || op == ext_pavgw) value = (x + y + 1) >> 1;
+        else if (op == ext_pmulhuw) value = (x * y) >> 16;
+        else if (op == ext_pmaxsw) value = (s16)x > (s16)y ? x : y;
+        else if (op == ext_pminsw) value = (s16)x < (s16)y ? x : y;
+        else if (op == ext_pmaxub) value = x > y ? x : y;
+        else value = x < y ? x : y;
+        result |= (u64)value << (width * j);
+    }
+    return result;
+}
+
+static u64 extended_execute(u32 op, u64 a, u64 b, u32 memory) {
+    u64 result = 0;
+    switch (op) {
+#define EXT_DO(n) case ext_##n: \
+        if (memory) \
+            __asm__ volatile("movq %1,%%mm0; " #n " %2,%%mm0; movq %%mm0,%0; emms" \
+                             : "=m"(result) : "m"(a), "m"(b) : "memory"); \
+        else \
+            __asm__ volatile("movq %1,%%mm0; movq %2,%%mm1; " #n " %%mm1,%%mm0; movq %%mm0,%0; emms" \
+                             : "=m"(result) : "m"(a), "m"(b) : "memory"); \
+        break;
+        EXT_BINARY(EXT_DO)
+#undef EXT_DO
+    }
+    return result;
+}
+
+static u32 mmx_extended(void) {
+    u32 seed = TEST_SEED, sum = 0;
+    for (u32 i = 0; i < 2048; i++) {
+        u64 a = random64(&seed), b = random64(&seed);
+        if (i < 4) {
+            const u64 edges[] = {0, ~0ull, 0x80007fff80007fffull, 0xff00ff0000ff00ffull};
+            a = edges[i]; b = edges[3 - i];
+        }
+        for (u32 op = 0; op < ext_end; op++) {
+            u64 want = extended_reference(op, a, b);
+            for (u32 form = 0; form < 2; form++) {
+                u64 got = extended_execute(op, a, b, form);
+                CHECK_EQ((u32)got, (u32)want);
+                CHECK_EQ(got >> 32, want >> 32);
+                sum = csum_mix(sum, (u32)got);
+            }
+        }
+        u64 shuffled, inserted, streamed __attribute__((aligned(8)));
+        u32 mask, extracted, word = rng(&seed), expected_mask = 0;
+        __asm__ volatile("movq %4,%%mm0; pshufw $0x1b,%%mm0,%%mm1; movq %%mm1,%0;"
+                         "pmovmskb %%mm0,%1; pextrw $2,%%mm0,%2;"
+                         "pinsrw $2,%5,%%mm0; movq %%mm0,%3; emms"
+                         : "=m"(shuffled), "=&r"(mask), "=&r"(extracted), "=m"(inserted)
+                         : "m"(a), "r"(word) : "memory");
+        u64 want_shuffle = 0;
+        for (u32 j = 0; j < 4; j++) want_shuffle |= lane(a, 3 - j, 16) << (16 * j);
+        for (u32 j = 0; j < 8; j++) expected_mask |= ((a >> (8 * j + 7)) & 1) << j;
+        CHECK(shuffled == want_shuffle);
+        CHECK_EQ(mask, expected_mask);
+        CHECK_EQ(extracted, lane(a, 2, 16));
+        CHECK(inserted == ((a & ~0xffff00000000ull) | ((u64)(word & 65535) << 32)));
+        __asm__ volatile("movq %1,%%mm0; movntq %%mm0,%0; sfence; emms"
+                         : "=m"(streamed) : "m"(a) : "memory");
+        CHECK(streamed == a);
+        u8 masked[8];
+        for (u32 j = 0; j < 8; j++) masked[j] = 0xa5;
+        u8 *destination = masked;
+        __asm__ volatile("movq %1,%%mm0; movq %2,%%mm1; maskmovq %%mm1,%%mm0; sfence; emms"
+                         : "+D"(destination) : "m"(a), "m"(b) : "memory");
+        for (u32 j = 0; j < 8; j++)
+            CHECK_EQ(masked[j], (b & (0x80ull << (8 * j))) ? lane(a, j, 8) : 0xa5);
+    }
+    t_ops(2048 * (2 * ext_end + 6));
+    return sum;
+}
+
 const test_t tests_mmx[] = {
+    {"mmx_extended",mmx_extended,REQ_MMX|REQ_MMXEXT},
     {"mmx_x87_transitions",mmx_x87_transitions,REQ_MMX|REQ_FPU},
     {"mmx_alu",mmx_alu,REQ_MMX}, {"mmx_shifts",mmx_shifts,REQ_MMX},
     {"mmx_state",mmx_state,REQ_MMX}, {"mmx_alias",mmx_alias,REQ_MMX}, {"mmx_exc",mmx_exc,REQ_MMX},

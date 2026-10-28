@@ -42,7 +42,7 @@ static void mixed_irq_hook(regs_t *r) {
         return;
     }
     mixed_soft_count++;
-    if (cpu.has_fpu) {
+    if (cpu_test_feature(REQ_FPU)) {
         __asm__ volatile("fnsave %0\n\tfninit\n\tfld1\n\tfld1\n\tfaddp\n\tfrstor %0"
                          : "+m"(fpu_irq_image) :: "memory");
         mixed_fpu_count++;
@@ -66,7 +66,7 @@ static u32 mixed_body(u32 *data, u32 *pt, u32 *frames, u32 iterations) {
     volatile u32 *window = (volatile u32 *)0x50000000u;
     u32 x = (u32)TEST_SEED, sum = 0;
     u32 old_cw = 0, custom_cw = 0x077Fu;
-    if (cpu.has_fpu) {
+    if (cpu_test_feature(REQ_FPU)) {
         __asm__ volatile("fnstcw %0" : "=m"(old_cw));
         __asm__ volatile("fninit; fldcw %0" :: "m"(custom_cw) : "memory");
     }
@@ -79,7 +79,7 @@ static u32 mixed_body(u32 *data, u32 *pt, u32 *frames, u32 iterations) {
         CHECK_EQ(*slot, v);
         sum = csum_mix(sum, v ^ x);
 
-        if (cpu.has_fpu) {
+        if (cpu_test_feature(REQ_FPU)) {
             u64 got;
             u16 cw;
             __asm__ volatile("fldl %2; faddl %3; fstpl %0; fnstcw %1"
@@ -88,7 +88,7 @@ static u32 mixed_body(u32 *data, u32 *pt, u32 *frames, u32 iterations) {
             CHECK_EQ(cw, custom_cw);
         }
 
-        if (cpu.has_mmx && cpu.has_fpu) {
+        if (cpu_test_feature(REQ_MMX) && cpu_test_feature(REQ_FPU)) {
             u64 got;
             __asm__ volatile("movq %1,%%mm0; paddd %2,%%mm0; movq %%mm0,%0; emms"
                              : "=m"(got) : "m"(mmx_step), "m"(mmx_step) : "memory");
@@ -97,9 +97,9 @@ static u32 mixed_body(u32 *data, u32 *pt, u32 *frames, u32 iterations) {
         }
 
         if (!(i & 255u)) {
-            if (cpu.has_fpu) __asm__ volatile("fldl %0" :: "m"(fp_one) : "memory");
+            if (cpu_test_feature(REQ_FPU)) __asm__ volatile("fldl %0" :: "m"(fp_one) : "memory");
             __asm__ volatile("int $0x90" ::: "memory", "cc");
-            if (cpu.has_fpu) {
+            if (cpu_test_feature(REQ_FPU)) {
                 u64 restored;
                 __asm__ volatile("fstpl %0" : "=m"(restored) :: "memory");
                 CHECK(restored == fp_one);
@@ -112,7 +112,7 @@ static u32 mixed_body(u32 *data, u32 *pt, u32 *frames, u32 iterations) {
         CHECK_EQ(window[0], 0x6A530000u + frame);
         if (!(i & 7u)) wr_cr3(rd_cr3());
     }
-    if (cpu.has_fpu) __asm__ volatile("fldcw %0" :: "m"(old_cw) : "memory");
+    if (cpu_test_feature(REQ_FPU)) __asm__ volatile("fldcw %0" :: "m"(old_cw) : "memory");
     CHECK_EQ(x, lcg_advance((u32)TEST_SEED, iterations));
     return sum ^ x;
 }
@@ -148,12 +148,12 @@ static u32 heavy_mix_transitions(void) {
     wr_cr3(saved_cr3);
     invlpg((void *)0x50000000u);
     int_hook[APIC_TIMER_VECTOR] = old_hook;
-    if (cpu.has_mmx && cpu.has_fpu) __asm__ volatile("emms");
-    if (cpu.has_fpu) __asm__ volatile("fninit");
+    if (cpu_test_feature(REQ_MMX) && cpu_test_feature(REQ_FPU)) __asm__ volatile("emms");
+    if (cpu_test_feature(REQ_FPU)) __asm__ volatile("fninit");
     CHECK_EQ(rc, GUARD_OK);
     CHECK_EQ(mixed_bad_vector, 0);
     CHECK_EQ(mixed_soft_count, (iterations + 255u) / 256u);
-    if (cpu.has_fpu) CHECK_EQ(mixed_fpu_count, (iterations + 255u) / 256u);
+    if (cpu_test_feature(REQ_FPU)) CHECK_EQ(mixed_fpu_count, (iterations + 255u) / 256u);
     u32 ref_x = (u32)TEST_SEED;
     for (u32 i = 0; i < iterations; i++) {
         ref_x = lcg_next(ref_x);
@@ -161,11 +161,11 @@ static u32 heavy_mix_transitions(void) {
         reference[ix] ^= ref_x ^ i;
     }
     for (u32 i = 0; i < WORDS; i++) CHECK_EQ(data[i], reference[i]);
-    u32 ops = iterations * (cpu.has_fpu ? (cpu.has_mmx ? 18u : 14u) : 8u);
+    u32 ops = iterations * (cpu_test_feature(REQ_FPU) ? (cpu_test_feature(REQ_MMX) ? 18u : 14u) : 8u);
     t_ops(ops);
     t_note("iterations=%u integer=%u x87=%u mmx=%u page_remaps=%u cr3_reloads=%u checksum=%08x",
-           iterations, iterations, cpu.has_fpu ? iterations : 0,
-           cpu.has_mmx && cpu.has_fpu ? iterations : 0, iterations, (iterations + 7u) / 8u, mixed_result);
+           iterations, iterations, cpu_test_feature(REQ_FPU) ? iterations : 0,
+           cpu_test_feature(REQ_MMX) && cpu_test_feature(REQ_FPU) ? iterations : 0, iterations, (iterations + 7u) / 8u, mixed_result);
     return mixed_result;
 }
 
@@ -186,14 +186,14 @@ static u32 heavy_state_interrupt(void) {
     mixed_soft_count = mixed_bad_vector = mixed_fpu_count = 0;
     idt_set_gate(APIC_TIMER_VECTOR, isr_stub[APIC_TIMER_VECTOR], SEL_KCODE, 0x8E);
     int_hook[APIC_TIMER_VECTOR] = mixed_irq_hook;
-    if (cpu.has_fpu) {
+    if (cpu_test_feature(REQ_FPU)) {
         __asm__ volatile("fnstcw %0" : "=m"(old_cw));
         __asm__ volatile("fninit; fldcw %0" :: "m"(custom_cw) : "memory");
     }
     for (u32 i = 0; i < count; i++) {
-        int do_x87 = cpu.has_fpu && (!cpu.has_mmx || !(i & 1));
+        int do_x87 = cpu_test_feature(REQ_FPU) && (!cpu_test_feature(REQ_MMX) || !(i & 1));
         if (do_x87) __asm__ volatile("fldl %0" :: "m"(one) : "memory");
-        else if (cpu.has_mmx && cpu.has_fpu)
+        else if (cpu_test_feature(REQ_MMX) && cpu_test_feature(REQ_FPU))
             __asm__ volatile("movq %0,%%mm0" :: "m"(mmx_want) : "memory");
         before = mixed_soft_count;
         __asm__ volatile(
@@ -218,20 +218,20 @@ static u32 heavy_state_interrupt(void) {
             __asm__ volatile("fnstcw %0; fstpl %1" : "=m"(after_cw), "=m"(fp_result) :: "memory");
             CHECK_EQ(after_cw, custom_cw);
             CHECK(fp_result == x87_want);
-        } else if (cpu.has_mmx && cpu.has_fpu) {
+        } else if (cpu_test_feature(REQ_MMX) && cpu_test_feature(REQ_FPU)) {
             __asm__ volatile("movq %%mm0,%0; emms" : "=m"(mmx_result) :: "memory");
             CHECK(mmx_result == mmx_want);
         }
     }
-    if (cpu.has_fpu) __asm__ volatile("fldcw %0" :: "m"(old_cw) : "memory");
+    if (cpu_test_feature(REQ_FPU)) __asm__ volatile("fldcw %0" :: "m"(old_cw) : "memory");
     int_hook[APIC_TIMER_VECTOR] = old_hook;
-    if (cpu.has_mmx && cpu.has_fpu) __asm__ volatile("emms");
+    if (cpu_test_feature(REQ_MMX) && cpu_test_feature(REQ_FPU)) __asm__ volatile("emms");
     CHECK_EQ(mixed_bad_vector, 0);
     CHECK_EQ(mixed_soft_count, count);
-    t_ops(count * (cpu.has_fpu ? (cpu.has_mmx ? 12u : 9u) : 8u));
+    t_ops(count * (cpu_test_feature(REQ_FPU) ? (cpu_test_feature(REQ_MMX) ? 12u : 9u) : 8u));
     t_note("software_interrupts=%u integer_register_checks=%u x87_checks=%u mmx_checks=%u handler_fnsave=%u",
-           count, count * 6u, cpu.has_fpu ? (cpu.has_mmx ? count / 2u : count) : 0,
-           cpu.has_mmx && cpu.has_fpu ? count / 2u : 0, mixed_fpu_count);
+           count, count * 6u, cpu_test_feature(REQ_FPU) ? (cpu_test_feature(REQ_MMX) ? count / 2u : count) : 0,
+           cpu_test_feature(REQ_MMX) && cpu_test_feature(REQ_FPU) ? count / 2u : 0, mixed_fpu_count);
     return mixed_soft_count;
 }
 

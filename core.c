@@ -14,7 +14,8 @@ static int kstreq(const char *a, const char *b) { while (*a && *a == *b) { a++; 
 
 /* ============================ output ============================ */
 static int ser_ok, ser_fail;
-static char note_buf[32768];
+enum { NOTE_CAPACITY = 32768 };
+static char *note_buf;
 static u32 note_len;
 static int note_capture, note_overflow;
 static u16 *vga = (u16 *)0xB8000;
@@ -49,7 +50,7 @@ static void ser_putc(char c) {
 }
 
 static void vga_init(void) {
-    u16 crtc = *(volatile u16 *)0x463;
+    u16 crtc = bda_read16(0x63);
     if (crtc == 0x3B4) vga = (u16 *)0xB0000;
     else vga = (u16 *)0xB8000;
     for (int i = 0; i < 80 * 25; i++) vga[i] = 0x0720;
@@ -70,7 +71,7 @@ static void vga_putc(char c) {
 
 void kputc(char c) {
     if (note_capture) {
-        if (note_len < sizeof note_buf - 1) note_buf[note_len++] = c;
+        if (note_len < NOTE_CAPACITY - 1) note_buf[note_len++] = c;
         else note_overflow = 1;
         return;
     }
@@ -317,7 +318,8 @@ u32 arena_end;
 u32 *pg_dir;
 int paging_on;
 static int pg_built;
-static u32 *bootinfo = (u32 *)0x600;
+extern const u32 bootinfo[8 + 32 * 6];
+extern const u8 _kernel_start[], _end[];
 
 void *arena_alloc(u32 size, u32 align) {
     u32 p = (arena_ptr + align - 1) & ~(align - 1);
@@ -328,23 +330,24 @@ void *arena_alloc(u32 size, u32 align) {
 
 static void mem_init(void) {
     u32 top = 0;
+    u32 runtime_end = ((u32)_end + 4095u) & ~4095u;
     u32 best_base = 0, best_end = 0;
     u32 n = bootinfo[5];
     if (n > 32) n = 32;
     for (u32 i = 0; i < n; i++) {
-        u32 *e = &bootinfo[8 + i * 6];
+        const u32 *e = &bootinfo[8 + i * 6];
         if (e[4] != 1 || e[1] != 0 || !(e[5] & 1)) continue;
         u64 base = ((u64)e[1] << 32) | e[0], len = ((u64)e[3] << 32) | e[2];
         if (base + len < base) continue;
         u64 t = base + len;
         if (t > top) top = t > 0xFFFFFFFFull ? 0xFFFFFFFFu : (u32)t;
-        if (base < 0x110000) base = 0x110000;
+        if (base < runtime_end) base = runtime_end;
         base = (base + 4095) & ~4095ull;
         if (t > 0x1000000) t = 0x1000000;
         t &= ~4095ull;
         /* Reserved records take precedence even if firmware overlaps ranges. */
         for (u32 j = 0; j < n; j++) {
-            u32 *r = &bootinfo[8 + j * 6];
+            const u32 *r = &bootinfo[8 + j * 6];
             if (r[4] == 1 || r[1]) continue;
             u64 rb = r[0], re = rb + (((u64)r[3] << 32) | r[2]);
             if (rb <= base && re > base) t = base;
@@ -359,11 +362,11 @@ static void mem_init(void) {
         u32 kb88 = bootinfo[2], e801 = bootinfo[3], blk = bootinfo[4];
         if (e801) top = 0x100000 + e801 * 1024 + blk * 65536;
         else top = 0x100000 + kb88 * 1024;
-        best_base = 0x110000;
+        best_base = runtime_end;
         best_end = (top > 0x1000000 ? 0x1000000 : top) & ~4095u;
     }
     ram_top = top;
-    arena_base = best_base ? best_base : 0x110000;
+    arena_base = best_base ? best_base : runtime_end;
     if (best_end > arena_base + 0x20000) {
         arena_end = best_end - 0x10000;
         arena_size = arena_end - arena_base - 0x10000;
@@ -372,6 +375,13 @@ static void mem_init(void) {
         arena_size = 0;
     }
     arena_ptr = arena_base + 0x10000;
+    if (!arena_size) {
+        kputs("FATAL no usable extended RAM for diagnostic buffer\nDONE\n");
+        for (;;) { cli(); hlt(); }
+    }
+    /* The arena's reserved 64 KiB header holds page tables below +0x6000;
+     * use its upper half for notes without reducing workload allocations. */
+    note_buf = (char *)(arena_base + 0x8000);
 }
 
 static void arena_reset(void) { arena_ptr = arena_base + 0x10000; }
@@ -448,12 +458,55 @@ static void fpu_probe_fn(void) {
     __asm__ volatile("fninit; fnstsw %0; fnstcw %1" : "=m"(fpu_sw), "=m"(fpu_cw));
 }
 static void cr4_probe_fn(void) { g_cr4_base = rd_cr4(); cr4_ok = 1; }
+static void fxsr_enable_fn(void) { wr_cr4(rd_cr4() | 0x200); }
+static u8 fxsr_probe_state[512] __attribute__((aligned(16)));
+static void fxsr_probe_fn(void) {
+    __asm__ volatile("fxsave %0; fxrstor %0" : "+m"(fxsr_probe_state) :: "memory");
+}
+static void cpuid_probe_fn(void) {
+    u32 a, b, c, d;
+    cpuid(0, &a, &b, &c, &d);
+}
+static void mmx_probe_fn(void) { __asm__ volatile("pxor %mm0,%mm0; emms"); }
+static void cmov_probe_fn(void) {
+    __asm__ volatile("xor %%eax,%%eax; cmovz %%eax,%%eax" ::: "eax", "cc");
+}
+static void cx8_probe_fn(void) {
+    u64 value = 0;
+    __asm__ volatile("lock cmpxchg8b %0" : "+m"(value) :
+                     "a"(0), "d"(0), "b"(0), "c"(0) : "cc");
+}
+static void now_probe_fn(void) {
+    __asm__ volatile("pxor %mm0,%mm0; pfadd %mm0,%mm0; emms");
+}
+static void nowext_probe_fn(void) {
+    __asm__ volatile("pxor %mm0,%mm0; pswapd %mm0,%mm0; emms");
+}
+static void tsc_probe_fn(void) { (void)rdtsc(); }
+
+static void cpu_probe_features(void) {
+    if (cpu_contract_known()) return;
+    const struct { u32 bit; void (*probe)(void); } probes[] = {
+        { REQ_TSC, tsc_probe_fn }, { REQ_CX8, cx8_probe_fn },
+        { REQ_CMOV, cmov_probe_fn }, { REQ_MMX, mmx_probe_fn },
+        { REQ_3DNOW, now_probe_fn }, { REQ_3DNOWEXT, nowext_probe_fn },
+        { REQ_FXSR, fxsr_probe_fn },
+    };
+    for (u32 i = 0; i < sizeof probes / sizeof probes[0]; i++) {
+        int rc = guard_call(probes[i].probe);
+        if (!rc) cpu.probed_features |= probes[i].bit;
+        kprintf("PROBE feature=%08x available=%u rc=%x\n", probes[i].bit, !rc, rc);
+        if (cpu.has_fpu) __asm__ volatile("fninit");
+    }
+}
 
 static void cpu_detect(void) {
     kmemset(&cpu, 0, sizeof cpu);
     cpu.is486 = flag_toggle(1u << 18);
     cpu.is386 = !cpu.is486;
-    cpu.has_cpuid = flag_toggle(1u << 21);
+    int id_flag = flag_toggle(1u << 21);
+    cpu.has_cpuid = guard_call(cpuid_probe_fn) == 0;
+    if (id_flag) cpu.claimed_features |= REQ_CPUID;
     cpu.family = cpu.is486 ? 4 : 3;
     if (cpu.has_cpuid) {
         u32 a, b, c, d;
@@ -484,38 +537,57 @@ static void cpu_detect(void) {
     cpu.has_vme = f >> 1 & 1; cpu.has_de = f >> 2 & 1; cpu.has_pse = f >> 3 & 1; cpu.has_tsc = f >> 4 & 1;
     cpu.has_msr = f >> 5 & 1; cpu.has_pae = f >> 6 & 1; cpu.has_mce = f >> 7 & 1; cpu.has_cx8 = f >> 8 & 1;
     cpu.has_apic = f >> 9 & 1;
+    if (!kmemcmp(cpu.vendor, "AuthenticAMD", 12) && cpu.family == 5 && cpu.model == 0) {
+        /* AMD 20734T: SSA/5 reports PGE in bit 9, not APIC. */
+        cpu.has_apic = 0;
+    }
     cpu.has_sep = (f >> 11 & 1) && !(cpu.family == 6 && cpu.model < 3 && cpu.stepping < 3);
     cpu.has_mtrr = f >> 12 & 1; cpu.has_pge = f >> 13 & 1; cpu.has_cmov = f >> 15 & 1; cpu.has_pat = f >> 16 & 1;
+    if (!kmemcmp(cpu.vendor, "AuthenticAMD", 12) && cpu.family == 5 && cpu.model == 0)
+        cpu.has_pge = f >> 9 & 1;
     cpu.has_pse36 = f >> 17 & 1; cpu.has_mmx = f >> 23 & 1; cpu.has_fxsr = f >> 24 & 1;
     cpu.has_3dnow = cpu.ext_edx >> 31 & 1;
     cpu.has_3dnowext = cpu.ext_edx >> 30 & 1;
-    /* EMMI has no CPUID feature bit; restrict config-port access to 6x86MX/MII. */
+    cpu.has_mmxext = (cpu.ext_edx >> 22 & 1) || (cpu.feat_edx >> 25 & 1);
+    cpu.has_syscall = !kmemcmp(cpu.vendor, "AuthenticAMD", 12) &&
+                     ((cpu.ext_edx & (1u << 11)) ||
+                      (cpu.family == 5 && (cpu.model == 6 || cpu.model == 7) &&
+                       (cpu.ext_edx & (1u << 10))));
+    /* 6x86MX/MII identify EMMI by model; GXm also has extended EDX bit 24. */
     cpu.has_emmi = cpu.has_cpuid && !kmemcmp(cpu.vendor, "CyrixInstead", 12) &&
-                   cpu.family == 6 && cpu.model == 0 && cpu.has_mmx;
+                   ((cpu.family == 6 && cpu.model == 0 && cpu.has_mmx) ||
+                    (cpu.family == 5 && cpu.model == 4 &&
+                     (cpu.ext_edx & (1u << 24))));
 
     /* CR4 availability / baseline CR0 */
     cr4_ok = 0;
-    if (cpu.has_cpuid && guard_call(cr4_probe_fn) != 0) cr4_ok = 0;
+    if (guard_call(cr4_probe_fn) != 0) cr4_ok = 0;
     u32 cr0 = rd_cr0();
     cr0 &= ~(0x4u | 0x8u); /* EM TS: preserve firmware cache policy */
     cr0 |= 0x2u;                                        /* MP */
     if (cpu.is486) cr0 |= 0x20u;                        /* NE */
     wr_cr0(cr0);
     g_cr0_base = cr0;
-    if (cr4_ok && cpu.has_fxsr) { wr_cr4(rd_cr4() | 0x200); g_cr4_base = rd_cr4(); }
+    if (cr4_ok && cpu.has_fxsr) {
+        int rc = guard_call(fxsr_enable_fn);
+        kprintf("PROBE feature=%08x available=%u rc=%x\n", REQ_FXSR, !rc, rc);
+        g_cr4_base = rd_cr4();
+    }
 
     /* FPU probe */
     fpu_sw = 0xFFFF; fpu_cw = 0;
-    if ((!cpu.has_cpuid || (cpu.feat_edx & 1)) &&
-        guard_call(fpu_probe_fn) == 0 && (fpu_sw & 0xFF) == 0 &&
+    if (guard_call(fpu_probe_fn) == 0 && (fpu_sw & 0xFF) == 0 &&
         (fpu_cw & 0x103F) == 0x003F) cpu.has_fpu = 1;
+    cpu.claimed_features |= cpu_detected_features();
+    if (cpu.feat_edx & 1) cpu.claimed_features |= REQ_FPU;
 }
-
-static void tsc_probe_fn(void) { (void)rdtsc(); }
 
 static void calibrate(void) {
     if (!cpu.has_tsc) return;
-    if (guard_call(tsc_probe_fn) != 0) { cpu.has_tsc = 0; return; }
+    if (guard_call(tsc_probe_fn) != 0) {
+        kputs("PROBE feature=00000002 available=0 advertised=1\n");
+        return;
+    }
     stamp_is_tsc = 1;
     u8 p61 = inb(0x61);
     outb(0x61, p61 & 0xFC);
@@ -537,6 +609,7 @@ static void calibrate(void) {
 static const test_t *g_cur;
 static u32 g_sum, g_nfail;
 static u64 g_ops;
+static const char *g_work_unit;
 static const char *g_skip_reason;
 static const char *g_fail_what;
 static int g_fail_line;
@@ -560,6 +633,7 @@ void t_failv(const char *what, int line, u32 got, u32 want) {
 }
 void t_skip(const char *reason) { g_skip_reason = reason; }
 void t_ops(u64 n) { g_ops += n; }
+void t_work_unit(const char *unit) { g_work_unit = unit; }
 void t_note(const char *fmt, ...) {
     if (test_quiet) return;
     va_list ap;
@@ -583,6 +657,8 @@ static const char *missing_req(u32 req) {
         { REQ_MTRR, "mtrr" }, { REQ_APIC, "apic" }, { REQ_MEM8M, "ram8m" }, { REQ_PCI, "pci" }, { REQ_MCE, "mce" },
         { REQ_VME, "vme" }, { REQ_DE, "de" }, { REQ_3DNOW, "3dnow" },
         { REQ_3DNOWEXT, "3dnowext" }, { REQ_EMMI, "cyrix_emmi" },
+        { REQ_AC, "alignment_check" },
+        { REQ_SYSCALL, "syscall" }, { REQ_MMXEXT, "mmxext" },
     };
     for (unsigned i = 0; i < sizeof m / sizeof m[0]; i++) {
         if (!(req & m[i].bit)) continue;
@@ -601,6 +677,7 @@ static const char *missing_req(u32 req) {
         case REQ_MSR: ok = cpu.has_msr; break;
         case REQ_CX8: ok = cpu.has_cx8; break;
         case REQ_486: ok = cpu.is486; break;
+        case REQ_AC: ok = cpu.is486; break;
         case REQ_P5: ok = cpu.family >= 5; break;
         case REQ_P6: ok = cpu.family >= 6; break;
         case REQ_NOHV: ok = !cpu.hv; break;
@@ -618,8 +695,11 @@ static const char *missing_req(u32 req) {
         case REQ_3DNOW: ok = cpu.has_3dnow; break;
         case REQ_3DNOWEXT: ok = cpu.has_3dnowext; break;
         case REQ_EMMI: ok = cpu.has_emmi; break;
+        case REQ_SYSCALL: ok = cpu.has_syscall; break;
+        case REQ_MMXEXT: ok = cpu.has_mmxext; break;
         }
-        if (!ok) return m[i].name;
+        if (!ok && !(cpu_workload_features & m[i].bit))
+            return m[i].name;
     }
     return NULL;
 }
@@ -706,14 +786,21 @@ static int selected(const char *name) {
 static void run_tests(const test_t *t) {
     for (; t->name; t++) {
         ++test_index;
-        if (!selected(t->name)) continue;
+        if (!selected(t->name) && t != tests_cpu_contract) {
+            kprintf("FILTER name=%s id=%u req=%08x reason=build_selection\n",
+                    t->name, test_index, t->req);
+            cpu_feature_result(t, "FILTERED");
+            continue;
+        }
         u32 runtime_start = ms_now();
+        int accuracy_test = cpu_accuracy_mode() || t == tests_cpu_contract;
         g_cur = t;
         tot_tests++;
         post((u8)test_index);
         g_nfail = 0; g_ops = 0; g_sum = 0; g_skip_reason = NULL; g_fail_what = NULL;
         note_len = 0; note_capture = 0; note_overflow = 0;
         test_quiet = 0;
+        g_work_unit = "operation";
         const char *miss = missing_req(t->req);
         const char *status;
         u64 c0 = 0, c1 = 0, cycles = 0, operations = 0;
@@ -733,9 +820,11 @@ static void run_tests(const test_t *t) {
             status = "SKIP";
             g_skip_reason = miss;
             tot_skip++;
-            kprintf("TEST r=%u name=%s status=SKIP reason=missing_%s id=%u req=%08x\n",
-                    g_round, t->name, miss, test_index, t->req);
+            kprintf("TEST r=%u name=%s status=SKIP reason=missing_%s id=%u req=%08x mode=%s\n",
+                    g_round, t->name, miss, test_index, t->req,
+                    accuracy_test ? "accuracy" : "benchmark");
             report_runtime(t->name, runtime_start, 0, 0);
+            cpu_feature_result(t, status);
             continue;
         }
         kprintf("BEGIN r=%u name=%s phase=%s\n", g_round, t->name, g_round == 1 ? "first" : "repeat");
@@ -789,8 +878,11 @@ static void run_tests(const test_t *t) {
             else cycles += c1 - c0;
             sample_window_ms = ms_now() - sample_start;
             if (rc || g_skip_reason) break;
-            if (sample_window_ms >= TEST_SECONDS * 1000u &&
-                (!lease_deadline || (s32)(pit_ticks - lease_deadline) >= 0)) break;
+#if BENCHMARKS
+            if (!accuracy_test && (sample_window_ms < TEST_SECONDS * 1000u ||
+                (lease_deadline && (s32)(pit_ticks - lease_deadline) < 0))) continue;
+#endif
+            break;
         }
         lease_active_id = 0;
         test_quiet = 0;
@@ -802,13 +894,16 @@ static void run_tests(const test_t *t) {
         else if (total_failures) { status = "FAIL"; tot_fail++; }
         else if (g_skip_reason) { status = "SKIP"; tot_skip++; }
         else { status = "PASS"; tot_pass++; }
+        cpu_feature_result(t, status);
         kprintf("TEST r=%u name=%s status=%s ms=%u cyc=%llu unit=%s ops=%llu sum=%08x",
                 g_round, t->name, status, sample_ms, cycles,
                 stamp_is_tsc ? "tsc" : "pit", operations, sum);
         kprintf(" iterations=%u warmup_ms=%u warmup_failed=%u failed_iterations=%u id=%u",
                 iterations ? iterations - 1 : 0, warmup_ms, warmup_failed, failed_iterations, test_index);
-        kprintf(" iteration_ops=%llu sample_window_ms=%u req=%08x",
-                variable_ops ? 0 : iteration_ops, sample_window_ms, t->req);
+        kprintf(" iteration_ops=%llu sample_window_ms=%u req=%08x mode=%s",
+                variable_ops ? 0 : iteration_ops, sample_window_ms, t->req,
+                accuracy_test ? "accuracy" : "benchmark");
+        kprintf(" op_unit=%s timing_scope=checked_workload", g_work_unit);
         if (rc) kprintf(" rc=%03x exc_vec=%u exc_err=%08x exc_eip=%08x cr2=%08x", rc, e_vec, e_err, e_eip, e_cr2);
         if (timing_invalid) kputs(" timing_invalid=counter_regressed");
         kprintf(" ops_constant=%u ms_resolution=10", !variable_ops && iteration_ops != 0);
@@ -852,7 +947,8 @@ void kmain(void) {
     vga_init();
     post(1);
     kprintf("CPUBURN-TEST %s start\n", CPUBURN_VERSION);
-    kprintf("BUILD version=%s compiler=\"%s\"\n", CPUBURN_VERSION, __VERSION__);
+    kprintf("BUILD version=%s compiler=\"%s\" benchmarks=%u\n",
+            CPUBURN_VERSION, __VERSION__, BENCHMARKS);
 
     gdt_init();
     idt_init();
@@ -864,7 +960,11 @@ void kmain(void) {
         kputs("FATAL PIT/PIC timer unavailable; legacy PC platform required\nDONE\n");
         for (;;) { cli(); hlt(); }
     }
+    cpu_control(ser_ok);
     cpu_detect();
+    cpu_contract_init();
+    cpu_probe_features();
+    cpu_workload_features = cpu_required_features() | cpu.claimed_features | cpu.probed_features;
     calibrate();
     pci_probe();
     mem_init();
@@ -876,9 +976,10 @@ void kmain(void) {
     kprintf("CPU mhz=%u tsc_per_ms=%llu hypervisor=%u hv_vendor=\"%s\" cr4=%u pci=%u serial=%u\n", cpu.mhz, cpu.tsc_per_ms, cpu.hv, cpu.hv_vendor, cr4_ok, pci_present, ser_ok);
     kprintf("CPU ext_edx=%08x 3dnow=%u 3dnowext=%u cyrix_emmi=%u\n",
             cpu.ext_edx, cpu.has_3dnow, cpu.has_3dnowext, cpu.has_emmi);
-    kprintf("MEM ram_top=%08x arena_base=%08x arena_size=%08x\n", ram_top, arena_base, arena_size);
-    kprintf("CFG rounds=%u burn_seconds=%u watchdog_seconds=%u heavy_scale=%u seed=%08x test_seconds=%u protocol=work1\n",
-            ROUNDS, BURN_SECONDS, WATCHDOG_SECONDS, HEAVY_SCALE, (u32)TEST_SEED, TEST_SECONDS);
+    kprintf("MEM ram_top=%08x arena_base=%08x arena_size=%08x kernel_start=%08x kernel_end=%08x\n",
+            ram_top, arena_base, arena_size, (u32)_kernel_start, (u32)_end);
+    kprintf("CFG rounds=%u burn_seconds=%u watchdog_seconds=%u heavy_scale=%u seed=%08x test_seconds=%u protocol=work1 benchmarks=%u\n",
+            ROUNDS, BURN_SECONDS, WATCHDOG_SECONDS, HEAVY_SCALE, (u32)TEST_SEED, TEST_SECONDS, BENCHMARKS);
     if (*ONLY) kprintf("CFG only=%s\n", ONLY);
 
     if (cpu.is386) kprintf("WARN 386 detected: unsupported, results may be unreliable\n");
@@ -886,6 +987,7 @@ void kmain(void) {
     u32 start_ms = ms_now();
     for (g_round = 1; g_round <= ROUNDS; g_round++) {
         paging_disable();
+        run_tests(tests_cpu_contract);
         run_tests(tests_core);
         run_tests(tests_int);
         run_tests(tests_corpus);
@@ -893,6 +995,7 @@ void kmain(void) {
         run_tests(tests_fp_edges);
         run_tests(tests_mmx);
         run_tests(tests_vendor);
+        run_tests(tests_cyrix);
         run_tests(tests_pmode);
         run_tests(tests_heavy_pmode);
         run_tests(tests_chipset);
@@ -908,6 +1011,7 @@ void kmain(void) {
         if (g_round == ROUNDS) run_tests(tests_burn);
     }
     u32 runtime_total = ms_now() - start_ms;
+    cpu_feature_report();
     kprintf("SUMMARY rounds=%u tests=%u pass=%u fail=%u skip=%u fault=%u ms=%u\n", ROUNDS, tot_tests, tot_pass, tot_fail, tot_skip, tot_fault,
             runtime_total);
     kprintf("RUNTIME scope=suite total_ms=%u warmup_ms=%llu sample_ms=%llu overhead_ms=%llu suite_overhead_ms=%llu resolution_ms=10\n",

@@ -63,6 +63,7 @@ The source registries `tests_*.c` list the precise workloads and feature gates.
 | Integer execution and translation | `tests_int.c`, `tests_corpus.c`, `tests_sweeps.c` | Arithmetic/defined flags, decoding, branches, SMC and code footprints; exhaustive only where explicitly stated, otherwise deterministic samples. |
 | x87 and MMX | `tests_fpu.c`, `tests_fp_edges.c`, `tests_mmx.c` | Results, formats, rounding, status/environment and scalar/exact references; not full x87 transcendental precision certification. |
 | AMD/Cyrix extensions | `tests_vendor.c` | Feature-gated baseline/enhanced 3DNow! and all twelve Cyrix EMMI opcodes; integer-only references, finite dyadic floating-point cases and documented reciprocal precision bounds. Not exhaustive floating-point range/rounding certification. |
+| Cyrix CPU controls | `tests_cyrix.c` | Model-qualified CCR4 CPUID/ID-flag controls and disabled-SMM opcode faults; saved configuration restored. GXm CPUID expectations prepared, execution pending integration. Not full CCR/ARR or SMM entry/exit coverage. |
 | Privilege, exceptions and restart | `tests_pmode.c`, `tests_heavy_pmode.c`, `tests_priority.c`, `tests_restart_complex.c` | Protected-mode architectural transitions and selected fault precedence/restart cases; not every combination of instructions, exceptions or pending interrupts. |
 | Paging and translated memory | `tests_paging.c`, `tests_heavy_paging.c`, `tests_mem.c` | Permissions, aliases, TLB invalidation and checked accesses; selected memory sizes/alignments, not a proof over all physical mappings. |
 | CPU/system state and sustained interactions | `tests_sys.c`, `tests_heavy_state.c`, `tests_burn.c` | Feature-gated control state, interrupts and mixed repetition; safe probes do not establish complete model-specific MSR behavior. |
@@ -108,8 +109,17 @@ and conversion tests include register, memory and same-register source/destinati
 forms. EMMI checks both even/odd specified registers and their implicit partners;
 memory-only instructions are never tested with invalid register operands.
 
-EMMI has no ordinary CPUID feature bit. Only `CyrixInstead`, family 6,
-model 0 with MMX (6x86MX/MII) may access Cyrix configuration ports.
+The twelve additional `cyrix_emmi_<opcode>` records isolate each EMMI operation
+using the same assertion forms, edge cases and vector counts as the two
+aggregate records. Each single-opcode invocation resets the deterministic PRNG;
+later opcodes in an aggregate continue its PRNG stream.
+Both accuracy and benchmark builds include them; existing aggregate IDs remain
+available for historical comparisons. Their work unit is
+`emmi_instruction_case`, not scalar lanes or raw instruction throughput.
+
+EMMI has no ordinary CPUID feature bit. The gate accepts `CyrixInstead`,
+family 6, model 0 with MMX (6x86MX/MII), or GXm family 5, model 4 with
+extended CPUID EDX bit 24. That extended bit means EMMI, **not FXSAVE**.
 The workloads temporarily enable CCR7.EMMX, preserving CCR3 mapping and
 restoring both configuration registers even after a guarded fault/watchdog.
 Other CPUs skip without touching these ports. Tests do not enable CPUID
@@ -142,7 +152,7 @@ that a particular instruction was translated or linked by the host.
 | `int_flags_boundaries` | ADD/SUB result and all six defined arithmetic flags across taken JMP and CALL/RET, then SETcc and ADC/SBB consumers; edge values plus seeded inputs. | 4,096 producer/consumer cases |
 | `int_partial_boundaries` | AL, AH and AX writes preserve the other EAX bits across branches/calls; full-width snapshots and an AH-dependent result. | 8,192 cases |
 | `int_divide_state` | DIV by zero, unsigned quotient overflow and signed quotient overflow deliver #DE at the faulting EIP, preserving dividend and divisor registers both in the exception frame and after handler return. Undefined division flags are not asserted. | 3,072 faults |
-| `mmx_x87_transitions` | FNSAVE/FRSTOR around MMX arithmetic and EMMS, MMX tag/TOP state, empty tags after EMMS, and exact integer x87 results plus final tags/TOP. | 2,048 transitions |
+| `mmx_x87_transitions` | FNSAVE/FRSTOR around MMX arithmetic and EMMS, nonempty MMX tags/TOP state, empty tags after EMMS, and exact integer x87 results plus final tags/TOP. Saved tags may classify register contents as valid, zero, or special; they need not all be zero. | 2,048 transitions |
 | `heavy_pm_code_context` | Repeated far calls to identical code bytes at the same offset/base/selector while alternating the code descriptor's default operand size. Both 16- and 32-bit decoding paths must return the correct result. | 32,768 calls |
 
 `ops` counts the cases/faults/transitions/calls in this table, **not guest
@@ -250,6 +260,104 @@ each save/restore record runs 65,536 checked iterations. LAPIC periodic stress
 requires at least 2,048 deliveries over at least two seconds; one-shot stress
 rearms and checks 1,024 deliveries. Actual periodic count varies with timing.
 
+## CPU contracts and accuracy runs
+
+The 86Box runner supplies its requested CPU family and FPU configuration to
+the guest automatically. The guest compares this independent expectation
+against its detected identity and features in `cpu_model_contract`, even when
+`ONLY` selects other tests. A required feature hidden by CPUID does **not**
+disable its registered tests: those tests execute under the existing exception
+guard. Missing advertisements fail the contract check; unsupported execution
+is recorded as FAULT rather than SKIP. Existing failures remain failures.
+Non-CPU requirements such as sufficient RAM and PCI availability still gate
+tests normally. A configured FPU cannot remove an integrated FPU requirement.
+
+```sh
+python3 tools/run_86box.py --emulator ../86Box/build/src/86Box --profile k6-2 --accuracy
+```
+
+`--accuracy` runs one warmup and one checked invocation per selected test,
+without benchmark sampling extensions. Every invocation keeps the same cases,
+seed and assertions as benchmark mode. Duration-based stress workloads retain
+their own guest-time durations. Accuracy runs require the new guest's control
+acknowledgement and DONE; early `--expect` markers cannot end them. Guest
+FAIL/FAULT results give the runner a nonzero exit. Host timeouts remain
+incomplete runs, not architectural failures. Fast-forward and host emulation
+capacity do not determine architectural verdicts. The performance report
+retains these correctness outcomes but does not treat them as benchmark samples.
+Without `--accuracy`, sustained benchmarking remains the default.
+
+To build a correctness-only image, disable benchmarks in the normal Makefile:
+
+```sh
+make -B BENCHMARKS=0
+make -B BENCHMARKS=1 # restore the default benchmark-enabled build
+```
+
+`BENCHMARKS` defaults to `1` and accepts only `0` or `1`. With `0`, the timed
+sampling/repetition loop is compiled out, the image always uses accuracy mode,
+and host sampling leases cannot extend a test. No `--accuracy` argument or
+host controller is needed. The 86Box runner recognizes this build automatically.
+Correctness cases, including assertions in burn-named workloads, remain intact;
+their intrinsic stress durations are not removed. Warmup and one checked
+invocation still run, but their times are diagnostic data, not benchmark samples.
+BUILD/CFG records and release BUILD.txt identify the setting. Use `-B` when
+changing it, just as for the other Makefile build settings.
+
+`cpu_models.h` contains minimum contracts for all 66 currently active 486+
+families, plus the two build-conditional K5 families. The catalogue includes
+486-class 386-bus upgrades and later Intel, AMD, Cyrix, IDT and VIA models.
+Requirements are independently sourced architectural minima, not generated
+from emulator implementations or accepted because master passes.
+[CPU contracts and coverage](doc/cpu-contracts.md) documents sources,
+configuration exceptions, protocol details and remaining coverage gaps.
+
+Standalone boot waits at most two guest seconds for optional host input, then
+uses detection. Ambiguous identities use intersected minimum requirements;
+unknown models use guarded feature discovery and retain unverified identity.
+`CONFORMANCE` records
+explicitly say `coverage=partial` and `catalogue=known/unknown`; unknown model
+contracts are SKIP, never verified conformance. UART control records and
+conformance metadata are preserved in JSON and plain serial logs. Runs with
+different contracts cannot be pooled into one performance report.
+
+`FEATURE` records distinguish sampled PASS, FAIL, UNTESTED and NA. Missing
+witnesses, filtered tests, skipped coverage and unmapped CPUID claims are not
+passes. `FILTER` records retain tests omitted by `ONLY`. Strict system-state
+checks cover TSC MSRs, MTRR/PAT/MCA state, MCE control, DE exceptions and PSE36
+address-bit/fault handling. AMD legacy SYSCALL/SYSRET and MMX integer
+extensions have separate behavioural witnesses and applicability gates.
+These are behavioural samples, not exhaustive
+proof of every architectural feature or interaction.
+
+Generate a source-bound compatible-machine/FPU/engine matrix, or execute a
+selection with actual CPU identity checks:
+
+```sh
+python3 tools/cpu_matrix.py --source ../86Box --output build/cpu-matrix
+python3 tools/cpu_matrix.py --source ../86Box --all-speeds --output build/cpu-matrix-all
+python3 tools/cpu_matrix.py --source ../86Box --output build/cpu-matrix-run \
+  --run --family pentium_p55c --family k6_2p --engine on
+```
+
+Generation does not require ROMs or start VMs. Execution uses local ROMs,
+isolated inputs, accuracy mode and sequential runs; failures, missing firmware,
+blocked entries and incomplete runs remain explicit. Some architectural claims
+still need behavioural witnesses; see the coverage document rather than
+treating a clean selected run as complete CPU certification.
+
+The optional contract integration tests use QEMU TCG to inject a hidden MMX
+feature bit and an incorrect expected model. These check the test harness,
+not whether QEMU is an accuracy oracle for 86Box:
+
+```sh
+make -B ONLY=int_partial_boundaries,mmx_alu,3dnow_float
+CPUBURN_CONTRACT_IMAGE="$PWD/floppy.img" python3 -m unittest discover -s tools -p test_cpu_contract.py
+make -B BENCHMARKS=0 ONLY=pm_syscall,mmx_extended
+CPUBURN_EXTENSION_IMAGE="$PWD/floppy.img" python3 -m unittest discover -s tools -p test_cpu_contract.py
+make -B # restore the complete default image after focused validation
+```
+
 ## Build and boot
 
 Requirements: GNU make, GNU coreutils, NASM and a C compiler/linker/objcopy
@@ -292,8 +400,8 @@ make release CROSS_COMPILE=i686-linux-gnu-
 # A bare-metal toolchain can use CROSS_COMPILE=i686-elf- instead.
 ```
 
-`CROSS_COMPILE` supplies the default GCC, linker and objcopy prefixes.
-Explicit `CC`, `LD`, `OBJCOPY` and `NASM` settings take precedence,
+`CROSS_COMPILE` supplies the default GCC, linker, objcopy and nm prefixes.
+Explicit `CC`, `LD`, `OBJCOPY`, `NM` and `NASM` settings take precedence,
 including tool installations with versioned executable names. Do not select
 an aarch64-targeting GCC: the **host** may be aarch64, but the **output**
 must remain 32-bit i486-compatible x86. Building and running the image are
@@ -305,6 +413,46 @@ image creation and packaging are direct Makefile recipes, without helper
 scripts or generated provenance headers. `VERSION` supplies the guest version;
 the compiler's built-in version string supplies its `BUILD` identification.
 Serial parsers/reports retain this record, including with plain COM1 logs.
+
+The default `-O2` preserves the established guest instruction mix and keeps the
+floppy payload compact. The runtime now executes at **1 MiB** in protected mode;
+its zero-initialized state no longer competes with low-memory V86 fixtures.
+Diagnostic notes use the upper 32 KiB of
+the arena's already-reserved header, leaving workload allocations unchanged.
+The ELF has separate code/read-only and writable load segments; these describe
+the image layout, not guest page protections for self-modifying-code tests.
+
+### Floppy boot and memory layout
+
+The 512-byte BIOS boot sector loads a 4 KiB bootstrap and the runtime file into
+low-memory staging. The bootstrap gathers the BIOS memory map, enables A20,
+enters protected mode and verifies that the entire runtime range, including
+BSS, is usable extended RAM before copying the file to `0x100000`.
+Enabled E820 reservations override overlapping usable entries; adjacent usable
+entries may cover the range together. Without E820, the contiguous RAM size
+reported by E801 or INT 15h/AH=88 is checked. Missing RAM produces a visible
+halt, not an unchecked copy. Startup clears BSS, and the allocator places its
+reserved header and workload buffers after the linked runtime's end.
+The `MEM` record includes `kernel_start` and `kernel_end`.
+
+The main stack remains below `0x90000`, and V86 code/stack fixtures retain
+their low-memory addresses. The runtime and its exception tables/stacks stay
+inside the first 16 MiB identity-mapped window. This is still a normal
+1,474,560-byte raw floppy image, not an ISO.
+
+This first-stage relocation deliberately retains the existing bounded BIOS
+loader: bootstrap plus **file payload** must fit in 384 KiB of staging below
+`0x70000`. BSS does not occupy that file budget. Linker and image-size checks
+enforce both limits; relocation removes the former combined code/BSS
+low-memory limit, not every future size limit. Growing beyond the staging
+budget would require chunked loading through a reusable low-memory buffer.
+It does not require changing media format.
+
+To exercise the actual bootstrap RAM validator and linker budgets, run
+`python3 -m unittest discover -s tools -p 'test_boot_memory.py' -v`.
+With QEMU installed and a full `BENCHMARKS=0` image, setting
+`CPUBURN_BOOT_IMAGE="$PWD/floppy.img"` for that command also checks relocated
+486 execution and safe rejection of a machine with no extended RAM.
 
 Boot the image as a **legacy BIOS floppy**, preferably write-protected, with
 at least 576 KiB conventional RAM and 8 MiB total RAM (16–32 MiB recommended).
@@ -425,6 +573,11 @@ host-derived invariant counter. A logged MHz value is a PIT calibration, not a
 claim about emulation throughput. `ops` is a workload-specific operation count,
 not a universally comparable instruction count. Checksums may intentionally
 include CPU-specific results and must not replace the individual assertions.
+`op_unit` names the counted work where specified; older workloads retain the
+generic `operation` label. `timing_scope=checked_workload` explicitly includes
+operand/reference preparation, assertions, and any in-function enable/restore
+sequence. These are not isolated opcode latency measurements. Reports preserve
+these fields and refuse to pool or compare incompatible work units/scopes.
 `ms`, `cyc`, and 64-bit `ops` aggregate measured invocations, excluding warm-up.
 `iterations` counts measured invocations; `iteration_ops` is their constant
 operation count, or zero if it varied. `failed_iterations` includes warm-up.

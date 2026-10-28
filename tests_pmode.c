@@ -279,6 +279,95 @@ static u32 pm_sysenter(void) {
     return sum;
 }
 
+static volatile u64 sc_old_efer, sc_old_star;
+static volatile u32 sc_rc, sc_disabled_rc;
+static volatile u32 sc_entry_cs, sc_entry_ss, sc_entry_flags, sc_entry_sp;
+static volatile u32 sc_exit_cs, sc_exit_ss, sc_exit_flags, sc_exit_sp;
+static volatile u32 sc_return_pc, sc_wanted_pc, sc_enter_sp, sc_marker;
+static u8 *sc_stack;
+
+__attribute__((naked)) static void pm_r3_syscall(void) {
+    __asm__ volatile(
+        "movl %esp,sc_enter_sp\n\t"
+        "movl $1f,sc_wanted_pc\n\t"
+        "movl $0x519ac83d,%edx\n\t"
+        "syscall\n"
+        "1: movw %cs,%ax\n\t"
+        "movzwl %ax,%eax\n\t"
+        "movl %eax,sc_exit_cs\n\t"
+        "movw %ss,%ax\n\t"
+        "movzwl %ax,%eax\n\t"
+        "movl %eax,sc_exit_ss\n\t"
+        "pushfl\n\t"
+        "popl sc_exit_flags\n\t"
+        "movl %esp,sc_exit_sp\n\t"
+        "int $0x80\n");
+}
+
+extern void pm_syscall_landing(void);
+__asm__(
+    ".text\n"
+    ".global pm_syscall_landing\n"
+    "pm_syscall_landing:\n\t"
+    "movl %ecx,sc_return_pc\n\t"
+    "movl %esp,sc_entry_sp\n\t"
+    "movl %edx,sc_marker\n\t"
+    "pushfl\n\t"
+    "popl sc_entry_flags\n\t"
+    "movw %cs,%ax\n\t"
+    "movzwl %ax,%eax\n\t"
+    "movl %eax,sc_entry_cs\n\t"
+    "movw %ss,%ax\n\t"
+    "movzwl %ax,%eax\n\t"
+    "movl %eax,sc_entry_ss\n\t"
+    "sysret\n");
+
+static void sc_save(void) {
+    sc_old_efer = rdmsr(0xc0000080u);
+    sc_old_star = rdmsr(0xc0000081u);
+}
+static void sc_restore_star(void) { wrmsr(0xc0000081u, sc_old_star); }
+static void sc_restore_efer(void) { wrmsr(0xc0000080u, sc_old_efer); }
+static void sc_body(void) {
+    u64 star = ((u64)SEL_UCODE << 48) | ((u64)SEL_KCODE << 32) | (u32)pm_syscall_landing;
+    wrmsr(0xc0000081u, star);
+    wrmsr(0xc0000080u, sc_old_efer & ~1ull);
+    sc_disabled_rc = ring3_call(pm_r3_syscall, (u32)sc_stack + 4096);
+    wrmsr(0xc0000080u, sc_old_efer | 1);
+    sc_rc = ring3_call(pm_r3_syscall, (u32)sc_stack + 4096);
+}
+static u32 pm_syscall(void) {
+    sc_stack = arena_alloc(4096, 16);
+    if (!sc_stack) SKIP("no syscall test stack");
+    /* AMD 21086C: these legacy transitions preserve ESP, clear IF on entry,
+     * and set IF on SYSRET. This is not the 64-bit R11/SFMASK convention. */
+    int rc = guard_call(sc_save);
+    CHECK_EQ(rc, 0);
+    if (rc) return 0;
+    sc_rc = sc_disabled_rc = ~0u;
+    sc_entry_cs = sc_entry_ss = sc_entry_flags = sc_entry_sp = 0;
+    sc_exit_cs = sc_exit_ss = sc_exit_flags = sc_exit_sp = 0;
+    sc_return_pc = sc_wanted_pc = sc_enter_sp = sc_marker = 0;
+    rc = guard_call(sc_body);
+    CHECK_EQ(guard_call(sc_restore_star), 0);
+    CHECK_EQ(guard_call(sc_restore_efer), 0);
+    CHECK_EQ(rc, 0);
+    CHECK_EQ(sc_disabled_rc, GUARD_EXC(6));
+    CHECK_EQ(sc_rc, GUARD_R3_INT80);
+    CHECK_EQ(sc_entry_cs, SEL_KCODE);
+    CHECK_EQ(sc_entry_ss, SEL_KDATA);
+    CHECK_EQ(sc_entry_flags & 0x20200, 0);
+    CHECK_EQ(sc_entry_sp, sc_enter_sp);
+    CHECK_EQ(sc_exit_cs, SEL_UCODE);
+    CHECK_EQ(sc_exit_ss, SEL_UDATA);
+    CHECK_EQ(sc_exit_flags & 0x200, 0x200);
+    CHECK_EQ(sc_exit_sp, sc_enter_sp);
+    CHECK_EQ(sc_return_pc, sc_wanted_pc);
+    CHECK_EQ(sc_marker, 0x519ac83d);
+    t_ops(2);
+    return sc_return_pc;
+}
+
 static u32 pm_irq_nesting(void) {
     pm_int_count = 0;
     int_hook[0x81] = pm_count_int;
@@ -469,12 +558,13 @@ static u32 pm_v86(void) {
 
 const test_t tests_pmode[] = {
     { "pm_exceptions", pm_exceptions, REQ_486 },
-    { "pm_alignment_check", pm_alignment_check, REQ_486 },
+    { "pm_alignment_check", pm_alignment_check, REQ_486 | REQ_AC },
     { "pm_segments", pm_segments, REQ_486 },
     { "pm_gates_rings", pm_gates_rings, REQ_486 },
     { "pm_task_switch", pm_task_switch, REQ_486 },
     { "pm_v86", pm_v86, REQ_486 },
     { "pm_sysenter", pm_sysenter, REQ_SEP | REQ_MSR },
+    { "pm_syscall", pm_syscall, REQ_SYSCALL | REQ_MSR },
     { "pm_irq_nesting", pm_irq_nesting, REQ_486 },
     { "pm_debug_regs", pm_debug_regs, REQ_486 },
     { 0, 0, 0 }

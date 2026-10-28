@@ -4,6 +4,10 @@
 
 #include <stdarg.h>
 
+#ifndef BENCHMARKS
+#define BENCHMARKS 1
+#endif
+
 typedef unsigned char u8;
 typedef unsigned short u16;
 typedef unsigned int u32;
@@ -27,7 +31,7 @@ typedef long long s64;
 #define GDT_ENTRIES 24
 
 /* ---- Test registry ---- */
-/* Requirement flags: harness auto-SKIPs (never FAILs) when not satisfied. */
+/* Unavailable requirements auto-SKIP unless required by the CPU contract. */
 #define REQ_CPUID (1u << 0)
 #define REQ_TSC (1u << 1)
 #define REQ_FPU (1u << 2)
@@ -40,7 +44,7 @@ typedef long long s64;
 #define REQ_SEP (1u << 9)
 #define REQ_MSR (1u << 10)
 #define REQ_CX8 (1u << 11)
-#define REQ_486 (1u << 12) /* >= 486 (AC flag works) */
+#define REQ_486 (1u << 12) /* 486 instruction set, including 386-bus hybrids */
 #define REQ_P5 (1u << 13)  /* family >= 5 */
 #define REQ_P6 (1u << 14)  /* family >= 6 */
 #define REQ_NOHV (1u << 15) /* skip under hypervisors (trapped/unreliable) */
@@ -57,6 +61,9 @@ typedef long long s64;
 #define REQ_3DNOW (1u << 26)
 #define REQ_3DNOWEXT (1u << 27)
 #define REQ_EMMI (1u << 28)
+#define REQ_SYSCALL (1u << 29)
+#define REQ_MMXEXT (1u << 30)
+#define REQ_AC (1u << 31)
 
 typedef struct test {
     const char *name;     /* short snake_case id, e.g. "int_alu" */
@@ -75,6 +82,23 @@ extern const test_t tests_fp_edges[], tests_sweeps[];
 extern const test_t tests_priority[];
 extern const test_t tests_restart_complex[];
 extern const test_t tests_vendor[];
+extern const test_t tests_cpu_contract[];
+extern const test_t tests_cyrix[];
+void cpu_control(int serial_available);
+void cpu_contract_init(void);
+u32 cpu_required_features(void);
+u32 cpu_raw_required(u32 word);
+int cpu_contract_known(void);
+const char *cpu_model_name(void);
+u32 cpu_extended_standard_edx(void);
+u32 cpu_detected_features(void);
+void cpu_feature_result(const test_t *test, const char *status);
+void cpu_feature_report(void);
+int cpu_accuracy_mode(void);
+extern u32 cpu_workload_features;
+static inline int cpu_test_feature(u32 bit) {
+    return (cpu_workload_features & bit) == bit;
+}
 
 /* ---- Test result helpers (valid only inside a running test) ---- */
 void t_fail(const char *what, int line);
@@ -82,6 +106,7 @@ void t_failv(const char *what, int line, u32 got, u32 want);
 void t_skip(const char *reason);
 void t_note(const char *fmt, ...); /* prints "NOTE <testname> ..." line (data for the AI reader) */
 void t_ops(u64 n);                 /* add n "operations" for ops/sec reporting */
+void t_work_unit(const char *unit); /* static token naming the counted work, not the timer */
 #define CHECK(c) do { if (!(c)) t_fail(#c, __LINE__); } while (0)
 #define CHECK_EQ(a, b) do { u32 _a = (u32)(a), _b = (u32)(b); if (_a != _b) t_failv(#a " == " #b, __LINE__, _a, _b); } while (0)
 #define SKIP(msg) do { t_skip(msg); return 0; } while (0)
@@ -105,7 +130,8 @@ typedef struct cpuinfo {
     int has_fpu;       /* probed with FNINIT/FNSTSW */
     int has_tsc, has_msr, has_cx8, has_cmov, has_mmx, has_fxsr, has_pse, has_pae, has_pge, has_sep,
         has_pat, has_mtrr, has_apic, has_pse36, has_mce, has_vme, has_de;
-    int has_3dnow, has_3dnowext, has_emmi;
+    int has_3dnow, has_3dnowext, has_emmi, has_syscall, has_mmxext;
+    u32 probed_features, claimed_features;
     u32 mhz;           /* calibrated via PIT, 0 if unknown */
     u64 tsc_per_ms;
 } cpuinfo_t;
@@ -186,6 +212,12 @@ extern tss32_t tss_main, tss_b;
 extern u8 exc_stack[16384]; /* ring0 stack used by TSS esp0 (top = exc_stack+16384) */
 
 /* ---- Raw CPU access ---- */
+/* Firmware-owned memory is defined at its physical address by link.ld. */
+extern volatile u8 bios_data_area[256];
+static inline u16 bda_read16(u32 offset) {
+    u16 lo = bios_data_area[offset];
+    return lo | ((u16)bios_data_area[offset + 1] << 8);
+}
 static inline void cli(void) { __asm__ volatile("cli" ::: "memory"); }
 static inline void sti(void) { __asm__ volatile("sti" ::: "memory"); }
 static inline void hlt(void) { __asm__ volatile("hlt" ::: "memory"); }

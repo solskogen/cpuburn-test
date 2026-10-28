@@ -1,7 +1,13 @@
 ; Real-mode stub (flat binary, org 0, runs at 0x1000:0000, linear 0x10000). Padded to 4 KiB.
-; Gathers BIOS info, enables A20, silences floppy motor, switches to 32-bit flat protected mode and jumps to kernel at 0x11000.
+; Gathers BIOS info, enables A20, validates RAM and relocates the runtime to 1 MiB.
 bits 16
 org 0
+%ifndef KERNEL_BYTES
+%error KERNEL_BYTES must describe the linked runtime file
+%endif
+%ifndef KERNEL_END
+%error KERNEL_END must include the linked runtime BSS
+%endif
 
 %define BOOTINFO 0x600          ; linear: filled for the kernel
 ; BOOTINFO layout:
@@ -227,6 +233,38 @@ pm32:
     mov gs, ax
     mov ss, ax
     mov esp, 0x90000
-    jmp 0x08:0x11000
+    mov eax, KERNEL_END
+    mov ebx, BOOTINFO
+    call boot_ram_available
+    test eax, eax
+    jz ram_error
+    cld
+    mov esi, 0x11000
+    mov edi, 0x100000
+    mov ecx, KERNEL_BYTES
+    rep movsb
+    jmp 0x08:0x100000
+
+ram_error:
+    mov esi, ram_message + 0x10000
+    mov edi, 0xb8000
+    cmp word [0x463], 0x3b4
+    jne .print
+    mov edi, 0xb0000
+.print:
+    lodsb
+    test al, al
+    jz .halt
+    out 0xe9, al
+    mov ah, 0x4f
+    stosw
+    jmp .print
+.halt:
+    cli
+    hlt
+    jmp .halt
+
+ram_message: db 'CPUBURN: runtime extended RAM unavailable; halted safely.', 0
+%include "boot_memory.asm"
 
 times 4096-($-$$) db 0

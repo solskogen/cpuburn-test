@@ -10,6 +10,11 @@
 #define ARITH (CF|PF|AF|ZF|SF|OF)
 #define LOGIC (CF|PF|ZF|SF|OF)
 #define NOINLINE __attribute__((noinline))
+#if __has_attribute(noclone)
+#define NOCLONE __attribute__((noclone))
+#else
+#define NOCLONE
+#endif
 static u32 rng(u32 *s) { u32 x=*s; x^=x<<13; x^=x>>17; x^=x<<5; return *s=x; }
 static u32 maskof(unsigned w) { return w==32 ? ~0u : (1u<<w)-1; }
 static u32 szp(u32 x, unsigned w) {
@@ -736,7 +741,8 @@ static u32 int_smc_mixed_k8_h16(void) { return smc_mixed_page(8,16); }
 
 /* A snippet of n ADDs is patched every k calls: sweeps the patch rate
    around the dynarec's compile-or-interpret threshold. */
-static u32 smc_rate(unsigned k,unsigned n) {
+/* Keep the parameter sweep from duplicating these large bodies at -O3. */
+static NOINLINE NOCLONE u32 smc_rate(unsigned k,unsigned n) {
     u8 *snip=arena_alloc(4096,4096); if(!snip) SKIP("arena_smc_rate");
     snip[0]=0xb8;
     for(unsigned i=0;i<n;i++) { snip[5+5*i]=0x05; put32(snip+6+5*i,0x01010101); }
@@ -752,7 +758,7 @@ static u32 smc_rate(unsigned k,unsigned n) {
 }
 /* As smc_rate, but each patch also turns a random one of the ADDs into ADD,
    SUB or XOR, so the block's code itself changes and is rarely seen twice. */
-static u32 smc_rate_op(unsigned k,unsigned n) {
+static NOINLINE NOCLONE u32 smc_rate_op(unsigned k,unsigned n) {
     static const u8 ops[3]={0x05,0x2d,0x35};
     u8 *snip=arena_alloc(4096,4096); if(!snip) SKIP("arena_smc_rate");
     snip[0]=0xb8;
@@ -879,6 +885,7 @@ static u32 int_cpuid_cr(void) {
     const u32 masks[]={1u<<18,1u<<21,0x4000,0x3000,0x400};
     for(unsigned i=0;i<sizeof(masks)/sizeof(masks[0]);i++) {
         u32 m=masks[i],n=old^m;
+        if(m==(1u<<18) && !cpu.is486 && !(cpu_required_features() & REQ_AC)) continue;
         __asm__ volatile("pushl %1; popfl; pushfl; popl %0; pushl %2; popfl" : "=&r"(image):"r"(n),"r"(old):"cc","memory");
         if(m!=(1u<<21) || cpu.has_cpuid) CHECK_EQ((image^old)&m,m);
         CHECK(image&2); sum^=image&m;

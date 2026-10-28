@@ -195,6 +195,29 @@ static void pse_body(void) {
 }
 static u32 pg_pse4m(void) { return run_page(pse_body); }
 
+static void pse36_body(void) {
+    wr_cr4(old4 | 0x10);
+    target = WIN;
+    /* A supervisor mapping prevents access to unowned memory above 4GiB.
+     * Bit 13 encodes physical bit 32, whereas bit 21 remains reserved. */
+    const u32 entries[] = {0x2083, 0x200083};
+    for (u32 i = 0; i < 2; i++) {
+        pd[WIN >> 22] = entries[i];
+        wr_cr3((u32)pd);
+        int rc = ring3_call(user_load, (u32)ustack + PAGE);
+        CHECK_EQ(rc, GUARD_EXC(14));
+        if (rc == GUARD_EXC(14)) {
+            CHECK_EQ(g_exc.cr2, WIN);
+            CHECK_EQ(g_exc.err & 15, i ? 13 : 5);
+        }
+    }
+    pd[WIN >> 22] = (u32)pt | 7;
+    wr_cr3((u32)pd);
+    t_note("PSE36 address-bit acceptance/#PF precedence; no unowned physical memory read");
+    t_ops(2);
+}
+static u32 pg_pse36_permissions(void) { return run_page(pse36_body); }
+
 static void pae_body(void) {
     volatile u64 *pdpt = arena_alloc(PAGE, PAGE), *dirs = arena_alloc(4 * PAGE, PAGE);
     volatile u64 *table = arena_alloc(PAGE, PAGE);
@@ -255,6 +278,7 @@ const test_t tests_paging[] = {
     {"pg_global", pg_global, REQ_PAGING | REQ_PGE | REQ_P5},
     {"pg_pse4m", pg_pse4m, REQ_PAGING | REQ_486 | REQ_PSE | REQ_MEM8M},
     {"pg_pae", pg_pae, REQ_PAGING | REQ_486 | REQ_PAE | REQ_MEM8M},
+    {"pg_pse36_permissions", pg_pse36_permissions, REQ_PAGING | REQ_PSE | REQ_PSE36},
     {"pg_apic_mmio", pg_apic_mmio, REQ_PAGING | REQ_APIC | REQ_MSR},
     {0, 0, 0}
 };

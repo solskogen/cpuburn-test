@@ -3,6 +3,7 @@
 
 import argparse
 import configparser
+import re
 import hashlib
 import json
 import math
@@ -86,8 +87,17 @@ def arguments():
                         help="explicit source config; snapshot and import safe machine/video keys only")
     parser.add_argument("--dynarec", choices=("on", "off"),
                         help="override the profile/config execution mode")
+    parser.add_argument("--accuracy", action="store_true",
+                        help="run checked invocations without benchmark sampling extensions; "
+                             "require CPU control acknowledgement and fail on guest failures")
+    parser.add_argument("--expected-signature", type=lambda s: int(s, 0),
+                        help="configured CPUID signature, e.g. 0x580 (matrix runner supplies it)")
+    parser.add_argument("--expected-family-name", help="expected automation CPU family display name")
+    parser.add_argument("--expected-model-name", help="expected automation CPU speed/model label")
+    parser.add_argument("--fpu-backend", choices=("host", "softfloat"),
+                        help="request host FPU or software floating-point implementation")
     parser.add_argument("--label", default="", help="emulator build/mode identifier")
-    parser.add_argument("--memory-mb", type=int, choices=(16, 32), default=16)
+    parser.add_argument("--memory-mb", type=positive_int, default=16)
     parser.add_argument("--emulated-ms", type=positive_int, default=86400000)
     parser.add_argument("--wall-seconds", type=positive, default=28800)
     parser.add_argument("--step-ms", type=positive_int, default=250,
@@ -144,7 +154,7 @@ def write_config(args, run_dir):
             raise RuntimeError("--config needs a [Machine] machine setting")
         config["Machine"].clear()
         for key in ("machine", "cpu_family", "cpu_speed", "cpu_multi", "fpu_type",
-                    "cpu_use_dynarec", "cpu_waitstates"):
+                    "cpu_use_dynarec", "cpu_waitstates", "fpu_softfloat"):
             if original.has_option("Machine", key):
                 config["Machine"][key] = original["Machine"][key]
         if original.has_option("Video", "gfxcard"):
@@ -152,6 +162,8 @@ def write_config(args, run_dir):
     config["Machine"]["mem_size"] = str(args.memory_mb * 1024)
     if args.dynarec is not None:
         config["Machine"]["cpu_use_dynarec"] = "1" if args.dynarec == "on" else "0"
+    if getattr(args, "fpu_backend", None) is not None:
+        config["Machine"]["fpu_softfloat"] = "1" if args.fpu_backend == "softfloat" else "0"
     config["Machine"]["time_sync"] = "disabled"
     config["General"] = {"vid_renderer": "qt_software"}
     config["Ports (COM & LPT)"] = {
@@ -168,6 +180,29 @@ def write_config(args, run_dir):
     with (run_dir / "86box.cfg").open("w") as handle:
         config.write(handle)
     return dict(config["Machine"])
+
+
+def cpu_control_frame(machine, accuracy=False, signature=None):
+    family = machine.get("cpu_family", "unknown")
+    fpu = machine.get("fpu_type", "auto")
+    if any(not re.fullmatch(r"[a-zA-Z0-9_-]+", value) for value in (family, fpu)):
+        raise ValueError("CPU family/FPU identifiers must be nonempty ASCII tokens")
+    if len(family) >= 48 or len(fpu) >= 16:
+        raise ValueError("CPU family/FPU identifier exceeds guest control limit")
+    mode = "accuracy" if accuracy else "benchmark"
+    if signature is not None and not 0 <= signature <= 0xffffffff:
+        raise ValueError("CPU signature must fit an unsigned 32-bit value")
+    suffix = f" {signature:08x}" if signature is not None else ""
+    return f"@cpu1 {family} {fpu} {mode}{suffix}\n".encode("ascii")
+
+
+def cpu_control_accepted(run, machine, accuracy, signature=None):
+    return any(row.get("protocol") == "cpu1" and row.get("accepted") == "1"
+               and row.get("model") == machine.get("cpu_family", "unknown")
+               and row.get("fpu") == machine.get("fpu_type", "auto")
+               and row.get("mode") == ("accuracy" if accuracy else "benchmark")
+               and (signature is None or row.get("signature") == f"{signature:08x}")
+               for row in run.get("cpu_control", []))
 
 
 class Automation:
@@ -270,10 +305,15 @@ def execute(args, run_dir, command, machine):
     capture = WorkloadCapture(getattr(args, "sample_cpu_seconds", 30.0), args.step_ms)
     recorder = PerfRecorder(run_dir) if getattr(args, "perf", False) else None
     perf_stopped = False
+    accuracy = getattr(args, "accuracy", False)
+    control_sent = False
+    signature = getattr(args, "expected_signature", None)
+    control_frame = cpu_control_frame(machine, accuracy, signature)
     result = {"status": "error", "expected": args.expect, "matched": [],
               "machine": machine, "label": args.label, "step_ms": args.step_ms,
               "emulated_ms": 0, "directory": str(run_dir), "host": host_metadata(),
               "emulator_executable": command[0],
+              "mode": "accuracy" if accuracy else "benchmark",
               "limits": {"emulated_ms": args.emulated_ms, "wall_seconds": args.wall_seconds},
               "perf": {"status": "requested" if recorder else "disabled"}}
     try:
@@ -320,6 +360,12 @@ def execute(args, run_dir, command, machine):
                 if expected in machine and str(info[actual]) != machine[expected]:
                     raise RuntimeError(f"hardware mismatch: requested {expected}="
                                        f"{machine[expected]}, got {info[actual]}")
+            for expected, actual in (("expected_family_name", "cpu_family"),
+                                     ("expected_model_name", "cpu")):
+                wanted = getattr(args, expected, None)
+                if wanted is not None and wanted != info.get(actual):
+                    raise RuntimeError(f"CPU substitution: requested {actual}={wanted!r}, "
+                                       f"got {info.get(actual)!r}")
             serial_from = 0
             serial_tail = ""
             seen = set()
@@ -351,11 +397,21 @@ def execute(args, run_dir, command, machine):
                 data = bytes.fromhex(serial["data"])
                 serial_log.write(data)
                 serial_log.flush()
-                for lease in capture.feed(data, now, time.monotonic()):
-                    api.request(f"serial write 1 {lease.encode('ascii').hex()}")
+                serial_tail += data.decode("cp437")
+                if re.search(r"(?m)^BUILD [^\n]*\bbenchmarks=0\r?$", serial_tail):
+                    accuracy = True
+                    result["mode"] = "accuracy"
+                    control_frame = cpu_control_frame(machine, True, signature)
+                leases = capture.feed(data, now, time.monotonic())
+                if not accuracy:
+                    for lease in leases:
+                        api.request(f"serial write 1 {lease.encode('ascii').hex()}")
                 if recorder is not None:
                     recorder.check()
-                serial_tail += data.decode("cp437")
+                if (not control_sent and
+                        "CONTROL protocol=cpu1 ready=1\n" in serial_tail.replace("\r", "")):
+                    api.request(f"serial write 1 {control_frame.hex()}")
+                    control_sent = True
                 for marker in args.expect:
                     if marker in serial_tail:
                         seen.add(marker)
@@ -386,7 +442,7 @@ def execute(args, run_dir, command, machine):
                     api.request("key down 0x3b")
                     api.request("key up 0x3b")
                     last_f1 = now
-                if args.expect and all(marker in seen for marker in args.expect):
+                if not accuracy and args.expect and all(marker in seen for marker in args.expect):
                     break
                 if any(line == "DONE" for line in serial_tail.replace("\r", "").splitlines()):
                     break
@@ -402,6 +458,25 @@ def execute(args, run_dir, command, machine):
                            not any(t.get("status") in ("FAIL", "FAULT") for t in result["tests"])),
                 "note": "Observed guest failures are retained; status observed is not correctness PASS.",
             }
+            result["conformance_coverage"] = {
+                "scope": "sampled",
+                "identity_verified": any(t.get("name") == "cpu_model_contract"
+                                         and t.get("status") == "PASS"
+                                         for t in result["tests"]),
+                "untested_features": [f["name"] for f in result.get("features", [])
+                                      if f.get("status") == "UNTESTED"],
+                "failed_features": [f["name"] for f in result.get("features", [])
+                                    if f.get("status") == "FAIL"],
+            }
+            if (accuracy and result["done"] and not result["fatal"]
+                    and not cpu_control_accepted(result, machine, True, signature)):
+                result["correctness"]["passed"] = False
+                raise RuntimeError("guest did not acknowledge the requested accuracy/CPU contract")
+            if (accuracy and result["done"] and not result["fatal"]
+                    and not any(t.get("name") == "cpu_model_contract"
+                                for t in result["tests"])):
+                result["correctness"]["passed"] = False
+                raise RuntimeError("accuracy run lacks the CPU contract test")
             result["final_info"] = api.request("info")
             result["registers"] = api.request("regs")
             screenshot = api.request(f"screenshot {run_dir / 'screen.png'}",
@@ -409,6 +484,8 @@ def execute(args, run_dir, command, machine):
             if not screenshot.get("ok"):
                 result["screenshot_note"] = screenshot.get("error")
             result["status"] = ("failed" if result.get("rejected") else
+                                "failed" if accuracy and result["done"]
+                                and not result["correctness"]["passed"] else
                                 "failed" if result["done"] and not result["counts_consistent"] else
                                 "pass" if args.expect and
                                 all(marker in seen for marker in args.expect)
@@ -423,6 +500,16 @@ def execute(args, run_dir, command, machine):
                 perf_stopped = True
                 result["perf"] = recorder.report(capture.windows)
             api.request("quit")
+    except TimeoutError as error:
+        serial_path = run_dir / "serial.log"
+        if serial_path.exists():
+            result.update(parse_log(serial_path.read_text(encoding="cp437")))
+        result["status"] = "timeout"
+        result["error"] = str(error)
+        result["correctness"] = {
+            "complete": False, "passed": False,
+            "note": "Host deadline interrupted the run; not an architectural failure.",
+        }
     except (OSError, RuntimeError, ValueError) as error:
         result["status"] = "error"
         result["error"] = str(error)
@@ -499,6 +586,7 @@ def main():
                                 "bios_f1": args.bios_f1, "expect": args.expect,
                                 "reject": args.reject,
                                 "sample_cpu_seconds": getattr(args, "sample_cpu_seconds", 30.0),
+                                "accuracy": getattr(args, "accuracy", False),
                                 "perf": getattr(args, "perf", False)},
                     "host": host_metadata()}
         (run_dir / "launch.json").write_text(json.dumps(manifest, indent=2) + "\n")

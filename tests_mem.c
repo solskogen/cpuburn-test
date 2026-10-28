@@ -137,7 +137,7 @@ static u32 mem_lock(void) {
     CHECK_EQ(ok, 0); CHECK_EQ(expected, 19);
     __asm__ volatile("lock btsl $20,%0" : "+m"(lock_word) :: "memory", "cc"); CHECK_EQ(lock_word, 19 | (1 << 20));
     lock_wide = arena_alloc(8, 8);
-    if (cpu.has_cx8 && lock_wide) { *lock_wide = 0x9ABCDEF012345678ull; CHECK_EQ(guard_call(cx8_op), 0); }
+    if (cpu_test_feature(REQ_CX8) && lock_wide) { *lock_wide = 0x9ABCDEF012345678ull; CHECK_EQ(guard_call(cx8_op), 0); }
     else t_note("CMPXCHG8B unavailable");
     int rc = guard_call(cache_flush); t_note("WBINVD rc=%x", rc);
     CHECK(rc == 0 || rc == GUARD_EXC(6) || rc == GUARD_EXC(13));

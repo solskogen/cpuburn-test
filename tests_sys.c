@@ -54,7 +54,7 @@ static u32 sys_msr_probe(void) {
         const u32 p5[] = {0, 1, 0x11, 0x12, 0x13};
         for (u32 i = 0; i < sizeof(p5) / sizeof(p5[0]); i++) if (!get_msr(p5[i], &value, 1)) sum = csum_mix(sum, value);
     }
-    if (cpu.has_tsc) {
+    if (cpu_test_feature(REQ_TSC)) {
         u64 before = stamp(); int rc = get_msr(0x10, &value, 0); u64 after = stamp();
         if (!rc) {
             CHECK(value >= before && value <= after);
@@ -62,14 +62,14 @@ static u32 sys_msr_probe(void) {
         }
         else t_note("MSR 0x010 #GP");
     }
-    if (cpu.has_apic) get_msr(0x1B, &value, 1);
+    if (cpu_test_feature(REQ_APIC)) get_msr(0x1B, &value, 1);
     if (cpu.family >= 6) {
         const u32 p6[] = {0x2A, 0x3A, 0x8B, 0xC1, 0xC2, 0x186, 0x187, 0x1D9};
         for (u32 i = 0; i < sizeof(p6) / sizeof(p6[0]); i++) if (!get_msr(p6[i], &value, 1)) sum = csum_mix(sum, value);
     }
-    if (cpu.has_sep) for (u32 i = 0x174; i <= 0x176; i++) get_msr(i, &value, 1);
-    if (cpu.has_mce && cpu.family >= 6) for (u32 i = 0x179; i <= 0x17B; i++) get_msr(i, &value, 1);
-    if (cpu.has_mtrr && !get_msr(0xFE, &caps, 1)) {
+    if (cpu_test_feature(REQ_SEP)) for (u32 i = 0x174; i <= 0x176; i++) get_msr(i, &value, 1);
+    if (cpu_test_feature(REQ_MCE) && cpu.family >= 6) for (u32 i = 0x179; i <= 0x17B; i++) get_msr(i, &value, 1);
+    if (cpu_test_feature(REQ_MTRR) && !get_msr(0xFE, &caps, 1)) {
         u32 n = (u32)caps & 255;
         t_note("MTRR variable_count=%u (first eight pairs maximum)", n);
         for (u32 i = 0; i < n && i < 8; i++) {
@@ -82,16 +82,113 @@ static u32 sys_msr_probe(void) {
         }
         get_msr(0x2FF, &value, 1);
     }
-    if (cpu.has_pat) get_msr(0x277, &value, 1);
+    if (cpu_test_feature(REQ_PAT)) get_msr(0x277, &value, 1);
     t_ops(1); return sum;
 }
 
 static int put_msr(u32 index, u64 value) {
     msr_index = index; msr_value = value; return guard_call(msr_write);
 }
+static u32 sys_msr_tsc(void) {
+    u64 before = rdtsc(), value = 0;
+    int rc = get_msr(0x10, &value, 0);
+    u64 after = rdtsc();
+    CHECK_EQ(rc, 0);
+    if (!rc) CHECK(value >= before && value <= after);
+    t_ops(1);
+    return (u32)value;
+}
+
+static int memory_type(u32 type) {
+    return type == 0 || type == 1 || type == 4 || type == 5 || type == 6;
+}
+
+static u32 sys_mtrr_state(void) {
+    u64 caps = 0, value = 0;
+    int rc = get_msr(0xfe, &caps, 0);
+    CHECK_EQ(rc, 0);
+    if (rc) return 0;
+    CHECK_EQ(get_msr(0x2ff, &value, 0), 0);
+    CHECK(memory_type(value & 255));
+    u32 count = (u32)caps & 255;
+    for (u32 i = 0; i < count; i++) {
+        rc = get_msr(0x200 + 2 * i, &value, 0);
+        CHECK_EQ(rc, 0);
+        if (!rc) CHECK(memory_type(value & 255));
+        CHECK_EQ(get_msr(0x201 + 2 * i, &value, 0), 0);
+    }
+    if (caps & 0x100) {
+        const u32 fixed[] = {0x250, 0x258, 0x259, 0x268, 0x269, 0x26a,
+                             0x26b, 0x26c, 0x26d, 0x26e, 0x26f};
+        for (u32 i = 0; i < sizeof fixed / sizeof fixed[0]; i++) {
+            rc = get_msr(fixed[i], &value, 0);
+            CHECK_EQ(rc, 0);
+            if (!rc) for (u32 j = 0; j < 8; j++) CHECK(memory_type((value >> (8 * j)) & 255));
+        }
+    }
+    t_note("MTRR register inventory verified; cache-type effects not measured");
+    t_ops(count + 1);
+    return (u32)caps;
+}
+
+static u32 sys_pat_state(void) {
+    u64 value = 0, got = 0;
+    int rc = get_msr(0x277, &value, 0);
+    CHECK_EQ(rc, 0);
+    if (rc) return 0;
+    for (u32 i = 0; i < 8; i++) {
+        u32 type = (value >> (8 * i)) & 255;
+        CHECK(memory_type(type) || type == 7);
+    }
+    CHECK_EQ(put_msr(0x277, value), 0);
+    CHECK_EQ(get_msr(0x277, &got, 0), 0);
+    CHECK(got == value);
+    t_note("PAT read/unchanged-write verified; cache-type effects not measured");
+    t_ops(8);
+    return (u32)value;
+}
+
+static u32 sys_mce_control(void) {
+    u32 saved = rd_cr4();
+    arg = saved ^ 0x40;
+    int rc = guard_call(write_cr4);
+    CHECK_EQ(rc, 0);
+    if (!rc) CHECK_EQ(rd_cr4() & 0x40, arg & 0x40);
+    arg = saved;
+    CHECK_EQ(guard_call(write_cr4), 0);
+    t_note("CR4.MCE control verified; external machine-check injection not covered");
+    t_ops(1);
+    return saved;
+}
+
+static u32 sys_mca_state(void) {
+    if (!((cpu.feat_edx | cpu_extended_standard_edx() | cpu_raw_required(0)) & (1u << 14)))
+        SKIP("missing_mca");
+    u64 caps = 0, status = 0, value = 0;
+    int rc = get_msr(0x179, &caps, 0);
+    CHECK_EQ(rc, 0);
+    if (rc) return 0;
+    u32 count = (u32)caps & 255;
+    if (cpu_raw_required(0) & (1u << 14)) CHECK_EQ(count, 5);
+    CHECK_EQ(get_msr(0x17a, &value, 0), 0);
+    if (caps & 0x100) CHECK_EQ(get_msr(0x17b, &value, 0), 0);
+    for (u32 bank = 0; bank < count; bank++) {
+        CHECK_EQ(get_msr(0x400 + 4 * bank, &value, 0), 0);
+        rc = get_msr(0x401 + 4 * bank, &status, 0);
+        CHECK_EQ(rc, 0);
+        if (!rc && (status & (1ull << 58)))
+            CHECK_EQ(get_msr(0x402 + 4 * bank, &value, 0), 0);
+        if (!rc && (status & (1ull << 59)))
+            CHECK_EQ(get_msr(0x403 + 4 * bank, &value, 0), 0);
+    }
+    t_note("MCA bank/register inventory; no external error injection or status clearing");
+    t_ops(count + 1);
+    return (u32)caps;
+}
+
 static u32 sys_msr_rw(void) {
     u64 saved[3], got; int saved_n = 0;
-    if (cpu.has_sep) {
+    if (cpu_test_feature(REQ_SEP)) {
         for (u32 i = 0; i < 3; i++) {
             if (get_msr(0x174 + i, &saved[i], 0)) break;
             saved_n++;
@@ -100,19 +197,26 @@ static u32 sys_msr_rw(void) {
             const u32 values[] = {SEL_KCODE, 0x90000, 0x11000};
             for (u32 i = 0; i < 3; i++) {
                 int rc = put_msr(0x174 + i, values[i]);
-                if (!rc) { CHECK_EQ(get_msr(0x174 + i, &got, 0), 0); CHECK_EQ(got, values[i]); }
+                if (!rc) {
+                    int read_rc = get_msr(0x174 + i, &got, 0);
+                    CHECK_EQ(read_rc, 0);
+                    if (!read_rc) CHECK_EQ(got, values[i]);
+                }
                 CHECK_EQ(put_msr(0x174 + i, saved[i]), 0);
                 CHECK_EQ(rc, 0);
             }
         } else t_note("SYSENTER MSRs unavailable; no writes attempted");
     }
-    if (cpu.has_pat && !get_msr(0x277, &got, 0) && got == 0x0007040600070406ull) {
+    if (cpu_test_feature(REQ_PAT) && !get_msr(0x277, &got, 0) && got == 0x0007040600070406ull) {
         /* Only rewrite the default PAT when it already is the live value. */
         CHECK_EQ(put_msr(0x277, got), 0);
-        u64 readback; CHECK_EQ(get_msr(0x277, &readback, 0), 0); CHECK(readback == got);
+        u64 readback;
+        int rc = get_msr(0x277, &readback, 0);
+        CHECK_EQ(rc, 0);
+        if (!rc) CHECK(readback == got);
         t_note("PAT unchanged=%016llx", got);
     }
-    if (cpu.has_tsc) {
+    if (cpu_test_feature(REQ_TSC)) {
         /* Intel P6+ (SDM vol. 3, "Time-Stamp Counter") and VIA C3 write only
            TSC[31:0] and clear TSC[63:32]; Pentium, AMD, Cyrix and WinChip
            write all 64 bits. A low-only write with high bits set would rewind
@@ -161,6 +265,22 @@ static void debug_roundtrip(void) {
 }
 static void dr4_read(void) { u32 v; __asm__ volatile("mov %%dr4,%0" : "=r"(v)); arg = v; }
 static void dr5_read(void) { u32 v; __asm__ volatile("mov %%dr5,%0" : "=r"(v)); arg = v; }
+static u32 sys_debug_extensions(void) {
+    u32 saved = rd_cr4();
+    arg = saved | 8;
+    int rc = guard_call(write_cr4), rc4 = rc, rc5 = rc;
+    if (!rc) {
+        rc4 = guard_call(dr4_read);
+        rc5 = guard_call(dr5_read);
+    }
+    arg = saved;
+    CHECK_EQ(guard_call(write_cr4), 0);
+    CHECK_EQ(rc, 0);
+    CHECK_EQ(rc4, GUARD_EXC(6));
+    CHECK_EQ(rc5, GUARD_EXC(6));
+    t_ops(2);
+    return saved;
+}
 static u32 sys_cr_regs(void) {
     u32 save0 = rd_cr0(), save2 = rd_cr2(), save3 = rd_cr3();
     const u32 bits[] = {0x10000, 0x40000, 0x20, 2};
@@ -173,14 +293,14 @@ static u32 sys_cr_regs(void) {
     CHECK(drc == 0 || drc == GUARD_EXC(13) || drc == GUARD_EXC(6) || drc == GUARD_EXC(1));
     if (guard_call(probe_cr4)) { t_note("CR4 unavailable"); return save0; }
     u32 save4 = arg, supported = 0;
-    if (cpu.has_vme) supported |= 3;
-    if (cpu.has_tsc) supported |= 4;
-    if (cpu.has_de) supported |= 8;
-    if (cpu.has_pse) supported |= 0x10;
-    if (cpu.has_mce) supported |= 0x40;
-    if (cpu.has_pge) supported |= 0x80;
+    if (cpu_test_feature(REQ_VME)) supported |= 3;
+    if (cpu_test_feature(REQ_TSC)) supported |= 4;
+    if (cpu_test_feature(REQ_DE)) supported |= 8;
+    if (cpu_test_feature(REQ_PSE)) supported |= 0x10;
+    if (cpu_test_feature(REQ_MCE)) supported |= 0x40;
+    if (cpu_test_feature(REQ_PGE)) supported |= 0x80;
     if (cpu.family >= 6) supported |= 0x100;
-    if (cpu.has_fxsr && (cpu.feat_edx & (1u << 25))) supported |= 0x200;
+    if (cpu_test_feature(REQ_FXSR) && (cpu.feat_edx & (1u << 25))) supported |= 0x200;
     for (u32 bit = 1; bit <= 0x200; bit <<= 1) if (supported & bit) {
         arg = save4 ^ bit; int rc = guard_call(write_cr4);
         if (!rc) {
@@ -194,7 +314,7 @@ static u32 sys_cr_regs(void) {
         arg = save4 | 0x80000000u; rc = guard_call(write_cr4);
         arg = save4; CHECK_EQ(guard_call(write_cr4), 0); CHECK_EQ(rc, GUARD_EXC(13));
     } else t_note("reserved CR4 write omitted under hypervisor: some TCG versions spin instead of #GP");
-    if (cpu.has_de) {
+    if (cpu_test_feature(REQ_DE)) {
         arg = save4 | 8; rc = guard_call(write_cr4);
         if (!rc) {
             int rc4 = guard_call(dr4_read), rc5 = guard_call(dr5_read);
@@ -268,12 +388,12 @@ static void pit2_delay_500(void) {
 }
 static u32 sys_irq_timer(void) {
     sti(); u32 start_tick = pit_ticks; u64 start = stamp();
-    if (cpu.has_tsc && cpu.tsc_per_ms) {
+    if (cpu_test_feature(REQ_TSC) && cpu.tsc_per_ms) {
         while (rdtsc() - start < cpu.tsc_per_ms * 500) hlt();
     } else pit2_delay_500();
     u32 ticks = pit_ticks - start_tick; CHECK(ticks >= 40 && ticks <= 60);
     t_note("500ms IRQ0 ticks=%u expected=50", ticks);
-    if (cpu.has_tsc) {
+    if (cpu_test_feature(REQ_TSC)) {
         u32 t = pit_ticks; u64 begin = rdtsc();
         while (pit_ticks - t < 4) { __asm__ volatile("sti; hlt" ::: "memory"); }
         t_note("STI/HLT cycles/tick=%llu", (rdtsc() - begin) / (pit_ticks - t));
@@ -287,6 +407,12 @@ const test_t tests_sys[] = {
     {"sys_msr_rw", sys_msr_rw, REQ_MSR | REQ_P6 | REQ_NOHV},
     {"sys_cr_regs", sys_cr_regs, REQ_486},
     {"sys_rdpmc", sys_rdpmc, REQ_P5},
+    {"sys_msr_tsc", sys_msr_tsc, REQ_MSR | REQ_TSC},
+    {"sys_mtrr_state", sys_mtrr_state, REQ_MTRR | REQ_MSR},
+    {"sys_pat_state", sys_pat_state, REQ_PAT | REQ_MSR},
+    {"sys_mce_control", sys_mce_control, REQ_MCE},
+    {"sys_mca_state", sys_mca_state, REQ_MSR},
+    {"sys_debug_extensions", sys_debug_extensions, REQ_DE},
     {"sys_cpuid_leaves", sys_cpuid_leaves, REQ_CPUID},
     {"sys_irq_timer", sys_irq_timer, 0},
     {0, 0, 0}

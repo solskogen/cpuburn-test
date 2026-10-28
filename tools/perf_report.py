@@ -35,6 +35,8 @@ def load_runs(path):
 def environment(run):
     result = {key: run.get(key) for key in
               ("cpu", "machine", "accel", "memory_mib", "cpu_info", "step_ms")}
+    if run.get("conformance"):
+        result["conformance"] = run["conformance"]
     if "host" in run:
         result["host"] = run["host"]
     if "workload_capture" in run:
@@ -106,6 +108,9 @@ def runtime_breakdown(run):
 
 
 def measurement_notes(test):
+    if test.get("mode") == "accuracy":
+        return ["accuracy_only", *(
+            ["correctness_" + test["status"].lower()] if test["status"] != "PASS" else [])]
     notes = []
     if test["status"] != "PASS":
         return ["correctness_" + test["status"].lower()]
@@ -125,6 +130,34 @@ def measurement_notes(test):
         elif ops <= 0 or int(test.get("ops", 0)) != iterations * ops:
             notes.append("nonconstant_or_inconsistent_operations")
     return notes
+
+
+def correctness_samples(run):
+    fields = ("r", "name", "status", "reason", "first", "got", "want",
+              "exc_vec", "exc_err", "seed")
+    return [{key: test[key] for key in fields if key in test} for test in run["tests"]]
+
+
+def correctness_changes(current, baseline):
+    if "correctness_samples" not in baseline:
+        return {"available": False, "reason": "baseline_lacks_assertion_details", "changes": []}
+
+    def observations(report):
+        result = {}
+        for sample in report["correctness_samples"]:
+            for test in sample:
+                key = (test.get("r"), test["name"])
+                result.setdefault(key, []).append(test)
+        return result
+
+    now, old = observations(current), observations(baseline)
+    changes = []
+    for key in sorted(set(now) | set(old)):
+        if now.get(key) != old.get(key):
+            changes.append({"r": key[0], "name": key[1],
+                            "before": old.get(key, []), "after": now.get(key, [])})
+    return {"available": True, "changes": changes,
+            "note": "Descriptive observations only; no accepted-failure or regression policy."}
 
 
 def summarize(runs, discard_rounds):
@@ -150,16 +183,19 @@ def summarize(runs, discard_rounds):
             if int(test["r"]) <= discard_rounds:
                 continue
             entry = groups.setdefault(test["name"], {"statuses": {}, "units": set(),
+                                                    "work_units": set(), "timing_scopes": set(),
                                                     "ops": set(), "iteration_ops": set(),
                                                     "cycles": [], "ms": []})
             status = test["status"]
             entry["statuses"][status] = entry["statuses"].get(status, 0) + 1
-            if status != "PASS" or "timing_invalid" in test:
+            if status != "PASS" or "timing_invalid" in test or test.get("mode") == "accuracy":
                 continue
             ops, cycles = int(test.get("ops", 0)), int(test.get("cyc", 0))
             if ops <= 0:
                 continue
             entry["units"].add(test["unit"])
+            entry["work_units"].add(test.get("op_unit", "unspecified"))
+            entry["timing_scopes"].add(test.get("timing_scope", "unspecified"))
             entry["ops"].add(ops)
             if "iterations" in test:
                 iterations = int(test["iterations"])
@@ -178,8 +214,12 @@ def summarize(runs, discard_rounds):
     for name, entry in sorted(groups.items()):
         if len(entry["units"]) > 1:
             raise ValueError(f"{name}: mixed timer units")
+        if len(entry["work_units"]) > 1 or len(entry["timing_scopes"]) > 1:
+            raise ValueError(f"{name}: mixed operation units or timing scopes")
         workloads[name] = {
             "statuses": entry["statuses"], "unit": next(iter(entry["units"]), None),
+            "op_unit": next(iter(entry["work_units"]), None),
+            "timing_scope": next(iter(entry["timing_scopes"]), None),
             "ops": sorted(entry["ops"]), "iteration_ops": sorted(entry["iteration_ops"]),
             "counter_per_op": distribution(entry["cycles"]),
             "ms_per_op": distribution(entry["ms"])}
@@ -196,6 +236,8 @@ def summarize(runs, discard_rounds):
                 for index, run in enumerate(runs) for test in run["tests"]
                 if (notes := measurement_notes(test))],
             "guest_runtime": [runtime_breakdown(run) for run in runs],
+            "feature_coverage": [run.get("features", []) for run in runs],
+            "correctness_samples": [correctness_samples(run) for run in runs],
             "host_boot_to_done_seconds": distribution(
                 [float(r["host_seconds"]) for r in runs if r.get("host_seconds") is not None])}
 
@@ -222,7 +264,9 @@ def compare(current, baseline, args):
                              signature == old.get("iteration_ops"))
         else:
             matching_work = now["ops"] == old["ops"] and len(now["ops"]) == 1
-        if healthy and now["unit"] == old["unit"] and matching_work:
+        if (healthy and now["unit"] == old["unit"] and matching_work and
+                now.get("op_unit") == old.get("op_unit") and
+                now.get("timing_scope") == old.get("timing_scope")):
             a, b = now["counter_per_op"], old["counter_per_op"]
             if a and b and b["median"] > 0:
                 pct = (a["median"] / b["median"] - 1) * 100
@@ -276,6 +320,7 @@ def main():
         if args.baseline:
             baseline = json.loads(args.baseline.read_text())
             report["comparison"] = compare(report, baseline, args)
+            report["correctness_comparison"] = correctness_changes(report, baseline)
             report["host_comparison"] = compare_host(report, baseline, args)
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(report, indent=2) + "\n")
@@ -283,7 +328,23 @@ def main():
         parser.error(str(error))
     print(f"report={args.output} workloads={len(report['workloads'])} "
           f"failures={len(report['failures'])}")
-    print("name samples min median p95 counter/op unit comparison")
+    for contract in report["environment"].get("conformance", []):
+        print("CPU conformance: " + " ".join(
+            f"{key}={contract.get(key, 'unknown')}"
+            for key in ("model", "source", "catalogue", "coverage", "mode")))
+    for index, features in enumerate(report["feature_coverage"]):
+        if features:
+            print(f"Run {index + 1} sampled feature coverage: " + " ".join(
+                f"{feature['name']}={feature['status']}" for feature in features
+                if feature["status"] != "NA"))
+    if "correctness_comparison" in report:
+        comparison = report["correctness_comparison"]
+        if not comparison["available"]:
+            print("Correctness comparison unavailable: baseline lacks assertion details.")
+        for change in comparison["changes"]:
+            print(f"Correctness observations changed: r={change['r']} {change['name']} "
+                  f"before={change['before']} after={change['after']}")
+    print("name samples min median p95 counter/op timer_unit op_unit timing_scope comparison")
     comparisons = {c["name"]: c for c in report.get("comparison", [])}
     for name, entry in report["workloads"].items():
         stats = entry["counter_per_op"]
@@ -293,7 +354,8 @@ def main():
             if "percent" in change:
                 label += f"({change['percent']:+.1f}%)"
             print(f"{name} {stats['n']} {stats['min']:.3f} {stats['median']:.3f} "
-                  f"{stats['p95']:.3f} {entry['unit']} {label}")
+                  f"{stats['p95']:.3f} {entry['unit']} "
+                  f"{entry['op_unit']} {entry['timing_scope']} {label}")
     print("Guest counters are not host throughput. Host boot-to-DONE includes boot/I/O/"
           "automation overhead; ms has 10ms resolution. First round is not guaranteed cold.")
     for note in report["measurement_notes"]:

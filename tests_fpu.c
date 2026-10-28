@@ -316,7 +316,7 @@ static u32 fpu_stack_cases(void) {
     CHECK_EQ(env[1]&0xbaff,0x82c1); CHECK_EQ(empty_tags(env[2]),0); CHECK(a==0x3ff0000000000000ull);
     sum=csum_mix(sum,env[1]&0xffff);
     /* unmasked FCOMI of an empty register leaves ZF, PF and CF alone */
-    if(cpu.has_cmov) {
+    if(cpu_test_feature(REQ_CMOV)) {
         u32 fl;
         init(); control(0x037e);
         __asm__ volatile("fld1; pushfl; orl $0x45,(%%esp); popfl; fcomi %%st(2),%%st; pushfl; popl %0; fnstsw %1; fnclex":"=r"(fl),"=m"(sw)::"memory","cc");
@@ -378,7 +378,7 @@ static u32 fpu_fxsr(void) {
     init(); __asm__ volatile("fxrstor %1; fxsave %0":"=m"(FXMEM(b)):"m"(FXMEM(a)):"memory");
     CHECK_EQ(*(u16 *)b,*(u16 *)a); CHECK_EQ(*(u16 *)(b+2),*(u16 *)(a+2)); CHECK_EQ(b[4],a[4]);
     CHECK(!kmemcmp(a+32,b+32,10)); CHECK(!kmemcmp(a+48,b+48,10));
-    if(cpu.has_mmx) {
+    if(cpu_test_feature(REQ_MMX)) {
         u64 q=0x0123456789abcdefull,out;
         __asm__ volatile("movq %1,%%mm0; movq %%mm0,%%mm1; movq %%mm0,%%mm2; movq %%mm0,%%mm3; movq %%mm0,%%mm4; movq %%mm0,%%mm5; movq %%mm0,%%mm6; movq %%mm0,%%mm7; fxsave %0; emms":"=m"(FXMEM(a)):"m"(q):"memory");
         CHECK_EQ(a[4],0xff); CHECK_EQ(*(u16 *)(a+2)&0x3800,0);

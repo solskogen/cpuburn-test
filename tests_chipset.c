@@ -182,7 +182,7 @@ static u32 cs_shadow_rom(void) {
     for(u32 i=0;i<8;i++) { u8 ch=v[5+i]; date[i]=(ch>=32&&ch<=126)?ch:'.'; } date[8]=0;
     t_note("reset_vector=%02x %02x %02x %02x %02x BIOS_date=%s",v[0],v[1],v[2],v[3],v[4],date);
     t_note("BDA COM1=%04x equipment=%04x conventional_KB=%u VGA_A0000=%08x VGA_B8000=%08x",
-           *(volatile u16 *)0x400,*(volatile u16 *)0x410,*(volatile u16 *)0x413,*(volatile u32 *)0xa0000,*(volatile u32 *)0xb8000);
+           bda_read16(0),bda_read16(0x10),bda_read16(0x13),*(volatile u32 *)0xa0000,*(volatile u32 *)0xb8000);
     return hash;
 }
 
@@ -246,7 +246,7 @@ static u32 cs_apic(void) {
 static u32 cs_misc_ports(void) {
     u8 p=inb(0x61),a=inb(0x92);
     t_note("port61=%02x NMI_parity=%u IOCHK=%u port92=%02x COM1 untouched",p,!!(p&0x80),!!(p&0x40),a);
-    u16 com2=*(volatile u16 *)0x402,lpt=*(volatile u16 *)0x408;
+    u16 com2=bda_read16(2),lpt=bda_read16(8);
     if(com2==0x2f8 && inb(0x2fd)!=0xff) {
         u8 saved=inb(0x2ff); outb(0x2ff,0x5a); u8 r1=inb(0x2ff); outb(0x2ff,0xa5); u8 r2=inb(0x2ff); outb(0x2ff,saved);
         t_note("COM2 scratch=%02x/%02x restored=%02x",r1,r2,saved);

@@ -34,6 +34,35 @@ def options(**changes):
 
 
 class PerfTests(unittest.TestCase):
+    def test_counted_work_unit_and_scope_survive_parser_and_report(self):
+        run = example()
+        for test in run["tests"]:
+            test.update(op_unit="emmi_instruction_case", timing_scope="checked_workload")
+        report = summarize([run], 0)
+        work = report["workloads"]["heavy"]
+        self.assertEqual(work["op_unit"], "emmi_instruction_case")
+        self.assertEqual(work["timing_scope"], "checked_workload")
+        parsed = parse_log("TEST r=1 name=a status=PASS op_unit=cpuid_control_state "
+                           "timing_scope=checked_workload\n")
+        self.assertEqual(parsed["tests"][0]["op_unit"], "cpuid_control_state")
+        self.assertEqual(parsed["tests"][0]["timing_scope"], "checked_workload")
+
+    def test_mixed_work_unit_or_scope_cannot_be_pooled(self):
+        for field in ("op_unit", "timing_scope"):
+            with self.subTest(field=field):
+                run = example()
+                run["tests"][0][field] = "different"
+                with self.assertRaisesRegex(ValueError, "mixed operation units or timing scopes"):
+                    summarize([run], 0)
+
+    def test_changed_work_unit_or_scope_is_not_comparable(self):
+        old = summarize([example()], 0)
+        for field in ("op_unit", "timing_scope"):
+            with self.subTest(field=field):
+                new = copy.deepcopy(old)
+                new["workloads"]["heavy"][field] = "different"
+                self.assertEqual(compare(new, old, options())[0]["status"], "not_comparable")
+
     def test_vendor_capability_records(self):
         cpu_line = 'CPU cpuid=1 vendor="AuthenticAMD" family=5 model=13'
         extensions = "CPU ext_edx=c08029bb 3dnow=1 3dnowext=1 cyrix_emmi=0"
