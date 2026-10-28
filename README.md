@@ -26,6 +26,60 @@ Version **0.1.0 preview**. Licensed under [MIT](LICENSE).
   test cases but reduces repetition/stress and timing confidence. Defaults
   are 10 and 5 guest seconds; invocations are never cut short.
 
+## Usage
+
+### Boot and capture results
+
+Run `make`, insert `floppy.img` into drive A: of an i486-or-newer VM, and
+boot from the floppy. Results appear on the VGA screen and COM1 (115200, 8N1).
+No guest OS or hard disk is required.
+
+To display and save serial output with the supplied Python 3 script, use
+an 86Box build with `AUTOMATION=ON`. With 86Box stopped, enable COM1 capture
+in the VM's existing `86box.cfg` section:
+
+```ini
+[Ports (COM & LPT)]
+serial1_enabled = 1
+serial1_device = automation
+```
+
+On Linux/macOS, start the VM in one terminal (replace the binary and VM paths):
+
+```sh
+86Box --vmpath /path/to/disposable-vm \
+  --automation "unix:/tmp/cpuburn-$UID.sock" --automation-hold
+```
+
+In another terminal, from this project's directory:
+
+```sh
+python3 tools/capture_serial.py "unix:/tmp/cpuburn-$UID.sock"
+python3 tools/perf_report.py serial.log --output report.json
+```
+
+The script displays results and saves `serial.log` until `DONE`. Inspect
+`SUMMARY`: successful capture does **not** mean all tests passed. The VM
+stays open and held afterward, including if capture fails; partial logs are
+retained. Use `--output another-run.log` for subsequent runs; existing files
+are not overwritten. Do not run another controller against the same VM
+while capturing. See `python3 tools/capture_serial.py --help` for options.
+
+For Windows or local TCP capture, start 86Box with
+`--automation tcp:7086 --automation-hold` instead, then use:
+
+```sh
+python3 tools/capture_serial.py tcp:127.0.0.1:7086 \
+  --token-file /path/to/disposable-vm/automation.token --output serial-tcp.log
+```
+
+Keep the socket local; do not expose it to the internet. If no results
+appear, check the VGA screen for a BIOS prompt and ensure firmware enables
+COM1. For automatic handling of supported BIOS F1 prompts, use
+[`tools/run_86box.py --bios-f1`](#sustained-host-profiling).
+
+## Overview
+
 Builds **`floppy.img`**, a raw 1.44 MiB bootable floppy image. No installed OS,
 filesystem, hard disk, network, or guest disk writes are required. Results go to
 COM1 (115200, 8N1), port `0xE9`, and VGA text; `0x80` carries progress checkpoints.
