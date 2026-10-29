@@ -73,8 +73,8 @@ make -B BENCHMARKS=1
 python3 tools/run_86box.py --vm "/path/to/My VM"
 ```
 
-The runner launches isolated VMs sequentially; do not start a VM or the serial
-capture script separately for these commands. `--vm` accepts any VM directory
+The runner starts your VM **in place**; stop it first and do not start another
+instance or serial controller during the run. `--vm` accepts any VM directory
 containing `86box.cfg`, or a configuration file such as
 `--vm "/another/location/custom.cfg"`. There is no required VM storage location.
 CPU family, clock, multiplier, RAM, FPU and the primary video card come from
@@ -87,7 +87,8 @@ To compare execution engines, run the same VM twice:
 
 ```sh
 python3 tools/run_86box.py --vm "/path/to/My VM" --dynarec on
-python3 tools/run_86box.py --vm "/path/to/My VM" --dynarec off
+python3 tools/run_86box.py --vm "/path/to/My VM" --dynarec off \
+  --output-dir "/path/to/interpreter-results"
 ```
 
 Other optional switches:
@@ -98,28 +99,25 @@ Other optional switches:
 | `--label interpreter` | Add an arbitrary descriptive label to `result.json` for identifying comparisons. It does **not** select the interpreter; only `--dynarec off` does that. Omit it unless you want a label. |
 | `--key 20000:0x3c` | Press F2 at 20,000 emulated milliseconds, only for firmware that explicitly offers F2 to load defaults and continue. General syntax is `EMULATED_MS:SET1_SCANCODE`; this is not automatic BIOS configuration. |
 
-The source configuration and its adjacent `nvr/` directory are copied into
-the private run directory. BIOS selections are retained. The VM should be
-stopped while its inputs are copied. Source files are never modified.
-Relative NVRAM locations are resolved beside the supplied configuration;
-original floppy, CD and hard-disk paths are deliberately **not opened**,
-whether relative or absolute.
-
-This is a CPU-test fixture, not a full clone of the original VM: storage is
-replaced with the write-protected test floppy, sound/network/host passthrough
-and other peripheral-specific settings are discarded, COM1 capture is
-enabled, host time synchronization is disabled, and software rendering is
-used. Thus peripherals and storage differ from the original machine.
-Firmware must support booting that floppy; copied CMOS may still require
-boot-order setup or acknowledgement of removed storage. Inspect `screen.log`
-or `screen.png` when boot stalls; the runner never blindly accepts firmware
-defaults. NVRAM symlinks are rejected rather than followed.
+Nothing is copied: the VM uses its own NVRAM, disks, devices and relative paths.
+The runner temporarily inserts the test image in drive A: (write-protected),
+enables COM1 capture and applies any explicit CPU/RAM/FPU overrides. After
+86Box exits, the original configuration is restored byte-for-byte, including
+the previous floppy and COM1 settings, also on ordinary errors or Ctrl+C.
+NVRAM and disks remain live and can be updated by firmware or the guest;
+they are **not** rolled back. Abrupt termination such as SIGKILL or a host
+power failure cannot guarantee configuration restoration.
+Ensure the BIOS boots drive A:, not your installed OS. Inspect `screen.log`
+or `screen.png` if boot stalls.
 Use `--rompath /path/to/roms` for firmware outside standard locations.
 Missing configuration or required CPU/RAM settings produce an error;
 firmware/boot problems remain explicit errors or incomplete runs, not passes.
 No firmware is downloaded.
 
-Each run saves `serial.log` and `result.json` under `build/86box-*`.
+By default, `serial.log`, `result.json` and the other capture diagnostics go
+directly into the supplied VM directory (beside the configuration file).
+Use `--output-dir /path/to/results` to save them elsewhere. Existing capture
+files are not overwritten; choose another output directory for another run.
 In `result.json`, **each sampled test** has an entry under
 `workload_capture.workloads`, identified by `name` and `id`:
 
@@ -248,212 +246,18 @@ exception probes gate MMX, P6 instructions, FXSAVE and AMD 3DNow!, while
 Cyrix EMMI uses a restricted vendor/model gate. No SSE/SSE2, later SIMD,
 64-bit execution or CPUs outside 86Box's supported range are targeted.
 
-## Coverage boundaries
+## Coverage overview
 
-The source registries `tests_*.c` list the precise workloads and feature gates;
-the following sections describe their checked behavior and limits.
+The i486-baseline image checks integer execution, x87, MMX and optional vendor
+instructions, protected-mode transitions, paging/restart, system state and
+selected chipset behavior. Tests are deterministic or explicitly bounded, not
+exhaustive ISA or motherboard certification. Eligibility depends on detected
+features and runtime resources; a SKIP is not a pass. Both benchmark and
+accuracy builds run checked workloads, not isolated instruction latency.
 
-| Area | Source modules | Evidence and limits |
-|---|---|---|
-| Integer execution and translation | `tests_int.c`, `tests_corpus.c`, `tests_sweeps.c` | Arithmetic/defined flags, decoding, branches, SMC and code footprints; exhaustive only where explicitly stated, otherwise deterministic samples. |
-| x87 and MMX | `tests_fpu.c`, `tests_fp_edges.c`, `tests_mmx.c` | Results, formats, rounding, status/environment and scalar/exact references; not full x87 transcendental precision certification. |
-| AMD/Cyrix extensions | `tests_vendor.c` | Feature-gated baseline/enhanced 3DNow! and all twelve Cyrix EMMI opcodes; integer-only references, finite dyadic floating-point cases and documented reciprocal precision bounds. Not exhaustive floating-point range/rounding certification. |
-| Cyrix CPU controls | `tests_cyrix.c` | Model-qualified CCR4 CPUID/ID-flag controls and disabled-SMM opcode faults; saved configuration restored. GXm CPUID expectations prepared, execution pending integration. Not full CCR/ARR or SMM entry/exit coverage. |
-| Privilege, exceptions and restart | `tests_pmode.c`, `tests_heavy_pmode.c`, `tests_priority.c`, `tests_restart_complex.c` | Protected-mode architectural transitions and selected fault precedence/restart cases; not every combination of instructions, exceptions or pending interrupts. |
-| Paging and translated memory | `tests_paging.c`, `tests_heavy_paging.c`, `tests_mem.c` | Permissions, aliases, TLB invalidation and checked accesses; selected memory sizes/alignments, not a proof over all physical mappings. |
-| CPU/system state and sustained interactions | `tests_sys.c`, `tests_heavy_state.c`, `tests_burn.c` | Feature-gated control state, interrupts and mixed repetition; safe probes do not establish complete model-specific MSR behavior. |
-| Supporting platform | `tests_chipset.c` | Legacy PIC/PIT/RTC, A20 and limited DMA/ROM/PCI checks; not comprehensive motherboard/chipset validation. Network, IDE and other peripheral throughput are outside the primary scope. |
-
-`req` in each `TEST` record is the hexadecimal requirement bitmask defined
-in `kernel.h`. It explains eligibility, not everything a test exercises.
-`SKIP` retains the missing feature or runtime precondition; it is not coverage
-or a pass. Inspect the selected machine, feature gates and actual result
-inventory rather than assuming every CPU runs the same cases. 808x/286 are
-not supported by this protected-mode image; 386 results are explicitly
-warned as unreliable. Availability is not inferred from a CPU's marketing
-name or its age: a K6 without 3DNow! does not run 3DNow! tests, and a
-6x86 without MMX/EMMI does not run EMMI tests. A supported CPU model is
-not a promise of exhaustive model-specific instruction/MSR coverage.
-
-### AMD and Cyrix instruction workloads
-
-The same i486-built image contains these optional workloads. Standard MMX
-and FPU gates still apply. `CPUID.80000001:EDX[31]` enables baseline
-3DNow! tests; bit 30 additionally enables the enhanced instructions
-implemented for K6-2+/K6-III+ in 86Box. This also permits other supported
-86Box CPUs advertising baseline 3DNow!, without assuming AMD ownership.
-Raw extended CPUID bits and decoded capabilities appear in `CPU` records.
-Later AMD extended-MMX/SSE instructions are deliberately not included.
-
-| Record | Instructions/behavior | Cases per invocation at scale 8 |
-|---|---|---:|
-| `3dnow_float` | PFADD/PFSUB/PFSUBR/PFMUL/PFACC, PFCMPEQ/PFCMPGE/PFCMPGT and PFMIN/PFMAX; signed finite integer inputs with exact binary32 references, including signed multiplication zero. | 30,720 |
-| `3dnow_convert` | PI2FD and PF2ID; exact conversion and fractional truncation with positive/negative lane values. | 6,144 |
-| `3dnow_integer` | PAVGUSB rounded unsigned-byte averages and AMD PMULHRW signed rounded products. | 6,144 |
-| `3dnow_reciprocal` | PFRCP/PFRSQRT low-lane broadcast, plus documented PFRCPIT1/PFRSQIT1/PFRCPIT2 refinement sequences. Positive powers of four; initial relative-error bounds of 2^-14 (reciprocal) / 2^-15 (reciprocal square root), final bounds of 2^-23. | 2,048 sequences |
-| `3dnow_state` | FEMMS empties MMX tags and permits exact x87 integer use; PREFETCH/PREFETCHW preserve flags and the referenced bytes. Cache-hit/timing effects are not asserted. | 1,024 transitions |
-| `3dnow_enhanced_float` | PFNACC/PFPNACC horizontal subtraction/mixed accumulation. | 6,144 |
-| `3dnow_word_convert` | PI2FW word selection and PF2IW truncation, signed saturation and sign extension into both dwords; poisoned unused input words and destination bits expose lane/preservation mistakes. | 6,144 |
-| `3dnow_swap` | PSWAPD swaps both dwords, including arbitrary bit patterns. | 3,072 |
-| `cyrix_emmi_arithmetic` | PAVEB, PADDSIW, PMAGW, PDISTIB, PSUBSIW, PMULHRWC, PMULHRIW and PMACHRIW; rounding, saturation, implicit destinations and unchanged source registers. | 28,672 |
-| `cyrix_emmi_moves` | PMVZB/PMVNZB/PMVLZB/PMVGEZB byte masks, preserving unselected bytes, mask and source. | 8,192 |
-
-`ops` counts packed instruction cases or the sequences/transitions shown
-above, not scalar lanes or a universal instruction count. 3DNow! arithmetic
-and conversion tests include register, memory and same-register source/destination
-forms. EMMI checks both even/odd specified registers and their implicit partners;
-memory-only instructions are never tested with invalid register operands.
-
-The twelve additional `cyrix_emmi_<opcode>` records isolate each EMMI operation
-using the same assertion forms, edge cases and vector counts as the two
-aggregate records. Each single-opcode invocation resets the deterministic PRNG;
-later opcodes in an aggregate continue its PRNG stream.
-Both accuracy and benchmark builds include them; existing aggregate IDs remain
-available for historical comparisons. Their work unit is
-`emmi_instruction_case`, not scalar lanes or raw instruction throughput.
-
-EMMI has no ordinary CPUID feature bit. The gate accepts `CyrixInstead`,
-family 6, model 0 with MMX (6x86MX/MII), or GXm family 5, model 4 with
-extended CPUID EDX bit 24. That extended bit means EMMI, **not FXSAVE**.
-The workloads temporarily enable CCR7.EMMX, preserving CCR3 mapping and
-restoring both configuration registers even after a guarded fault/watchdog.
-Other CPUs skip without touching these ports. Tests do not enable CPUID
-on CPUs whose firmware has disabled it; those cannot satisfy this EMMI gate.
-Equal/opposite PMAGW magnitude ties are avoided because the reference used
-here does not specify their tie-breaking rule.
-
-The integer-only references follow AMD's
-[3DNow! manual, 21928G](https://kib.kiev.ua/x86docs/AMD/AMD-3DNow/21928G.pdf)
-and [extension manual, 22466D](https://kib.kiev.ua/x86docs/AMD/AMD-3DNow/22466D.pdf),
-and the Cyrix instruction descriptions in the
-[NASM 0.98.39 manual](https://github.com/netwide-assembler/nasm/blob/nasm-0.98.39/doc/nasmdoc.src).
-They do not use 86Box results as expected values. NaNs, infinities, denormal
-range/underflow cases, general reciprocal inputs and all rounding cases are
-not exhaustively covered. A mismatch remains `FAIL`, not an emulator-specific
-exception to the reference.
-
-## Heavy interaction workloads
-
-### CPU execution-boundary workloads
-
-These five records target execution/state boundaries that matter to 86Box's
-interpreter and recompiler. They assert architectural results independently;
-agreement between two emulators or execution engines is not their oracle.
-The same static instruction sites are reused, but the guest cannot prove
-that a particular instruction was translated or linked by the host.
-
-| Record | Checked behavior | Cases per invocation at scale 8 |
-|---|---|---:|
-| `int_flags_boundaries` | ADD/SUB result and all six defined arithmetic flags across taken JMP and CALL/RET, then SETcc and ADC/SBB consumers; edge values plus seeded inputs. | 4,096 producer/consumer cases |
-| `int_partial_boundaries` | AL, AH and AX writes preserve the other EAX bits across branches/calls; full-width snapshots and an AH-dependent result. | 8,192 cases |
-| `int_divide_state` | DIV by zero, unsigned quotient overflow and signed quotient overflow deliver #DE at the faulting EIP, preserving dividend and divisor registers both in the exception frame and after handler return. Undefined division flags are not asserted. | 3,072 faults |
-| `mmx_x87_transitions` | FNSAVE/FRSTOR around MMX arithmetic and EMMS, nonempty MMX tags/TOP state, empty tags after EMMS, and exact integer x87 results plus final tags/TOP. Saved tags may classify register contents as valid, zero, or special; they need not all be zero. | 2,048 transitions |
-| `heavy_pm_code_context` | Repeated far calls to identical code bytes at the same offset/base/selector while alternating the code descriptor's default operand size. Both 16- and 32-bit decoding paths must return the correct result. | 32,768 calls |
-
-`ops` counts the cases/faults/transitions/calls in this table, **not guest
-instructions**. The first three and code-context record require i486;
-MMX/x87 transitions require both features and otherwise explicitly skip.
-Context changes use guarded descriptor restoration; the divide handler is
-restored after the workload. These additions do not claim new coverage of
-all Jcc conditions, page-fault commit rules, real-mode transitions, SMM or
-every x87 exception. Existing paging/restart and FPU tests cover separate cases.
-Use `ONLY` with these exact names for an isolated diagnostic image.
-
-`corpus_integer_sequences` generates deterministic 32-instruction programs
-mixing 8/16/32-bit ADD/ADC/SUB/SBB/CMP, AND/OR/XOR, ROL/ROR, NOT and INC/DEC
-across four registers. At default scale it regenerates 16,384 blocks at
-64 instruction alignments and executes each eight times: **4,194,304 corpus
-instructions**, with four register/flag checkpoints per block execution.
-These counts describe one invocation; the sustained harness repeats it.
-Every opcode-group/width combination must occur. Arithmetic results and
-carry/borrow use an independent bit-serial reference; only architecturally
-defined flags are compared. A failure logs the global seed, vector seed,
-block/reuse/checkpoint, initial registers and the full instruction prefix
-needed to reproduce it. This is a constrained, safe instruction corpus,
-not unconstrained random privileged/invalid-opcode fuzzing.
-
-The `fdiv_v*_rn/rd/ru/rz` records add the notorious 4,195,835 / 3,145,727 Pentium FDIV case,
-nearby mantissas and scaled/signed ratios with exact raw x87 reference values
-under all four rounding controls. `fprem_v*` and `fprem1_v*` exercise FPREM and FPREM1
-with extreme extended-range exponents, signed zeros, nearest-even ties,
-denormals and nonfinite status checks. Each of the 15 FDIV vectors and four
-rounding controls has its own record (60 total); each of 11 remainder
-vectors/instructions has its own record (22 total). Four classification records
-independently exercise FPREM/FPREM1 denormals, finite/infinity and invalid
-infinity/finite. A failure in one record cannot hide any other vector or
-rounding mode. Default totals on a passing CPU are 122,880 divisions,
-45,056 remainder cases and 32,768 classification cases. Individual records
-still fail fast on their first bad iteration. Iterative C2 completion is bounded at 2,048
-steps: noncompletion is a reported failure, not an infinite spin.
-The embedded tables can be independently rechecked without floating-point
-arithmetic using `python tools/check_fp_edges.py` (exact integer/rational
-rounding and remainder identities).
-Negative-quotient condition bits are diagnostic only because their signed
-encoding is ambiguous in the reference wording; exact signed remainders and
-nonnegative quotient bits are still asserted.
-
-`heavy_decode_align` sweeps offsets 0–63 and 4093–4095 with prefixed,
-variable-length i486 code and both branch paths (1,852,416 instructions at
-default scale). `heavy_decode_worksets` covers executable footprints from
-4 KiB to 4 MiB, contrasting code rewrite/taken-branch invalidation with
-unchanged reuse (1,245,168 instructions with full-size owned RAM).
-`heavy_mem_align` covers 13 footprints from 1 KiB to 4 MiB, the same 67
-offsets, and 1/2/4/8-byte accesses with bytewise reference checks
-(1,363,584 operations). Eight-byte accesses use integer halves, not optional
-MMX/SSE. Available owned RAM caps the largest footprint and is logged.
-Timing notes give per-size results and the worst alignment; memory timings
-include the checked loop's initialization/reference overhead, not pure
-load/store latency. The sweep is substantial on slow hardware (about
-62 seconds for the memory record on the tested 33 MHz 86Box 486).
-
-The paged-code/restart additions include six separate records: code modified
-through physical aliases and remapped execution pages; linked direct/indirect
-code blocks; cross-page instruction fetch and data access; partially completed
-forward/backward REP MOVSD; and split-stack PUSH/POP fault restart. Assertions
-check final results and fault-time architectural state, including preserved
-registers. At the default scale these execute 53,477,376 SMC instructions,
-1,048,576 linked blocks, 81,920 real page faults and 2,097,152 MOVSD elements.
-These are workloads with fixed counts; they do not merely sleep for a duration.
-They use owned memory and restore mappings/hooks after guarded failures.
-
-Six exception-priority records add 98,304 default cases: segment-limit #GP
-before operand paging; LGDT/LIDT privilege #GP; invalid LOCK MOV #UD;
-nonpresent/protection page-fault error bits; instruction-fetch faults before
-operand access; and mapped ring-3 alignment controls. They check defined
-exception/state outcomes rather than unspecified overlaps; in particular,
-same-data-access #AC versus #PF ordering is not asserted. Missing mandatory
-traps remain failures. Setup and execution are guarded with mapping/hook cleanup.
-
-Complex restart records exercise mixed 16/32-bit PUSHA/POPA, ENTER/LEAVE,
-same-privilege far CALL/RETF and same-ring IRET across page boundaries.
-The faulting stacks belong to ring 3 so faults can use a safe ring-0 TSS
-stack. Checks cover restart EIP, CPL, CR2, defined page-fault bits, final
-registers/frames and guard bytes. They deliberately do not require rollback
-of intermediate memory stores or assert unspecified fault-time registers.
-Default scale runs 32,768 cases per complex record (131,072 total), with
-mode-specific instruction/fault counts logged separately.
-
-Eight protected-mode stress records add 16-bit code/stack/address-size paths,
-LDT/TI descriptor use, expand-down boundaries, ring-3 call gates with parameter
-copying and RETF, privilege checks, VME/PVI virtual flags/VIP faults, and
-interrupt shadows. Default coverage includes about 4.2 million 16-bit operations
-and 16,384 call-gate transitions. STI/IRET use 64 actual pending IRQ samples;
-MOV SS/POP SS use pending single-step debug traps (not a claim to test every
-asynchronous IRQ ordering). Unsupported VME/PVI is skipped through feature gates.
-
-Mixed-state stress alternates seeded integer/memory work, page remaps, x87 and
-MMX with software interrupts, checking preserved state against scalar references.
-At default scale it performs 131,072 iterations (about 1.84 million operations
-on a 486 and 2.36 million with MMX). Separate state tests exercise
-FNSAVE/FRSTOR and feature-gated FXSAVE/FXRSTOR. Active LAPIC tests exercise
-periodic and one-shot interrupt delivery with PIT deadlines and explicit EOI;
-they skip absent/disabled/relocated/x2APIC configurations and a preexisting
-active timer rather than taking it over. They do not reroute the PIC, send
-IPIs, or test other processors.
-At default scale the interrupt-state test delivers 32,768 software interrupts;
-each save/restore record runs 65,536 checked iterations. LAPIC periodic stress
-requires at least 2,048 deliveries over at least two seconds; one-shot stress
-rearms and checks 1,024 deliveries. Actual periodic count varies with timing.
+See the [workload catalogue](doc/workloads.md) for every registered record,
+requirements, work units and limitations, and [CPU contracts](doc/cpu-contracts.md)
+for model expectations and feature-evidence distinctions.
 
 ## CPU contracts and accuracy runs
 
@@ -500,7 +304,7 @@ changing it, just as for the other Makefile build settings.
 
 ### Model coverage and matrices
 
-`cpu_models.h` contains minimum contracts for all 66 currently active 486+
+`cpu_models.h` contains minimum contracts for all 67 currently active 486+
 families, plus the two build-conditional K5 families. The catalogue includes
 486-class 386-bus upgrades and later Intel, AMD, Cyrix, IDT and VIA models.
 Requirements are independently sourced architectural minima, not generated
@@ -928,9 +732,12 @@ claimed from local desktop-emulator validation.
 ## Safety and limits
 
 Only the boot loader uses BIOS disk reads. The protected-mode kernel does not
-access disk controllers or issue storage writes. Memory patterns are restricted
-to firmware-reported usable extended RAM owned by the test. PCI configuration
-and ROM inspection are read-only. The suite does not reprogram MTRRs, initiate
+access disk controllers or issue storage writes. Most memory patterns use
+firmware-reported usable extended RAM owned by the test. The
+`int_smc_ram_top` workload also writes a probe just above reported RAM and
+may execute there if it reads back; see the [catalogue](doc/workloads.md).
+PCI configuration and ROM inspection are read-only. The suite does not
+reprogram MTRRs, initiate
 DMA transfers, write-probe option ROMs, disable A20 during workloads, invoke SMM,
 or run destructive board-specific chipset configuration tests. Device absence
 is reported rather than treated as a benchmark failure.

@@ -8,7 +8,7 @@ static __attribute__((noinline)) u32 cyrix_capabilities(void) {
         {"cx6x86", CYRIX_SMM}, {"cx6x86l", CYRIX_SMM},
         {"cx6x86mx", CYRIX_SMM | CYRIX_CPUID | CYRIX_SHR},
         {"mii", CYRIX_SMM | CYRIX_CPUID | CYRIX_SHR},
-        {"mediagx_mmx", CYRIX_SMM | CYRIX_CPUID | CYRIX_GXM}
+        {"mediagxm", CYRIX_SMM | CYRIX_CPUID | CYRIX_GXM}
     };
     for (u32 i = 0; i < sizeof models / sizeof models[0]; i++) {
         const char *model = cpu_model_name(), *name = models[i].name;

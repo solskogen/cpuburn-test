@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Run one combined correctness/unthrottled-capacity benchmark in isolated 86Box."""
+"""Run CPU checks and capacity measurements using an existing 86Box VM."""
 
 import argparse
 import configparser
+from contextlib import contextmanager
+import fcntl
 import re
 import hashlib
 import json
@@ -63,8 +65,8 @@ def boot_key(value):
 def arguments():
     parser = argparse.ArgumentParser(description=__doc__, epilog=(
         "Requires an AUTOMATION-enabled 86Box, Xvfb, and locally installed ROMs. "
-        "Never downloads firmware. All mutable state stays in a new build/86box-* "
-        "directory. No original config or image is modified. Without --expect, "
+        "Never downloads firmware. --vm runs the supplied VM in place, temporarily "
+        "inserting the test floppy and enabling COM1, then restores its config. Without --expect, "
         "DONE completes observation with strict nonzero summary counts, not a "
         "guest-test PASS (FAIL/FAULT remain visible). Default limits: 24 guest "
         "hours and 8 host hours. Ratios measure unthrottled speed capacity, not "
@@ -74,13 +76,14 @@ def arguments():
         "may require --bios-f1. Graphical BIOS prompts cannot be read by 'text'; "
         "AL440LX needs --key 20000:0x3b to resume its fresh-CMOS F1 prompt and "
         "may leave COM1 inaccessible (use screen.log). --vm accepts a VM directory "
-        "(containing 86box.cfg) or a configuration file. CPU/RAM/video and BIOS "
-        "selectors are imported; NVRAM is copied privately. Disks, networking, "
-        "host backends and other peripheral settings are discarded."
+        "(containing 86box.cfg) or a configuration file. NVRAM, disks and devices "
+        "remain in place and may be updated by the VM. Stop the VM before running."
     ))
     parser.add_argument("--emulator", default="86Box",
                         help="executable name or path (default: 86Box on PATH)")
     parser.add_argument("--image", type=Path, default=ROOT / "floppy.img")
+    parser.add_argument("--output-dir", type=Path,
+                        help="results directory (default: supplied VM directory)")
     parser.add_argument("--rompath", type=Path,
                         help="local ROM directory (normally containing machines/ and video/)")
     source = parser.add_mutually_exclusive_group(required=True)
@@ -160,15 +163,69 @@ def emulator_binary(value):
     return Path(executable).resolve(strict=True)
 
 
-def copy_nvram(source, destination):
-    if source.is_symlink():
-        raise RuntimeError(f"NVRAM directory must not be a symlink: {source}")
-    if not source.exists():
-        return
-    for path in source.rglob("*"):
-        if path.is_symlink() or not (path.is_file() or path.is_dir()):
-            raise RuntimeError(f"unsupported NVRAM entry: {path}")
-    shutil.copytree(source, destination)
+@contextmanager
+def inplace_vm(args, image):
+    source = vm_config(args.vm)
+    for process in Path("/proc").iterdir():
+        if not process.name.isdigit():
+            continue
+        try:
+            command = (process / "cmdline").read_bytes().split(b"\0")
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+        if not command or "86box" not in Path(os.fsdecode(command[0])).name.lower():
+            continue
+        cwd = None
+        try:
+            cwd = (process / "cwd").resolve(strict=True)
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            pass
+        for index, word in enumerate(command):
+            if word in (b"--vmpath", b"-P") and index + 1 < len(command):
+                path = Path(os.fsdecode(command[index + 1]))
+                if not path.is_absolute():
+                    if cwd is None:
+                        continue
+                    path = cwd / path
+                if path.resolve() == source.parent.resolve():
+                    raise RuntimeError(f"VM is already running (PID {process.name}): {source}")
+            elif os.fsdecode(word) == str(source):
+                raise RuntimeError(f"VM is already running (PID {process.name}): {source}")
+    with source.open("r+b") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError(f"VM configuration is already in use: {source}") from None
+        original = handle.read()
+        config = configparser.ConfigParser(interpolation=None, strict=False)
+        config.read_string(original.decode("utf-8-sig"))
+        if not config.has_section("Machine"):
+            raise RuntimeError("VM configuration needs a [Machine] section")
+        for key in ("machine", "cpu_family", "cpu_speed", "mem_size"):
+            if not config.has_option("Machine", key):
+                raise RuntimeError(f"VM configuration needs an explicit [Machine] {key}")
+        for key in ("cpu_speed", "mem_size"):
+            if int(config["Machine"][key]) <= 0:
+                raise RuntimeError(f"VM [Machine] {key} must be positive")
+        if args.dynarec is not None:
+            config["Machine"]["cpu_use_dynarec"] = str(int(args.dynarec == "on"))
+        if args.memory_mb is not None:
+            config["Machine"]["mem_size"] = str(args.memory_mb * 1024)
+        if args.fpu_backend is not None:
+            config["Machine"]["fpu_softfloat"] = str(int(args.fpu_backend == "softfloat"))
+        for section in ("Ports (COM & LPT)", "Floppy and CD-ROM drives"):
+            if not config.has_section(section):
+                config.add_section(section)
+        config["Ports (COM & LPT)"].update(serial1_enabled="1", serial1_device="automation")
+        config["Floppy and CD-ROM drives"].update(
+            fdd_01_type="35_2hd", fdd_01_fn=str(image), fdd_01_writeprot="1")
+        try:
+            with source.open("w", encoding="utf-8") as output:
+                config.write(output)
+            yield source, dict(config["Machine"]), hashlib.sha256(original).hexdigest()
+        finally:
+            with source.open("wb") as output:
+                output.write(original)
 
 
 def write_config(args, run_dir):
@@ -193,18 +250,6 @@ def write_config(args, run_dir):
                     "cpu", "cpu_manufacturer", "cpu_override", "cpu_debug_regs_486"):
             if original.has_option("Machine", key):
                 config["Machine"][key] = original["Machine"][key]
-        if getattr(args, "vm", None):
-            for key in ("cpu_family", "cpu_speed", "mem_size"):
-                if key not in config["Machine"]:
-                    raise RuntimeError(f"VM configuration needs an explicit [Machine] {key}")
-            for key in ("cpu_speed", "mem_size"):
-                try:
-                    value = int(config["Machine"][key])
-                except ValueError:
-                    raise RuntimeError(f"invalid VM [Machine] {key}") from None
-                if value <= 0:
-                    raise RuntimeError(f"VM [Machine] {key} must be positive")
-            copy_nvram(source.parent / "nvr", run_dir / "nvr")
         if original.has_option("Video", "gfxcard"):
             config["Video"]["gfxcard"] = original["Video"]["gfxcard"]
         for section in original.sections():
@@ -383,15 +428,18 @@ def execute(args, run_dir, command, machine):
         display, display_name = start_display(run_dir, deadline)
         environment = os.environ.copy()
         # Keep the session runtime directory so OpenAL can reach PipeWire.
-        environment.update(DISPLAY=display_name, QT_QPA_PLATFORM="xcb",
+        environment.update(DISPLAY=display_name, QT_QPA_PLATFORM="xcb")
+        if not getattr(args, "vm", None):
+            environment.update(
                            XDG_CONFIG_HOME=str(run_dir / "config"),
                            XDG_CACHE_HOME=str(run_dir / "cache"),
                            XDG_DATA_HOME=str(run_dir / "data"),
                            TMPDIR=str(run_dir / "scratch"))
-        for name in ("config", "cache", "data", "scratch"):
-            (run_dir / name).mkdir(mode=0o700)
+            for name in ("config", "cache", "data", "scratch"):
+                (run_dir / name).mkdir(mode=0o700)
         with (run_dir / "process.log").open("wb") as output:
-            emulator = subprocess.Popen(command, cwd=run_dir, env=environment,
+            emulator = subprocess.Popen(command, cwd=(vm_config(args.vm).parent
+                                        if getattr(args, "vm", None) else run_dir), env=environment,
                                         stdout=output, stderr=output, start_new_session=True)
         socket_path = run_dir / "automation.sock"
         while time.monotonic() < deadline:
@@ -614,6 +662,46 @@ def execute(args, run_dir, command, machine):
     return result
 
 
+def run_existing_vm(args, emulator, image, roms):
+    source = vm_config(args.vm)
+    run_dir = (args.output_dir.expanduser().absolute() if args.output_dir else source.parent)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    artifacts = ("serial.log", "result.json", "launch.json", "automation.sock",
+                 "automation.jsonl", "screen.log", "screen.png", "emulator.log",
+                 "process.log", "xvfb.log", "perf.data", "perf-record.log")
+    for name in artifacts:
+        if (run_dir / name).exists():
+            raise RuntimeError(f"output already exists: {run_dir / name}; "
+                               "use --output-dir for another run")
+    if len(os.fsencode(run_dir / "automation.sock")) >= 108:
+        raise RuntimeError("output path is too long for a UNIX automation socket; use --output-dir")
+    if args.prepare_only:
+        raise RuntimeError("--prepare-only is for generated fixtures, not in-place --vm runs")
+    print("Running VM in place: disks, NVRAM and host-connected devices remain active. "
+          "The VM must not already be running. Configuration is restored after exit.",
+          file=sys.stderr)
+    with inplace_vm(args, image) as (source, machine, source_hash):
+        command = [str(emulator), "--automation", f"unix:{run_dir / 'automation.sock'}",
+                   "--automation-hold", "--noconfirm", "--vmpath", str(source.parent),
+                   "--rompath", str(roms), "--logfile", str(run_dir / "emulator.log"),
+                   str(source)]
+        image_hash = hashlib.sha256(image.read_bytes()).hexdigest()
+        (run_dir / "launch.json").write_text(json.dumps({
+            "command": command, "source_vm": str(source), "machine": machine,
+            "source_config_sha256": source_hash, "image": str(image),
+            "image_sha256": image_hash, "in_place": True,
+        }, indent=2) + "\n")
+        result = execute(args, run_dir, command, machine)
+        result["image_sha256"] = image_hash
+        result["emulator_sha256"] = hashlib.sha256(emulator.read_bytes()).hexdigest()
+        (run_dir / "result.json").write_text(json.dumps(result, indent=2) + "\n")
+    print(json.dumps({key: result[key] for key in
+                      ("status", "directory", "emulated_ms", "matched")}))
+    if "error" in result:
+        print(result["error"], file=sys.stderr)
+    return 0 if result["status"] in ("pass", "observed") else 1
+
+
 def main():
     args = arguments()
     try:
@@ -626,6 +714,8 @@ def main():
         if not args.prepare_only and shutil.which("Xvfb") is None:
             raise RuntimeError("Xvfb is required")
         roms = rom_directory(args.rompath)
+        if args.vm:
+            return run_existing_vm(args, emulator, image, roms)
         (ROOT / "build").mkdir(exist_ok=True)
         run_dir = ROOT / "build" / (
             f"86box-{args.profile or 'vm'}-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}")
@@ -652,14 +742,6 @@ def main():
                                 "accuracy": getattr(args, "accuracy", False),
                                 "perf": getattr(args, "perf", False)},
                     "host": host_metadata()}
-        if args.vm:
-            manifest["source_vm"] = str(vm_config(args.vm))
-            manifest["source_config_sha256"] = hashlib.sha256(
-                (run_dir / "source.cfg").read_bytes()).hexdigest()
-            manifest["isolation"] = (
-                "Private config/NVRAM, imported CPU/RAM/video/BIOS selectors; "
-                "floppy-only storage, no source disks or host backends. "
-                "Time sync disabled and software renderer selected.")
         (run_dir / "launch.json").write_text(json.dumps(manifest, indent=2) + "\n")
         if args.prepare_only:
             print(json.dumps({"status": "prepared", "directory": str(run_dir)}))
@@ -679,4 +761,8 @@ def main():
 
 
 if __name__ == "__main__":
+    def interrupt(signum, frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, interrupt)
     sys.exit(main())

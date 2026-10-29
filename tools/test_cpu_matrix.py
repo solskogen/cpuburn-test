@@ -105,6 +105,20 @@ class CpuMatrixTests(unittest.TestCase):
         rows = make_matrix([self.cpu(family="future_cpu")], [self.board()])
         self.assertFalse(rows[0]["contract"])
 
+    def test_mediagxm_contract_and_both_engines(self):
+        cpu = self.cpu(family="mediagxm", package="CPU_PKG_GXM",
+                       speed=166666666, multi=5, voltage=2900,
+                       flags="CPU_SUPPORTS_DYNAREC | CPU_REQUIRES_DYNAREC")
+        board = self.board(name="p5gxm", cpu={
+            "package": "CPU_PKG_GXM", "min_bus": "30000000", "max_bus": "33333333",
+            "min_voltage": "2800", "max_voltage": "3000",
+            "min_multi": "5", "max_multi": "8",
+        })
+        rows = make_matrix([cpu], [board])
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(row["contract"] and row["machine"] == "p5gxm" for row in rows))
+        self.assertEqual({row["dynarec"] for row in rows}, {"on", "off"})
+
     def test_config_output_is_safe_and_preserves_identity(self):
         rows = make_matrix([self.cpu()], [self.board()])
         with tempfile.TemporaryDirectory() as directory:

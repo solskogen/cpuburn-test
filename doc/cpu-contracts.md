@@ -133,11 +133,11 @@ Other claims without behavioural witnesses remain visible UNTESTED.
 This is a regression tool with an explicit
 coverage ledger, not a certificate that all supported CPUs are fully accurate.
 
-## Cyrix CPU-system cases and pending GXm integration
+## Cyrix CPU-system cases and GXm integration
 
 `cyrix_cpuid_control` checks CCR4.CPUID off/on, EFLAGS.ID writability,
 disabled CPUID #UD, enabled vendor identification, and CCR3/CCR4 restoration
-on 6x86MX/MII and the prepared GXm contract.
+on 6x86MX/MII and GXm.
 `cyrix_smm_disabled` clears SMAC without changing the SMM address range and
 checks precise #UD EIP and unchanged owned operand bytes for the six descriptor
 save/restore opcodes, RSM and the model's SMINT encoding. MII/6x86MX additionally
@@ -152,17 +152,17 @@ roundtrip, SMM entry/exit, all register/addressing forms or complete CCR/ARR
 coverage. Those remain gaps. SMINT is 0F 7E in the older guide, versus 0F 38
 in the MII and GXm books; the tests must not assume one encoding for all Cyrix.
 
-`mediagx_mmx` is a specification-contract identifier, not a claim that the
-current 86Box inventory contains that selectable family. `mediagx_cpuid`
-prepares assertions for documented CPUID identity/features, TLB/cache descriptors
+`mediagxm` matches the selectable MediaGX MMX family in 86Box.
+`mediagx_cpuid` checks documented CPUID identity/features, TLB/cache descriptors
 and leaf limits, leaving stepping and reserved fields unconstrained.
 Family 5/model 4 is also used by 6x86L; standalone detection cannot uniquely
-identify GXm from that signature. Use an explicit contract when integration
-lands. GXm extended EDX bit 24 is EMMI, not FXSR, and bit 16 denotes FPU
+identify GXm from that signature. Use an explicit contract, supplied by the
+runner's VM configuration or source-bound matrix. GXm extended EDX bit 24
+is EMMI, not FXSR, and bit 16 denotes FPU
 conditional moves, not PAT. The book's zero extended FCMOV flag conflicts with
 its x87 instruction listing; do not infer x87 instruction absence solely from
-that flag. GXm execution remains unverified until a suitable implementation
-is available.
+that flag. The compatible machine is ECS P5GX-M (`p5gxm`); integrated
+graphics/audio/device conformance remains outside this CPU contract.
 
 The CPU-system records participate in ordinary checked benchmarking too.
 Counted units distinguish CPUID control states, disabled-SMM opcode cases
@@ -190,8 +190,8 @@ The manifest records the source revision, exact table hashes, whether those
 tables are modified, and enabled preprocessor definitions. `#if 0` entries
 are excluded. Pass `--define USE_AMD_K5` only when that option matches the
 emulator build; the source revision alone does not establish build options.
-The default inventory at the implementation revision contains 66 families
-and 144 configurations; these counts are not hard-coded expectations.
+The inventory with the MediaGX integration contains 67 families
+and 146 configurations; these counts are not hard-coded expectations.
 Both runtime engines are covered where dynarec exists, including CPUs for
 which the GUI normally forces its dynarec checkbox on.
 Generation requires Python, Git and the GNU C preprocessor (`cpp`).

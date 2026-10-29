@@ -40,9 +40,9 @@ void _start(void) {
     failed |= (cpu_detected_features() & (REQ_FXSR | REQ_PAT)) != 0;
     failed |= !(cpu_detected_features() & REQ_EMMI);
     configured = 1;
-    kmemcpy(configured_model, "mediagx_mmx", sizeof "mediagx_mmx");
+    kmemcpy(configured_model, "mediagxm", sizeof "mediagxm");
     cpu_contract_init();
-    failed |= !equal(cpu_model_name(), "mediagx_mmx");
+    failed |= !equal(cpu_model_name(), "mediagxm");
     failed |= cpu_raw_required(2) != 0x01808131u;
     failed |= (cpu_required_features() & (REQ_FXSR | REQ_PAT | REQ_DE | REQ_PSE)) != 0;
     failed |= (cpu_required_features() & (REQ_MMX | REQ_EMMI | REQ_CMOV)) !=

@@ -37,7 +37,7 @@ u32 cpu_extended_standard_edx(void) {
                : cpu.ext_edx;
 }
 u32 cpu_raw_required(u32 word) {
-    if (word == 2 && expected && equal(expected->name, "mediagx_mmx"))
+    if (word == 2 && expected && equal(expected->name, "mediagxm"))
         return 0x01808131u;
     if (!word && expected && expected->family == 6 &&
         equal(expected->vendor, "GenuineIntel")) return 1u << 14;

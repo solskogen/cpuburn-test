@@ -72,8 +72,8 @@ CPU_MODEL("cx6x86", "CyrixInstead", 5, MODEL_BIT(2), MODEL_DX)
 CPU_MODEL("cx6x86l", "CyrixInstead", 5, MODEL_BIT(4), MODEL_DX | REQ_CX8 | REQ_DE)
 CPU_MODEL("cx6x86mx", "CyrixInstead", 6, MODEL_BIT(0), MODEL_CYRIX | REQ_CPUID | REQ_MMX | REQ_EMMI | REQ_CMOV | REQ_DE | REQ_PGE)
 CPU_MODEL("mii", "CyrixInstead", 6, MODEL_BIT(0), MODEL_CYRIX | REQ_CPUID | REQ_MMX | REQ_EMMI | REQ_CMOV | REQ_DE | REQ_PGE)
-/* GXm Data Book rev. 2.0, tables 9-18/19/23; pending 86Box model integration. */
-CPU_MODEL("mediagx_mmx", "CyrixInstead", 5, MODEL_BIT(4), MODEL_CYRIX | REQ_CPUID | REQ_MMX | REQ_EMMI | REQ_CMOV)
+/* GXm Data Book rev. 2.0, tables 9-18/19/23. */
+CPU_MODEL("mediagxm", "CyrixInstead", 5, MODEL_BIT(4), MODEL_CYRIX | REQ_CPUID | REQ_MMX | REQ_EMMI | REQ_CMOV)
 CPU_MODEL("pentiumpro", "GenuineIntel", 6, MODEL_BIT(1), MODEL_P6)
 CPU_MODEL("pentium2_od", "GenuineIntel", 6, MODEL_BIT(3), MODEL_P6 | REQ_MMX | REQ_SEP)
 CPU_MODEL("pentium2_klamath", "GenuineIntel", 6, MODEL_BIT(3), MODEL_P6 | REQ_MMX | REQ_SEP)

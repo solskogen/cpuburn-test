@@ -16,7 +16,7 @@ baseline/enhanced 3DNow!, and Cyrix EMMI. See README.md for exact workloads,
 feature gates, references and limitations.
 
 CPU-aware execution adds independently sourced minimum contracts for all
-66 active 486+ families and two optional K5 families, guarded discovery,
+67 active 486+ families and two optional K5 families, guarded discovery,
 mandatory feature witnesses and explicit sampled/untested coverage records.
 The source-bound matrix generator selects compatible machines, FPU variants,
 both runtime engines and optionally both FPU backends.
@@ -33,13 +33,26 @@ with explicit size checks; BSS no longer consumes that staging budget.
 The optional 86Box runner accepts `--vm` with a VM directory or a direct
 configuration path, finds `86Box` on PATH by default, and preserves CPU,
 RAM, FPU and engine settings unless explicitly overridden. `--dynarec on|off`
-selects an engine for an isolated run. Config/NVRAM copies are private;
-original disks and host backends are excluded, not cloned. Firmware may
-require acknowledgement of the removed storage. Generated profiles and
+selects an engine for the run. The supplied VM runs in place, without copying
+its configuration, NVRAM or media. Floppy/COM1 settings and explicit overrides
+are temporary; the original config is restored after exit. NVRAM, disks and
+host backends remain live, not rolled back. Logs default to the VM directory;
+`--output-dir` selects another location. Generated profiles and
 matrix configs remain available through explicit `--profile`/`--config`.
 
 ## Known results and limitations
 
+- MediaGX MMX (`mediagxm`) is integrated with the ECS P5GX-M source-bound
+  matrix. Full 306-record host-FPU accuracy runs complete in both engines
+  with identical outcomes: 201 PASS, 73 FAIL, 30 SKIP and 2 FAULT.
+  The CPU identity contract, GXm CPUID, Cyrix CPUID controls, disabled-SMM
+  checks and all fourteen aggregate/individual EMMI records pass.
+  Both focused benchmark runs pass those seventeen workloads plus the
+  identity contract; all seventeen have attributed samples and explicit
+  work units/scopes. These short samples verify wiring, not performance.
+  The two full-suite faults are `fpu_stack` and `fpu_p6`; failures/faults
+  remain findings, not accepted baselines or proof that every oracle is
+  correct. SoftFPU and positive CPU-side SMM execution are not newly validated.
 - The earlier 281-record MMX/dynarec integration image completed with 187 PASS,
   72 FAIL, 22 SKIP and no FAULT. All 271 pre-vendor outcomes were unchanged;
   the ten vendor records skipped correctly. All original 266 outcomes were
