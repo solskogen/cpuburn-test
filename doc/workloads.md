@@ -217,9 +217,9 @@ rearms and checks 1,024 deliveries. Actual periodic count varies with timing.
 
 ## Inventory and reading the tables
 
-This inventory contains **306 registered records** in the default source
+This inventory contains **310 registered records** in the default source
 registries, including `cpu_model_contract` and the core recovery test. It is an
-inventory, not a promise that all 306 execute on a particular machine. `ONLY`
+inventory, not a promise that all 310 execute on a particular machine. `ONLY`
 filters names (the contract is always selected), feature requirements and
 runtime preconditions can skip records, and `burn_mixed` runs only in the final
 round. The tables below name every record; group descriptions apply to every
@@ -274,6 +274,7 @@ coverage unless explicitly qualified.
 | `int_string` | 486 | REP string moves, stores, compares and scans including direction and counts; aggregate element work. |
 | `int_prefix_addr` | 486 | Prefix decoding, address/operand sizes and addressing forms with checked results; aggregate operations. |
 | `int_smc` | 486 | Self-modified immediate/opcode and executing-loop cases at six offsets including page crossings; `ops` is a synthetic mixed instruction/case count. |
+| `int_smc_split_w_chunk`, `int_smc_split_d_chunk`, `int_smc_split_w_page`, `int_smc_split_d_page` | 486 | Misaligned word (`w`) or dword (`d`) stores starting 1-3 bytes before a 64-byte boundary (`chunk`) or a page end (`page`) that change only the opcode and immediate of a snippet starting past it, in pages holding generated code; 1,024 checked patches per offset. Catches dirty tracking that marks only where the store starts. |
 | `int_smc_ram_top` | 486 | Generated-code rewrites near the RAM top; counts 32,768 operations. Probes by writing just above firmware-reported RAM when below the 15 MiB hole, and may execute there if readback succeeds; this is not limited to firmware-reported owned RAM. |
 | `int_cpuid_cr` | 486 | CPUID where present, EFLAGS and control-register state checks; 100 generic operations, not exhaustive register semantics. |
 | `int_alu_burn` | 486 | Repeated integer arithmetic, flags and branch-intensive checks; aggregate counted work, not duration-based. |

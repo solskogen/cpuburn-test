@@ -712,6 +712,54 @@ static u32 int_smc(void) {
     t_ops(6*(2048*3+512+128*64+256*128)); return sum;
 }
 
+static NOINLINE u32 exec_code_eax(u8 *p,u32 a) {
+    u32 r; smc_sync();
+    __asm__ volatile("call *%1" : "=a"(r) : "r"(p), "0"(a) : "ecx","edx","cc","memory");
+    return r;
+}
+/* A misaligned word or dword store that starts just before a 64-byte
+   boundary, or a page's end, and changes only bytes past it: the opcode and
+   immediate of a snippet starting at the boundary, in pages that hold
+   compiled code (so the stores take a recompiler's tracked path). The change
+   must be seen past the boundary, not only in the chunk or page the store
+   starts in, which itself is left as it was. */
+static NOINLINE NOCLONE u32 smc_split(unsigned size,unsigned boundary) {
+    static const u8 ops[6]={0xb8,0x05,0x2d,0x35,0x0d,0x25}; /* MOV ADD SUB XOR OR AND EAX,imm32 */
+    u8 *area=arena_alloc(8192,4096); if(!area) SKIP("arena_smc_split");
+    u8 *p=area+boundary; volatile u8 *writer=p;
+    u32 sum=0,seed=0x5b117000u^(size<<16)^boundary;
+    area[0]=0xc3; /* code in the first page too */
+    for(unsigned off=1;off<size;off++) {
+        u8 *at=p-off;
+        for(unsigned i=0;i<off;i++) at[i]=(u8)(0xa5+i);
+        writer[0]=0xb8; put32(writer+1,0x01020304); writer[5]=0xc3;
+        for(unsigned i=0;i<32;i++) { exec_code(area); CHECK_EQ(exec_code_eax(p,0),0x01020304); }
+        for(unsigned i=0;i<1024;i++) {
+            u32 r=rng(&seed),v=0;
+            for(unsigned b=0;b<off;b++) v|=(u32)at[b]<<(8*b);
+            v|=(u32)ops[r%6]<<(8*off);
+            for(unsigned b=off+1;b<size;b++) v|=((r>>(8*b))&0xffu)<<(8*b);
+            if(size==2) __asm__ volatile("movw %w1,(%0)" ::"r"(at),"r"(v):"memory");
+            else __asm__ volatile("movl %1,(%0)" ::"r"(at),"r"(v):"memory");
+            u32 imm=p[1]|((u32)p[2]<<8)|((u32)p[3]<<16)|((u32)p[4]<<24),a=0x13579bdfu^i,want;
+            switch(p[0]) {
+                case 0xb8: want=imm; break;
+                case 0x05: want=a+imm; break;
+                case 0x2d: want=a-imm; break;
+                case 0x35: want=a^imm; break;
+                case 0x0d: want=a|imm; break;
+                default:   want=a&imm; break;
+            }
+            CHECK_EQ(exec_code_eax(p,a),want); sum=csum_mix(sum,want);
+        }
+    }
+    t_ops((size-1)*(32*2+1024*3)); return sum;
+}
+static u32 int_smc_split_w_chunk(void) { return smc_split(2,1024); }
+static u32 int_smc_split_d_chunk(void) { return smc_split(4,1024); }
+static u32 int_smc_split_w_page(void) { return smc_split(2,4096); }
+static u32 int_smc_split_d_page(void) { return smc_split(4,4096); }
+
 /* A hot loop shares its 4K page with a snippet patched every k calls: the
    dynarec must not slow the loop down for the snippet's sake. */
 static u32 smc_mixed_page(unsigned k,unsigned h) {
@@ -987,6 +1035,10 @@ const test_t tests_int[]={
     {"int_string",int_string,REQ_486},
     {"int_prefix_addr",int_prefix_addr,REQ_486},
     {"int_smc",int_smc,REQ_486},
+    {"int_smc_split_w_chunk",int_smc_split_w_chunk,REQ_486},
+    {"int_smc_split_d_chunk",int_smc_split_d_chunk,REQ_486},
+    {"int_smc_split_w_page",int_smc_split_w_page,REQ_486},
+    {"int_smc_split_d_page",int_smc_split_d_page,REQ_486},
     {"int_smc_mixed_k2_h1",int_smc_mixed_k2_h1,REQ_486},
     {"int_smc_mixed_k2_h16",int_smc_mixed_k2_h16,REQ_486},
     {"int_smc_mixed_k8_h1",int_smc_mixed_k8_h1,REQ_486},
