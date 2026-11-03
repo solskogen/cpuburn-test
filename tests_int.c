@@ -762,7 +762,9 @@ static u32 int_smc_split_d_page(void) { return smc_split(4,4096); }
 
 /* REP STOS rewrites code that has run: the string ops store whole runs at a
    time, and code compiled from the bytes they replace must not run again.
-   Bytes, words and dwords, forwards and backwards, some across a page. */
+   Bytes, words and dwords, forwards and backwards, some across a page. Each
+   body runs 256 times, so a recompiler that compiles it runs it as compiled
+   code. */
 static void rep_fill(u8 *dst,u32 bytes,u32 val,unsigned size,int back) {
     u32 count=bytes/size;
     if(back) dst+=bytes-size;
@@ -781,7 +783,7 @@ static u32 int_smc_rep_stos(void) {
     static const u8 fills[3]={0x40,0x48,0x90}; /* INC EAX, DEC EAX, NOP */
     u8 *area=arena_alloc(8192,4096); if(!area) SKIP("arena_smc_rep_stos");
     u32 sum=0,seed=0x5705c0deu;
-    for(unsigned round=0;round<2048;round++) {
+    for(unsigned round=0;round<256;round++) {
         u32 r=rng(&seed);
         unsigned size=1u<<(r%3),back=(r>>2)&1;
         u32 bytes=(((r>>3)%200)+size)&~(size-1);
@@ -791,10 +793,10 @@ static u32 int_smc_rep_stos(void) {
         int per=v==0x40?1:v==0x48?-1:0;
         p[0]=0x31; p[1]=0xc0; p[2+bytes]=0xc3;
         rep_fill(p+2,bytes,val,size,back);
-        for(unsigned i=0;i<3;i++) CHECK_EQ(exec_code(p),(u32)(per*(int)bytes));
+        for(unsigned i=0;i<256;i++) CHECK_EQ(exec_code(p),(u32)(per*(int)bytes));
         sum=csum_mix(sum,bytes^(v<<16));
     }
-    t_ops(2048*3); return sum;
+    t_ops(256*256); return sum;
 }
 
 /* A hot loop shares its 4K page with a snippet patched every k calls: the
