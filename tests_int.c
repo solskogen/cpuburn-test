@@ -233,8 +233,8 @@ static u32 int_sha1_xdown(void) { return with_xdown_segs(int_sha1); }
 static u32 int_bn_muladd_xdown(void) { return with_xdown_segs(int_bn_muladd); }
 /* A large executable footprint, compiled once and run again and again, as
    Windows 98's first boot runs its drivers and setup code: many distinct
-   short functions (ALU, shifts, LEA, loads and stores over 64 KiB of data
-   and a skipped INC) in a fixed shuffled order, so the host code for them
+   short functions (loads and stores over 64 KiB of data, moves, ALU, LEA,
+   PUSH/POP, a shift, INC and a skipped INC) in a fixed shuffled order, so the host code for them
    all is in use at once. Chained, each ends with a direct JMP to the next,
    as straight-line code reaches the next; called, each is reached by its
    own CALL through a table and returns, as through a dispatch table. */
@@ -251,38 +251,47 @@ enum { CF_FN=64, CF_DATA=16384 };
 /* One function's code from seed, ending with a JMP to next (a RET if next is
    NULL); or, code NULL, its effect on st and data */
 static void cf_gen(u32 seed,u8 *code,const u8 *next,u32 *st,u32 *data) {
-    static const u8 len[10]={5,6,3,2,6,6,7,2,2,5};
+    /* A mix like compiled code's: loads and stores, register moves, ALU,
+       LEA, a byte load, PUSH/POP, a shift, INC and a skipped INC */
+    static const u8 mix[16]={0,0,0,1,1,2,3,4,5,6,7,8,9,10,11,12};
+    static const u8 len[13]={6,6,6,2,5,7,2,2,5,2,7,3,1};
     u32 p=0,a=st?st[0]:0,b=st?st[1]:0,d=st?st[2]:0;
     for(;;) {
         u32 r=rng(&seed),imm=rng(&seed),off=(imm%CF_DATA)*4,k=1+(r>>8)%31;
-        unsigned op=r%10;
+        unsigned op=mix[r%16];
         if(p+len[op]>CF_FN-5) break;
         if(code) {
             u8 *c=code+p;
             switch(op) {
-            case 0: c[0]=0x05; kmemcpy(c+1,&imm,4); break;                          /* add eax,imm */
-            case 1: c[0]=0x81; c[1]=0xf3; kmemcpy(c+2,&imm,4); break;               /* xor ebx,imm */
-            case 2: c[0]=0xc1; c[1]=0xc0; c[2]=k; break;                            /* rol eax,k */
-            case 3: c[0]=0x01; c[1]=0xd8; break;                                    /* add eax,ebx */
-            case 4: c[0]=0x89; c[1]=0x86; kmemcpy(c+2,&off,4); break;               /* mov [esi+off],eax */
-            case 5: c[0]=0x03; c[1]=0x9e; kmemcpy(c+2,&off,4); break;               /* add ebx,[esi+off] */
-            case 6: c[0]=0x8d; c[1]=0x94; c[2]=0x58; kmemcpy(c+3,&imm,4); break;    /* lea edx,[eax+ebx*2+imm] */
-            case 7: c[0]=0x29; c[1]=0xc2; break;                                    /* sub edx,eax */
-            case 8: c[0]=0x31; c[1]=0xd0; break;                                    /* xor eax,edx */
-            case 9: c[0]=0xa8; c[1]=0x01; c[2]=0x74; c[3]=0x01; c[4]=0x43; break;   /* test al,1; jz; inc ebx */
+            case 0: c[0]=0x8b; c[1]=0x86; kmemcpy(c+2,&off,4); break;               /* mov eax,[esi+off] */
+            case 1: c[0]=0x89; c[1]=0x86; kmemcpy(c+2,&off,4); break;               /* mov [esi+off],eax */
+            case 2: c[0]=0x03; c[1]=0x9e; kmemcpy(c+2,&off,4); break;               /* add ebx,[esi+off] */
+            case 3: c[0]=0x89; c[1]=0xda; break;                                    /* mov edx,ebx */
+            case 4: c[0]=0x05; kmemcpy(c+1,&imm,4); break;                          /* add eax,imm */
+            case 5: c[0]=0x8d; c[1]=0x94; c[2]=0x58; kmemcpy(c+3,&imm,4); break;    /* lea edx,[eax+ebx*2+imm] */
+            case 6: c[0]=0x29; c[1]=0xc2; break;                                    /* sub edx,eax */
+            case 7: c[0]=0x31; c[1]=0xd0; break;                                    /* xor eax,edx */
+            case 8: c[0]=0xa8; c[1]=0x01; c[2]=0x74; c[3]=0x01; c[4]=0x43; break;   /* test al,1; jz; inc ebx */
+            case 9: c[0]=0x50; c[1]=0x5b; break;                                    /* push eax; pop ebx */
+            case 10: c[0]=0x0f; c[1]=0xb6; c[2]=0x9e; kmemcpy(c+3,&off,4); break;   /* movzx ebx,byte [esi+off] */
+            case 11: c[0]=0xc1; c[1]=0xe0; c[2]=k; break;                           /* shl eax,k */
+            case 12: c[0]=0x40; break;                                              /* inc eax */
             }
         } else {
             switch(op) {
-            case 0: a+=imm; break;
-            case 1: b^=imm; break;
-            case 2: a=(a<<k)|(a>>(32-k)); break;
-            case 3: a+=b; break;
-            case 4: data[off/4]=a; break;
-            case 5: b+=data[off/4]; break;
-            case 6: d=a+b*2+imm; break;
-            case 7: d-=a; break;
-            case 8: a^=d; break;
-            case 9: if(a&1) b++; break;
+            case 0: a=data[off/4]; break;
+            case 1: data[off/4]=a; break;
+            case 2: b+=data[off/4]; break;
+            case 3: d=b; break;
+            case 4: a+=imm; break;
+            case 5: d=a+b*2+imm; break;
+            case 6: d-=a; break;
+            case 7: a^=d; break;
+            case 8: if(a&1) b++; break;
+            case 9: b=a; break;
+            case 10: b=data[off/4]&0xff; break;
+            case 11: a<<=k; break;
+            case 12: a++; break;
             }
         }
         p+=len[op];

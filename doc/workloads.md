@@ -270,7 +270,7 @@ coverage unless explicitly qualified.
 | `int_bn_muladd` | 486 | Bignum multiply-accumulate and multiply-subtract rows (MUL, ADD, ADC $0, four words a pass) as RSA signature checks run them; 512 1024-bit products against a 64-bit reference. |
 | `int_sha1_xdown` | 486 | `int_sha1` with DS, ES and SS expand-down from 4 KiB, base 0, big, as Windows 98 gives a Win32 program: every access has a lower bound. |
 | `int_bn_muladd_xdown` | 486 | `int_bn_muladd` with the same expand-down DS, ES and SS. |
-| `int_code_footprint_128k` | 486 | 2,048 distinct 64-byte functions (ALU, shifts, LEA, loads and stores over 64 KiB, a skipped INC) chained by direct JMPs in a shuffled order, run 256 times; the first pass against a model. A large compiled working set, as Windows 98's first boot. |
+| `int_code_footprint_128k` | 486 | 2,048 distinct 64-byte functions (loads and stores over 64 KiB, moves, ALU, LEA, MOVZX, PUSH/POP, SHL, INC and a skipped INC) chained by direct JMPs in a shuffled order, run 256 times; the first pass against a model. A large compiled working set, as Windows 98's first boot. |
 | `int_code_footprint_512k` | 486 | The same with 8,192 functions, run 64 times: 512 KiB of guest code, whose blocks share hash slots 128 KiB apart in physical memory. |
 | `int_code_footprint_calls` | 486 | 2,048 such functions each reached by its own CALL through a table and returning, as through a dispatch table; 256 passes. |
 | `int_flags_exhaustive` | 486 | Exhausts all 256×256 byte operand pairs for ADD/ADC/SUB/SBB/CMP flag forms; other widths/operations are samples. Reports a synthetic 500,000 operations, not the exact number of cases. |
