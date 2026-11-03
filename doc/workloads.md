@@ -217,9 +217,9 @@ rearms and checks 1,024 deliveries. Actual periodic count varies with timing.
 
 ## Inventory and reading the tables
 
-This inventory contains **311 registered records** in the default source
+This inventory contains **316 registered records** in the default source
 registries, including `cpu_model_contract` and the core recovery test. It is an
-inventory, not a promise that all 311 execute on a particular machine. `ONLY`
+inventory, not a promise that all 316 execute on a particular machine. `ONLY`
 filters names (the contract is always selected), feature requirements and
 runtime preconditions can skip records, and `burn_mixed` runs only in the final
 round. The tables below name every record; group descriptions apply to every
@@ -276,6 +276,8 @@ coverage unless explicitly qualified.
 | `int_smc` | 486 | Self-modified immediate/opcode and executing-loop cases at six offsets including page crossings; `ops` is a synthetic mixed instruction/case count. |
 | `int_smc_split_w_chunk`, `int_smc_split_d_chunk`, `int_smc_split_w_page`, `int_smc_split_d_page` | 486 | Misaligned word (`w`) or dword (`d`) stores starting 1-3 bytes before a 64-byte boundary (`chunk`) or a page end (`page`) that change only the opcode and immediate of a snippet starting past it, in pages holding generated code; 1,024 checked patches per offset. Catches dirty tracking that marks only where the store starts. |
 | `int_smc_rep_stos` | 486 | REP STOSB, STOSW and STOSD, forwards and backwards, rewrite the INC, DEC or NOP body of a snippet that has already run, some of them across a page end; 2,048 rewrites, each run three times. Catches string stores that fill code pages without marking every byte they replace. |
+| `int_smc_alu_family_exit` | 486 | Patches flip a snippet's opcodes between ADD, OR, AND, SUB and XOR EAX,imm32, each version run 32 times; every eighth puts ADC, SBB or CMP in, and the next puts the family back. Catches a recompiler that reads such opcodes as it runs and does not leave the code when one is no longer of the family. |
+| `int_smc_alu_ops_k1_n8`, `int_smc_alu_ops_k4_n16`, `int_smc_alu_ops_k16_n8`, `int_smc_alu_ops_k16_n32` | 486 | As `int_smc_rate_op`, picking from ADD, OR, AND, SUB, XOR, ADC, SBB and CMP EAX,imm32 (never in the first slot, where ADC and SBB would take the caller's carry); `k` calls per patch, `n` instructions. |
 | `int_smc_ram_top` | 486 | Generated-code rewrites near the RAM top; counts 32,768 operations. Probes by writing just above firmware-reported RAM when below the 15 MiB hole, and may execute there if readback succeeds; this is not limited to firmware-reported owned RAM. |
 | `int_cpuid_cr` | 486 | CPUID where present, EFLAGS and control-register state checks; 100 generic operations, not exhaustive register semantics. |
 | `int_alu_burn` | 486 | Repeated integer arithmetic, flags and branch-intensive checks; aggregate counted work, not duration-based. |

@@ -4,7 +4,7 @@ First public-release candidate of the bare-metal i486-and-newer CPU/FPU
 correctness and benchmark-data suite for 86Box. This is a preview, not an
 exhaustive x86 conformance certification.
 
-The default image selects 311 workload records: one round, scale 8,
+The default image selects 316 workload records: one round, scale 8,
 TEST_SECONDS=5 and BURN_SECONDS=10. Optional features produce explicit SKIP
 records. The suite preserves failures during warm-up and measured execution,
 reports coarse guest runtime and first-failure context, and leaves comparison

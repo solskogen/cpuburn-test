@@ -860,6 +860,83 @@ static NOINLINE NOCLONE u32 smc_rate_op(unsigned k,unsigned n) {
     }
     t_ops(((calls+k-1)/k)*k*(n+2)); return sum;
 }
+/* As smc_rate_op, but each patch picks from ADD, OR, AND, SUB, XOR, ADC, SBB and
+   CMP EAX,imm32: the same length and form, the last three outside the set a
+   recompiler may treat as one, ADC and SBB taking the carry the instruction
+   before left. */
+static NOINLINE NOCLONE u32 smc_alu_ops(unsigned k,unsigned n) {
+    static const u8 ops[8]={0x05,0x0d,0x25,0x2d,0x35,0x15,0x1d,0x3d};
+    u8 *snip=arena_alloc(4096,4096); if(!snip) SKIP("arena_smc_alu_ops");
+    snip[0]=0xb8;
+    for(unsigned i=0;i<n;i++) { snip[5+5*i]=0x05; put32(snip+6+5*i,0x89abcdefu*(i+1)); }
+    snip[5+5*n]=0xc3;
+    u32 sum=0,seed=0xa1d0f000u^(k<<8)^n;
+    const unsigned calls=8192;
+    for(unsigned c=0;c<calls;c+=k) {
+        /* Not the first: ADC and SBB there would take the caller's carry */
+        u32 a=rng(&seed),r=rng(&seed); put32(snip+1,a); snip[5+5*(1+(r>>8)%(n-1))]=ops[(r>>4)%8];
+        u32 want=a,cf=0;
+        for(unsigned i=0;i<n;i++) {
+            u8 o=snip[5+5*i]; u32 imm=0x89abcdefu*(i+1),res;
+            switch(o) {
+                case 0x05: res=want+imm; cf=res<want; want=res; break;
+                case 0x0d: want|=imm; cf=0; break;
+                case 0x25: want&=imm; cf=0; break;
+                case 0x2d: cf=want<imm; want-=imm; break;
+                case 0x35: want^=imm; cf=0; break;
+                case 0x15: { u64 t=(u64)want+imm+cf; cf=(u32)(t>>32); want=(u32)t; } break;
+                case 0x1d: { u64 t=(u64)want-imm-cf; cf=(u32)((t>>32)&1); want=(u32)t; } break;
+                default:   cf=want<imm; break; /* CMP */
+            }
+        }
+        for(unsigned i=0;i<k;i++) CHECK_EQ(exec_code(snip),want);
+        sum=csum_mix(sum,want);
+    }
+    t_ops(((calls+k-1)/k)*k*(n+2)); return sum;
+}
+/* Patches flip opcodes between ADD, OR, AND, SUB and XOR EAX,imm32, which a
+   recompiler may compile to read the opcode as it runs; every eighth puts
+   ADC, SBB or CMP in instead, which such code must not run as one of those,
+   and the next one puts the family back. Each version runs 32 times. */
+static u32 int_smc_alu_family_exit(void) {
+    static const u8 fam[5]={0x05,0x0d,0x25,0x2d,0x35},other[3]={0x15,0x1d,0x3d};
+    const unsigned n=8,k=32;
+    u8 *snip=arena_alloc(4096,4096); if(!snip) SKIP("arena_smc_alu_family");
+    snip[0]=0xb8;
+    for(unsigned i=0;i<n;i++) { snip[5+5*i]=0x05; put32(snip+6+5*i,0x89abcdefu*(i+1)); }
+    snip[5+5*n]=0xc3;
+    u32 sum=0,seed=0xfa417e00u;
+    for(unsigned round=0;round<2048;round++) {
+        u32 a=rng(&seed),r=rng(&seed);
+        /* Not the first: ADC and SBB there would take the caller's carry */
+        unsigned at=5+5*(1+(r>>8)%(n-1));
+        put32(snip+1,a);
+        snip[at]=((round&7)==7) ? other[(r>>4)%3] : fam[(r>>4)%5];
+        u32 want=a,cf=0;
+        for(unsigned i=0;i<n;i++) {
+            u8 o=snip[5+5*i]; u32 imm=0x89abcdefu*(i+1),res;
+            switch(o) {
+                case 0x05: res=want+imm; cf=res<want; want=res; break;
+                case 0x0d: want|=imm; cf=0; break;
+                case 0x25: want&=imm; cf=0; break;
+                case 0x2d: cf=want<imm; want-=imm; break;
+                case 0x35: want^=imm; cf=0; break;
+                case 0x15: { u64 t=(u64)want+imm+cf; cf=(u32)(t>>32); want=(u32)t; } break;
+                case 0x1d: { u64 t=(u64)want-imm-cf; cf=(u32)((t>>32)&1); want=(u32)t; } break;
+                default:   cf=want<imm; break;
+            }
+        }
+        for(unsigned i=0;i<k;i++) CHECK_EQ(exec_code(snip),want);
+        /* Back to the family, so the next rounds run compiled again */
+        if((round&7)==7) snip[at]=fam[r%5];
+        sum=csum_mix(sum,want);
+    }
+    t_ops(2048*k*(n+2)); return sum;
+}
+static u32 int_smc_alu_ops_k1_n8(void) { return smc_alu_ops(1,8); }
+static u32 int_smc_alu_ops_k4_n16(void) { return smc_alu_ops(4,16); }
+static u32 int_smc_alu_ops_k16_n8(void) { return smc_alu_ops(16,8); }
+static u32 int_smc_alu_ops_k16_n32(void) { return smc_alu_ops(16,32); }
 static u32 int_smc_rate_k1_n16(void) { return smc_rate(1,16); }
 static u32 int_smc_rate_k2_n16(void) { return smc_rate(2,16); }
 static u32 int_smc_rate_k4_n16(void) { return smc_rate(4,16); }
@@ -1077,6 +1154,11 @@ const test_t tests_int[]={
     {"int_smc_split_w_page",int_smc_split_w_page,REQ_486},
     {"int_smc_split_d_page",int_smc_split_d_page,REQ_486},
     {"int_smc_rep_stos",int_smc_rep_stos,REQ_486},
+    {"int_smc_alu_family_exit",int_smc_alu_family_exit,REQ_486},
+    {"int_smc_alu_ops_k1_n8",int_smc_alu_ops_k1_n8,REQ_486},
+    {"int_smc_alu_ops_k4_n16",int_smc_alu_ops_k4_n16,REQ_486},
+    {"int_smc_alu_ops_k16_n8",int_smc_alu_ops_k16_n8,REQ_486},
+    {"int_smc_alu_ops_k16_n32",int_smc_alu_ops_k16_n32,REQ_486},
     {"int_smc_mixed_k2_h1",int_smc_mixed_k2_h1,REQ_486},
     {"int_smc_mixed_k2_h16",int_smc_mixed_k2_h16,REQ_486},
     {"int_smc_mixed_k8_h1",int_smc_mixed_k8_h1,REQ_486},
