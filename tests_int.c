@@ -760,6 +760,43 @@ static u32 int_smc_split_d_chunk(void) { return smc_split(4,1024); }
 static u32 int_smc_split_w_page(void) { return smc_split(2,4096); }
 static u32 int_smc_split_d_page(void) { return smc_split(4,4096); }
 
+/* REP STOS rewrites code that has run: the string ops store whole runs at a
+   time, and code compiled from the bytes they replace must not run again.
+   Bytes, words and dwords, forwards and backwards, some across a page. */
+static void rep_fill(u8 *dst,u32 bytes,u32 val,unsigned size,int back) {
+    u32 count=bytes/size;
+    if(back) dst+=bytes-size;
+    if(size==1) {
+        if(back) __asm__ volatile("std; rep stosb; cld" : "+D"(dst),"+c"(count) : "a"(val) : "memory","cc");
+        else __asm__ volatile("rep stosb" : "+D"(dst),"+c"(count) : "a"(val) : "memory");
+    } else if(size==2) {
+        if(back) __asm__ volatile("std; rep stosw; cld" : "+D"(dst),"+c"(count) : "a"(val) : "memory","cc");
+        else __asm__ volatile("rep stosw" : "+D"(dst),"+c"(count) : "a"(val) : "memory");
+    } else {
+        if(back) __asm__ volatile("std; rep stosl; cld" : "+D"(dst),"+c"(count) : "a"(val) : "memory","cc");
+        else __asm__ volatile("rep stosl" : "+D"(dst),"+c"(count) : "a"(val) : "memory");
+    }
+}
+static u32 int_smc_rep_stos(void) {
+    static const u8 fills[3]={0x40,0x48,0x90}; /* INC EAX, DEC EAX, NOP */
+    u8 *area=arena_alloc(8192,4096); if(!area) SKIP("arena_smc_rep_stos");
+    u32 sum=0,seed=0x5705c0deu;
+    for(unsigned round=0;round<2048;round++) {
+        u32 r=rng(&seed);
+        unsigned size=1u<<(r%3),back=(r>>2)&1;
+        u32 bytes=(((r>>3)%200)+size)&~(size-1);
+        u8 *p=area+(((r>>12)&1) ? 4096-2-(bytes/2) : ((r>>13)&63));
+        u8 v=fills[(r>>20)%3];
+        u32 val=v*0x01010101u;
+        int per=v==0x40?1:v==0x48?-1:0;
+        p[0]=0x31; p[1]=0xc0; p[2+bytes]=0xc3;
+        rep_fill(p+2,bytes,val,size,back);
+        for(unsigned i=0;i<3;i++) CHECK_EQ(exec_code(p),(u32)(per*(int)bytes));
+        sum=csum_mix(sum,bytes^(v<<16));
+    }
+    t_ops(2048*3); return sum;
+}
+
 /* A hot loop shares its 4K page with a snippet patched every k calls: the
    dynarec must not slow the loop down for the snippet's sake. */
 static u32 smc_mixed_page(unsigned k,unsigned h) {
@@ -1039,6 +1076,7 @@ const test_t tests_int[]={
     {"int_smc_split_d_chunk",int_smc_split_d_chunk,REQ_486},
     {"int_smc_split_w_page",int_smc_split_w_page,REQ_486},
     {"int_smc_split_d_page",int_smc_split_d_page,REQ_486},
+    {"int_smc_rep_stos",int_smc_rep_stos,REQ_486},
     {"int_smc_mixed_k2_h1",int_smc_mixed_k2_h1,REQ_486},
     {"int_smc_mixed_k2_h16",int_smc_mixed_k2_h16,REQ_486},
     {"int_smc_mixed_k8_h1",int_smc_mixed_k8_h1,REQ_486},
