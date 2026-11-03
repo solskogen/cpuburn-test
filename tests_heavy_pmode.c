@@ -125,6 +125,77 @@ static void hp_16_body(void) {
     }
 }
 
+/*
+ * Windows 98's 16-bit decompressor, as it runs while it boots: a byte copy
+ * through two far pointers kept in memory, each byte loading them with LES
+ * and putting ES back from memory, and stepping them as huge pointers
+ * (ADD 1, SBB, AND 8 into the selector). Data at DS:0 (selector 0x50):
+ * source and destination far pointers, the ES to put back, the count.
+ */
+extern const u8 hp_huge16_begin[], hp_huge16_end[];
+__asm__(
+    ".text\n"
+    ".global hp_huge16_begin,hp_huge16_end\n"
+    "hp_huge16_begin:\n"
+    ".code16\n"
+    "movw $0x48,%ax\n movw %ax,%ss\n movl $0xfff0,%esp\n"
+    "movw $0x50,%ax\n movw %ax,%ds\n movw %ax,%es\n"
+    "movw 12,%cx\n"
+    "1: lesw 0,%bx\n movb %es:(%bx),%al\n movw 8,%es\n"
+    "lesw 4,%bx\n movb %al,%es:(%bx)\n movw 8,%es\n"
+    "lesw 0,%bx\n movw 8,%es\n"
+    "addw $1,0\n sbbw %dx,%dx\n andw $8,%dx\n addw %dx,2\n"
+    "addw $1,4\n sbbw %dx,%dx\n andw $8,%dx\n addw %dx,6\n"
+    "loop 1b\n"
+    "movw $0x10,%ax\n movw %ax,%ds\n movw %ax,%es\n movw %ax,%ss\n"
+    "movl %edi,%esp\n xorl %eax,%eax\n lretl\n"
+    ".code32\n"
+    "hp_huge16_end:\n");
+
+static u8 *hp_huge_buf;
+
+static void hp_huge_body(void) {
+    u32 bytes = (u32)(hp_huge16_end - hp_huge16_begin);
+    u8 *src = hp_huge_buf, *dst = hp_huge_buf + 8192;
+    volatile u16 *v = (volatile u16 *)(hp_mem + 256);
+    kmemcpy(hp_mem, hp_huge16_begin, bytes);
+    gdt_set(8, (u32)hp_mem, bytes - 1, 0x9b, 0);
+    gdt_set(9, 0, 0xffff, 0x93, 0);
+    gdt_set(10, (u32)hp_mem + 256, 255, 0x93, 0);
+    gdt_set(11, (u32)src, 8191, 0x93, 0);
+    gdt_set(12, (u32)dst, 8191, 0x93, 0);
+    for (hp_case = 0; hp_case < 32u * HEAVY_SCALE; hp_case++) {
+        u32 n = 1024 + (hp_rand() & 3071), so = hp_rand() & 4095, dof = hp_rand() & 4095;
+        for (u32 i = 0; i < n; i++) src[so + i] = (u8)hp_rand();
+        v[0] = (u16)so; v[1] = 0x58; v[2] = (u16)dof; v[3] = 0x60; v[4] = 0x50; v[6] = (u16)n;
+        u32 flags = rd_eflags();
+        cli();
+        hp_enter16();
+        wr_eflags(flags);
+        if (kmemcmp(dst + dof, src + so, n) || v[0] != (u16)(so + n) || v[2] != (u16)(dof + n)) {
+            t_note("seed=%08x case=%u n=%u", TEST_SEED, hp_case, n);
+            CHECK(0);
+            break;
+        }
+        hp_sum = csum_mix(hp_sum, dst[dof] ^ n);
+        t_ops(n * 19);
+    }
+}
+
+static u32 hp_huge_copy(void) {
+    hp_mem = arena_alloc(512, 16);
+    hp_huge_buf = arena_alloc(16384, 16);
+    void *low_save = arena_alloc(32768, 16);
+    CHECK(hp_mem && hp_huge_buf && low_save);
+    if (!hp_mem || !hp_huge_buf || !low_save) return 0;
+    kmemcpy(low_save, (void *)0x8000, 32768);
+    hp_sum = 0;
+    hp_run(hp_huge_body);
+    kmemcpy((void *)0x8000, low_save, 32768);
+    t_note("rounds=%u seg_loads_per_byte=6 address_bits=16", hp_case);
+    return hp_sum;
+}
+
 static u32 hp_16bit(void) {
     hp_mem = arena_alloc(512, 16);
     void *low_save = arena_alloc(32768, 16);
@@ -798,6 +869,7 @@ static u32 hp_context(void) {
 const test_t tests_heavy_pmode[] = {
     { "heavy_pm_code_context", hp_context, REQ_486 },
     { "heavy_pm_16bit", hp_16bit, REQ_486 },
+    { "heavy_pm_huge_copy16", hp_huge_copy, REQ_486 },
     { "heavy_pm_ldt", hp_ldt_test, REQ_486 },
     { "heavy_pm_expand_down", hp_expand, REQ_486 },
     { "heavy_pm_call_gates", hp_callgates, REQ_486 },

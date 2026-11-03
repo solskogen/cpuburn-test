@@ -217,9 +217,9 @@ rearms and checks 1,024 deliveries. Actual periodic count varies with timing.
 
 ## Inventory and reading the tables
 
-This inventory contains **316 registered records** in the default source
+This inventory contains **327 registered records** in the default source
 registries, including `cpu_model_contract` and the core recovery test. It is an
-inventory, not a promise that all 316 execute on a particular machine. `ONLY`
+inventory, not a promise that all 327 execute on a particular machine. `ONLY`
 filters names (the contract is always selected), feature requirements and
 runtime preconditions can skip records, and `burn_mixed` runs only in the final
 round. The tables below name every record; group descriptions apply to every
@@ -264,6 +264,15 @@ coverage unless explicitly qualified.
 | `int_partial_boundaries` | 486 | 8,192 partial AL/AH/AX writes and preserved-register checks across control flow. |
 | `int_divide_state` | 486 | 3,072 #DE cases for zero divisor and quotient overflow, checking fault EIP and registers, not undefined flags. |
 | `int_alu` | 486 | Deterministic 8/16/32-bit ALU results, conversions and carry chains against references; `ops` is an aggregate count. Separate records check flags. |
+| `int_adc_shift_loop` | 486 | DX:AX and EDX:EAX shifted left 1-15 bits at a time by ADD/ADC loops, as Windows 98's 16-bit bit-stream reader does; 8,192 rounds of 32 shifts against a 64-bit reference. |
+| `int_far_ptr_copy` | 486 | Byte copies through far pointers: per byte LES of both pointers and ES reloaded from memory, six segment loads a byte, as Windows 98's 16-bit decompressor; 256 copies of 1-4 KiB checked. |
+| `int_sha1` | 486 | SHA-1 with Windows 98's own message-schedule loops (byte swap, expansion two words a pass); the "abc" digest and a 256 KiB buffer against a C schedule. |
+| `int_bn_muladd` | 486 | Bignum multiply-accumulate and multiply-subtract rows (MUL, ADD, ADC $0, four words a pass) as RSA signature checks run them; 512 1024-bit products against a 64-bit reference. |
+| `int_sha1_xdown` | 486 | `int_sha1` with DS, ES and SS expand-down from 4 KiB, base 0, big, as Windows 98 gives a Win32 program: every access has a lower bound. |
+| `int_bn_muladd_xdown` | 486 | `int_bn_muladd` with the same expand-down DS, ES and SS. |
+| `int_code_footprint_128k` | 486 | 2,048 distinct 64-byte functions (ALU, shifts, LEA, loads and stores over 64 KiB, a skipped INC) chained by direct JMPs in a shuffled order, run 256 times; the first pass against a model. A large compiled working set, as Windows 98's first boot. |
+| `int_code_footprint_512k` | 486 | The same with 8,192 functions, run 64 times: 512 KiB of guest code, whose blocks share hash slots 128 KiB apart in physical memory. |
+| `int_code_footprint_calls` | 486 | 2,048 such functions each reached by its own CALL through a table and returning, as through a dispatch table; 256 passes. |
 | `int_flags_exhaustive` | 486 | Exhausts all 256×256 byte operand pairs for ADD/ADC/SUB/SBB/CMP flag forms; other widths/operations are samples. Reports a synthetic 500,000 operations, not the exact number of cases. |
 | `int_muldiv` | 486 | 8,192 seeded multiply/divide vectors across byte/word/dword forms and three division faults; reports 188,416 operations. |
 | `int_shift_rot` | 486 | Shift/rotate results and defined flags over widths, counts and sampled values; counted instruction-form work, not exhaustive operands. |
@@ -447,6 +456,7 @@ arena memory and restore temporary descriptor/interrupt state.
 | `pm_debug_regs` | 486 | Debug-register, single-step and breakpoint traps; counted delivered traps. |
 | `heavy_pm_code_context` | 486 | 32,768 far calls alternating descriptor default operand size at identical code location. |
 | `heavy_pm_16bit` | 486 | 16-bit code/stack/address-size operations and near/far calls; aggregate instruction/transition count. |
+| `heavy_pm_huge_copy16` | 486 | Windows 98's 16-bit decompressor copy in 16-bit code: per byte LES of two far pointers kept in memory, ES put back from memory, and both stepped as huge pointers (ADD 1, SBB, AND 8 into the selector); checked against a reference. |
 | `heavy_pm_ldt` | 486 | LDT/TI descriptors, segment use, limits and selected faults; aggregate operations. |
 | `heavy_pm_expand_down` | 486 | Expand-down segment and stack boundaries, legal accesses and faults. |
 | `heavy_pm_call_gates` | 486 | Ring-3 call gates, parameter copying and RETF; 16,384 transitions at default scale, `ops` also counts parameter/return work. |
@@ -498,6 +508,7 @@ fault-time registers.
 | `pg_apic_mmio` | PAGING + APIC + MSR | Read-only LAPIC MMIO through paging; disabled, relocated, x2APIC or unreadable configurations skip. |
 | `heavy_pg_smc_alias` | PAGING + 486 | Generated code modified through physical aliases and remapped execution pages; counted guest instructions. |
 | `heavy_pg_block_links` | PAGING + 486 | Direct/indirect linked generated blocks and expected results; counts executed blocks. |
+| `heavy_pg_ring3_pages` | PAGING + 486 | Ring-3 code reads 32 pages, enters ring 0 by INT and returns, 4,096 times a round for 8 rounds: every return to ring 3 after translations made at ring 0. |
 | `heavy_pg_split_fetch` | PAGING + 486 | Cross-page instruction fetch faults and restart state; counts fault cases. |
 | `heavy_pg_split_data` | PAGING + 486 | Cross-page data faults and restart state; counts fault cases. |
 | `heavy_pg_rep_restart` | PAGING + 486 | Partially completed forward/backward REP MOVSD and preserved state; counts MOVSD elements. |

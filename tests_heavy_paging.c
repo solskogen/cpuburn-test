@@ -412,9 +412,54 @@ static void hp_stack_body(void) {
 }
 static u32 hp_stack_test(void) { return hp_run(hp_stack_body); }
 
+/*
+ * Ring-3 code that reads a word from each of 32 pages, then makes a round
+ * trip through ring 0 (an INT that only IRETs) and goes on: as Windows 98's
+ * Win16 code does while it boots, entering the VMM thousands of times a
+ * second. A TLB kept across the round trip saves the 32 page walks.
+ */
+static volatile u32 hp_r3p_base, hp_r3p_loops, hp_r3p_sum;
+extern void hp_r3p_user(void), hp_r3p_isr(void);
+__asm__(
+    ".text\n"
+    ".global hp_r3p_user,hp_r3p_isr\n"
+    "hp_r3p_isr:\n iretl\n"
+    "hp_r3p_user:\n"
+    "movl hp_r3p_loops,%ecx\n xorl %eax,%eax\n"
+    "1: movl hp_r3p_base,%esi\n movl $32,%edx\n"
+    "2: addl (%esi),%eax\n roll $1,%eax\n addl $4096,%esi\n decl %edx\n jnz 2b\n"
+    "int $0x81\n"
+    "decl %ecx\n jnz 1b\n"
+    "movl %eax,hp_r3p_sum\n"
+    "int $0x80\n");
+
+static u32 hp_r3_pages(void) {
+    u32 *buf = arena_alloc(33 * 4096, 4096);
+    void *stack = arena_alloc(8192, 16);
+    if (!buf || !stack) SKIP("arena_r3_pages");
+    u32 seed = 0x3a6e5000u, want = 0, sum = 0;
+    for (u32 p = 0; p < 32; p++) buf[p * 1024] = hp_rng(&seed);
+    idt_set_gate(0x81, hp_r3p_isr, SEL_KCODE, 0xEE);
+    const u32 loops = 4096;
+    for (u32 i = 0; i < loops; i++)
+        for (u32 p = 0; p < 32; p++) { want += buf[p * 1024]; want = (want << 1) | (want >> 31); }
+    for (u32 round = 0; round < 8; round++) {
+        hp_r3p_base = (u32)buf; hp_r3p_loops = loops; hp_r3p_sum = 0;
+        int rc = ring3_call(hp_r3p_user, (u32)stack + 8192);
+        CHECK_EQ(rc, GUARD_R3_INT80);
+        CHECK_EQ(hp_r3p_sum, want);
+        sum = csum_mix(sum, hp_r3p_sum);
+        if (rc != GUARD_R3_INT80) break;
+    }
+    idt_set_gate(0x81, isr_stub[0x81], SEL_KCODE, 0x8E);
+    t_ops(8 * loops * (32 * 5 + 4));
+    return sum;
+}
+
 const test_t tests_heavy_paging[] = {
     { "heavy_pg_smc_alias", hp_smc, REQ_PAGING | REQ_486 },
     { "heavy_pg_block_links", hp_blocks, REQ_PAGING | REQ_486 },
+    { "heavy_pg_ring3_pages", hp_r3_pages, REQ_PAGING | REQ_486 },
     { "heavy_pg_split_fetch", hp_fetch, REQ_PAGING | REQ_486 },
     { "heavy_pg_split_data", hp_split, REQ_PAGING | REQ_486 },
     { "heavy_pg_rep_restart", hp_rep, REQ_PAGING | REQ_486 },

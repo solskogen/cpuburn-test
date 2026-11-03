@@ -61,6 +61,264 @@ static u32 alu_ref(unsigned op,u32 a,u32 b,u32 cin,unsigned w,u32 *flags) {
 static u32 run_alu(unsigned w,unsigned op,u32 a,u32 b,u32 c,u32 *f) {
     return w==8?alu8(op,a,b,c,f):w==16?alu16(op,a,b,c,f):alu32(op,a,b,c,f);
 }
+/* A bit-stream reader's shift, as Windows 98's 16-bit code does it as it
+   boots: DX:AX (or EDX:EAX) shifted left by CL one bit at a time with ADD
+   and ADC, each ADC taking the carry the ADD before it left. */
+static u32 int_adc_shift_loop(void) {
+    u32 sum=0,seed=0xadc5f17u;
+    const unsigned rounds=1u<<13;
+    for(unsigned i=0;i<rounds;i++) {
+        u32 a=rng(&seed),d=rng(&seed),r=rng(&seed),ra=a,rd=d;
+        /* 32 shifts of 1-15 bits each, as a reader pulls codes off the stream */
+        if(r&0x100) {
+            u64 v=((u64)d<<32)|a;
+            for(unsigned k=0;k<32;k++) {
+                u32 c=1+((r>>(k&15))%15),n=c;
+                __asm__ volatile("orb %%cl,%%cl; jz 2f; 1: addl %%eax,%%eax; adcl %%edx,%%edx; decb %%cl; jnz 1b; 2:"
+                                 : "+a"(ra),"+d"(rd),"+c"(n) :: "cc");
+                v<<=c;
+            }
+            CHECK_EQ(ra,(u32)v); CHECK_EQ(rd,(u32)(v>>32));
+        } else {
+            u32 v=((d&0xffff)<<16)|(a&0xffff);
+            for(unsigned k=0;k<32;k++) {
+                u32 c=1+((r>>(k&15))%15),n=c;
+                __asm__ volatile("orb %%cl,%%cl; jz 2f; 1: addw %%ax,%%ax; adcw %%dx,%%dx; decb %%cl; jnz 1b; 2:"
+                                 : "+a"(ra),"+d"(rd),"+c"(n) :: "cc");
+                v<<=c;
+            }
+            CHECK_EQ(ra,(a&0xffff0000u)|(v&0xffff)); CHECK_EQ(rd,(d&0xffff0000u)|(v>>16));
+        }
+        sum=csum_mix(sum,ra^rd);
+    }
+    t_ops(rounds*32*8*4); return sum;
+}
+/* A copy through far pointers, as Windows 98's 16-bit decompressor does it
+   as it boots: each byte loads both pointers with LES and puts ES back from
+   memory, six segment register loads a byte, and steps the offsets. */
+static u32 int_far_ptr_copy(void) {
+    u8 *src=arena_alloc(8192,16),*dst=arena_alloc(8192,16);
+    if(!src || !dst) SKIP("arena_far_ptr_copy");
+    gdt_set(GDT_SCRATCH_FIRST+2,(u32)src,8191,0x92,0x4);
+    gdt_set(GDT_SCRATCH_FIRST+3,(u32)dst,8191,0x92,0x4);
+    static volatile struct __attribute__((packed)) { u32 off; u16 sel; } sp,dp;
+    static volatile u16 es_save;
+    u32 sum=0,seed=0xfa2c0b1u;
+    const unsigned rounds=256;
+    for(unsigned r=0;r<rounds;r++) {
+        u32 n=1024+(rng(&seed)&3071),so=rng(&seed)&4095,dof=rng(&seed)&4095,cnt=n;
+        for(unsigned i=0;i<n;i++) src[so+i]=(u8)rng(&seed);
+        sp.off=so; sp.sel=(GDT_SCRATCH_FIRST+2)<<3;
+        dp.off=dof; dp.sel=(GDT_SCRATCH_FIRST+3)<<3;
+        __asm__ volatile("movw %%es,%0\n"
+                         "1: lesl %1,%%ebx; movb %%es:(%%ebx),%%al; movw %0,%%es\n"
+                         "lesl %2,%%ebx; movb %%al,%%es:(%%ebx); movw %0,%%es\n"
+                         "lesl %1,%%ebx; movw %0,%%es\n"
+                         "addl $1,%1; sbbl %%edx,%%edx; addl $1,%2; adcl $0,%%edx\n"
+                         "decl %%ecx; jnz 1b"
+                         : "+m"(es_save),"+m"(sp),"+m"(dp),"+c"(cnt) :: "eax","ebx","edx","memory","cc");
+        CHECK_EQ(kmemcmp(dst+dof,src+so,n),0);
+        sum=csum_mix(sum,dst[dof]^n);
+    }
+    t_ops(rounds*2048*12); return sum;
+}
+/* SHA-1 as Windows 98 runs it as it first boots, checking file signatures:
+   the message schedule's byte swap and expansion loops are its own, two
+   words a pass, each pass one trip round a short loop. */
+extern void sha1_sched(u32 *w,const u32 *blk);
+__asm__(".text\n"
+".type sha1_sched,@function\nsha1_sched:\n"
+"pushl %ebp\n pushl %esi\n pushl %edi\n pushl %ebx\n"
+"movl 24(%esp),%edx\n movl 20(%esp),%ecx\n pushl %ecx\n"
+"movl $16,%esi\n movl $0xff00ff00,%edi\n movl $0xff00ff,%ebp\n leal -4(%ecx),%ecx\n"
+"1: movl (%edx),%eax\n addl $4,%edx\n movl %eax,%ebx\n andl %edi,%eax\n andl %ebp,%ebx\n addl $4,%ecx\n"
+"roll $8,%eax\n rorl $8,%ebx\n xorl %ebx,%eax\n decl %esi\n movl %eax,(%ecx)\n jne 1b\n"
+"popl %ecx\n leal 8(%ecx),%ecx\n movl $32,%edx\n"
+"2: movl -8(%ecx),%eax\n movl -4(%ecx),%ebx\n movl (%ecx),%esi\n movl 4(%ecx),%edi\n xorl %esi,%eax\n xorl %edi,%ebx\n"
+"movl 0x18(%ecx),%esi\n movl 0x1c(%ecx),%edi\n xorl %esi,%eax\n xorl %edi,%ebx\n"
+"movl 0x2c(%ecx),%esi\n movl 0x30(%ecx),%edi\n xorl %esi,%eax\n addl $8,%ecx\n roll $1,%eax\n xorl %edi,%ebx\n roll $1,%ebx\n"
+"movl %eax,0x30(%ecx)\n decl %edx\n movl %ebx,0x34(%ecx)\n jne 2b\n"
+"popl %ebx\n popl %edi\n popl %esi\n popl %ebp\n ret\n");
+static inline u32 rol32(u32 x,unsigned n) { return (x<<n)|(x>>(32-n)); }
+static void sha1_block(u32 *h,const u32 *blk,int ref) {
+    u32 w[80];
+    if(ref) {
+        for(unsigned i=0;i<16;i++) { u32 v=blk[i]; w[i]=(v>>24)|((v>>8)&0xff00)|((v<<8)&0xff0000)|(v<<24); }
+        for(unsigned i=16;i<80;i++) w[i]=rol32(w[i-3]^w[i-8]^w[i-14]^w[i-16],1);
+    } else sha1_sched(w,blk);
+    u32 a=h[0],b=h[1],c=h[2],d=h[3],e=h[4],t;
+    for(unsigned i=0;i<20;i++) { t=rol32(a,5)+((b&c)|(~b&d))+e+0x5a827999+w[i]; e=d; d=c; c=rol32(b,30); b=a; a=t; }
+    for(unsigned i=20;i<40;i++) { t=rol32(a,5)+(b^c^d)+e+0x6ed9eba1+w[i]; e=d; d=c; c=rol32(b,30); b=a; a=t; }
+    for(unsigned i=40;i<60;i++) { t=rol32(a,5)+((b&c)|(b&d)|(c&d))+e+0x8f1bbcdc+w[i]; e=d; d=c; c=rol32(b,30); b=a; a=t; }
+    for(unsigned i=60;i<80;i++) { t=rol32(a,5)+(b^c^d)+e+0xca62c1d6+w[i]; e=d; d=c; c=rol32(b,30); b=a; a=t; }
+    h[0]+=a; h[1]+=b; h[2]+=c; h[3]+=d; h[4]+=e;
+}
+static void sha1_init(u32 *h) { h[0]=0x67452301; h[1]=0xefcdab89; h[2]=0x98badcfe; h[3]=0x10325476; h[4]=0xc3d2e1f0; }
+static u32 int_sha1(void) {
+    const unsigned blocks=4096;
+    u32 *buf=arena_alloc(blocks*64,16);
+    if(!buf) SKIP("arena_sha1");
+    /* "abc", padded: the known digest a9993e36 4706816a ba3e2571 7850c26c 9cd0d89d */
+    static const u32 abc[16]={0x80636261,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0x18000000};
+    u32 h[5],hr[5],seed=0x5a1f00du;
+    sha1_init(h); sha1_block(h,abc,0);
+    CHECK_EQ(h[0],0xa9993e36); CHECK_EQ(h[1],0x4706816a); CHECK_EQ(h[2],0xba3e2571); CHECK_EQ(h[3],0x7850c26c); CHECK_EQ(h[4],0x9cd0d89d);
+    for(unsigned i=0;i<blocks*16;i++) buf[i]=rng(&seed);
+    sha1_init(h); sha1_init(hr);
+    for(unsigned i=0;i<blocks;i++) sha1_block(h,buf+i*16,0);
+    for(unsigned i=0;i<blocks/16;i++) sha1_block(hr,buf+i*16,1);
+    /* the reference pass covers the first sixteenth; its digest must match a fresh fast pass over the same */
+    u32 hf[5]; sha1_init(hf);
+    for(unsigned i=0;i<blocks/16;i++) sha1_block(hf,buf+i*16,0);
+    for(unsigned i=0;i<5;i++) CHECK_EQ(hf[i],hr[i]);
+    t_ops(blocks*1800); return h[0]^h[1]^h[2]^h[3]^h[4];
+}
+/* Bignum arithmetic as Windows 98 runs it as it first boots, checking
+   signatures with RSA: a multiply-accumulate row four words to a pass, each
+   word MUL, ADD and two ADC $0 that take the carries into the high half. */
+extern u32 bn_mul_add4(u32 *r,const u32 *a,u32 n,u32 w);
+extern u32 bn_mul_sub4(u32 *r,const u32 *a,u32 n,u32 w);
+#define BN_STEP(o,OP) "movl " o "(%esi,%ebp,4),%eax\n mull %ebx\n addl %eax,%ecx\n movl " o "(%edi,%ebp,4),%eax\n adcl $0,%edx\n" \
+                      OP " %ecx,%eax\n adcl $0,%edx\n movl %eax," o "(%edi,%ebp,4)\n movl %edx,%ecx\n"
+#define BN_FN(name,OP) \
+".type " name ",@function\n" name ":\n pushl %ebp\n pushl %esi\n pushl %edi\n pushl %ebx\n" \
+"movl 20(%esp),%edi\n movl 24(%esp),%esi\n movl 32(%esp),%ebx\n xorl %ecx,%ecx\n xorl %ebp,%ebp\n" \
+"1: " BN_STEP("0",OP) BN_STEP("4",OP) BN_STEP("8",OP) BN_STEP("12",OP) \
+"addl $4,%ebp\n cmpl 28(%esp),%ebp\n jb 1b\n movl %ecx,%eax\n popl %ebx\n popl %edi\n popl %esi\n popl %ebp\n ret\n"
+__asm__(".text\n" BN_FN("bn_mul_add4","addl") BN_FN("bn_mul_sub4","subl"));
+static u32 bn_ref(u32 *r,const u32 *a,u32 n,u32 w,int sub) {
+    u32 c=0;
+    for(u32 i=0;i<n;i++) {
+        u64 p=(u64)a[i]*w+c;
+        if(sub) { u32 lo=(u32)p; c=(u32)(p>>32)+(r[i]<lo); r[i]-=lo; }
+        else { u64 s=p+r[i]; r[i]=(u32)s; c=(u32)(s>>32); }
+    }
+    return c;
+}
+static u32 int_bn_muladd(void) {
+    enum { N=32 };
+    static u32 a[N],b[N],r[2*N],rr[2*N];
+    u32 sum=0,seed=0xb16a0d0u;
+    const unsigned rounds=512;
+    for(unsigned k=0;k<rounds;k++) {
+        for(unsigned i=0;i<N;i++) { a[i]=rng(&seed); b[i]=rng(&seed); }
+        if(k&1) for(unsigned i=0;i<2*N;i++) r[i]=rr[i]=rng(&seed);
+        else for(unsigned i=0;i<2*N;i++) r[i]=rr[i]=0;
+        /* a product row by row, or (odd rounds) one taken off r, as a reduction does */
+        for(unsigned i=0;i<N;i++) {
+            u32 c=(k&1)?bn_mul_sub4(r+i,a,N,b[i]):bn_mul_add4(r+i,a,N,b[i]);
+            u32 cr=bn_ref(rr+i,a,N,b[i],k&1);
+            CHECK_EQ(c,cr);
+            if(k&1) { r[i+N]-=c; rr[i+N]-=cr; } else { r[i+N]=c; rr[i+N]=cr; }
+        }
+        for(unsigned i=0;i<2*N;i++) CHECK_EQ(r[i],rr[i]);
+        sum=csum_mix(sum,r[N]^r[2*N-1]);
+    }
+    t_ops(rounds*N*N*9); return sum;
+}
+/* The same with DS, ES and SS as Windows 98 gives a Win32 program: base 0,
+   expand-down, big, the first page left out so that a null pointer faults.
+   Every access then has a lower bound to pass. */
+static u32 with_xdown_segs(u32 (*fn)(void)) {
+    const u16 sel=(GDT_SCRATCH_FIRST+4)<<3;
+    u16 ods,oes,oss;
+    gdt_set(GDT_SCRATCH_FIRST+4,0,0xfff,0x96,0x4);
+    __asm__ volatile("movw %%ds,%0; movw %%es,%1; movw %%ss,%2" : "=m"(ods),"=m"(oes),"=m"(oss));
+    __asm__ volatile("movw %0,%%ds; movw %0,%%es; movw %0,%%ss" :: "r"(sel) : "memory");
+    u32 r=fn();
+    __asm__ volatile("movw %0,%%ds; movw %1,%%es; movw %2,%%ss" :: "m"(ods),"m"(oes),"m"(oss) : "memory");
+    return r;
+}
+static u32 int_sha1_xdown(void) { return with_xdown_segs(int_sha1); }
+static u32 int_bn_muladd_xdown(void) { return with_xdown_segs(int_bn_muladd); }
+/* A large executable footprint, compiled once and run again and again, as
+   Windows 98's first boot runs its drivers and setup code: many distinct
+   short functions (ALU, shifts, LEA, loads and stores over 64 KiB of data
+   and a skipped INC) in a fixed shuffled order, so the host code for them
+   all is in use at once. Chained, each ends with a direct JMP to the next,
+   as straight-line code reaches the next; called, each is reached by its
+   own CALL through a table and returns, as through a dispatch table. */
+extern void cf_run(u32 *st,u32 *data,void **table,u32 n);
+__asm__(".text\n"
+".type cf_run,@function\ncf_run:\n"
+"pushl %ebp\n pushl %esi\n pushl %edi\n pushl %ebx\n"
+"movl 20(%esp),%ecx\n movl 24(%esp),%esi\n movl 28(%esp),%edi\n movl 32(%esp),%ebp\n"
+"pushl %ecx\n movl (%ecx),%eax\n movl 4(%ecx),%ebx\n movl 8(%ecx),%edx\n"
+"1: call *(%edi)\n addl $4,%edi\n decl %ebp\n jnz 1b\n"
+"popl %ecx\n movl %eax,(%ecx)\n movl %ebx,4(%ecx)\n movl %edx,8(%ecx)\n"
+"popl %ebx\n popl %edi\n popl %esi\n popl %ebp\n ret\n");
+enum { CF_FN=64, CF_DATA=16384 };
+/* One function's code from seed, ending with a JMP to next (a RET if next is
+   NULL); or, code NULL, its effect on st and data */
+static void cf_gen(u32 seed,u8 *code,const u8 *next,u32 *st,u32 *data) {
+    static const u8 len[10]={5,6,3,2,6,6,7,2,2,5};
+    u32 p=0,a=st?st[0]:0,b=st?st[1]:0,d=st?st[2]:0;
+    for(;;) {
+        u32 r=rng(&seed),imm=rng(&seed),off=(imm%CF_DATA)*4,k=1+(r>>8)%31;
+        unsigned op=r%10;
+        if(p+len[op]>CF_FN-5) break;
+        if(code) {
+            u8 *c=code+p;
+            switch(op) {
+            case 0: c[0]=0x05; kmemcpy(c+1,&imm,4); break;                          /* add eax,imm */
+            case 1: c[0]=0x81; c[1]=0xf3; kmemcpy(c+2,&imm,4); break;               /* xor ebx,imm */
+            case 2: c[0]=0xc1; c[1]=0xc0; c[2]=k; break;                            /* rol eax,k */
+            case 3: c[0]=0x01; c[1]=0xd8; break;                                    /* add eax,ebx */
+            case 4: c[0]=0x89; c[1]=0x86; kmemcpy(c+2,&off,4); break;               /* mov [esi+off],eax */
+            case 5: c[0]=0x03; c[1]=0x9e; kmemcpy(c+2,&off,4); break;               /* add ebx,[esi+off] */
+            case 6: c[0]=0x8d; c[1]=0x94; c[2]=0x58; kmemcpy(c+3,&imm,4); break;    /* lea edx,[eax+ebx*2+imm] */
+            case 7: c[0]=0x29; c[1]=0xc2; break;                                    /* sub edx,eax */
+            case 8: c[0]=0x31; c[1]=0xd0; break;                                    /* xor eax,edx */
+            case 9: c[0]=0xa8; c[1]=0x01; c[2]=0x74; c[3]=0x01; c[4]=0x43; break;   /* test al,1; jz; inc ebx */
+            }
+        } else {
+            switch(op) {
+            case 0: a+=imm; break;
+            case 1: b^=imm; break;
+            case 2: a=(a<<k)|(a>>(32-k)); break;
+            case 3: a+=b; break;
+            case 4: data[off/4]=a; break;
+            case 5: b+=data[off/4]; break;
+            case 6: d=a+b*2+imm; break;
+            case 7: d-=a; break;
+            case 8: a^=d; break;
+            case 9: if(a&1) b++; break;
+            }
+        }
+        p+=len[op];
+    }
+    if(!code) { st[0]=a; st[1]=b; st[2]=d; return; }
+    if(next) { u32 rel=(u32)next-(u32)(code+p+5); code[p]=0xe9; kmemcpy(code+p+1,&rel,4); p+=5; }
+    else code[p++]=0xc3;
+    while(p<CF_FN) code[p++]=0xcc;
+}
+static u32 code_footprint(u32 nfn,u32 passes,u32 seed0,int chain) {
+    u8 *code=arena_alloc(nfn*CF_FN,4096);
+    u32 *data=arena_alloc(CF_DATA*4,4096),*ref=arena_alloc(CF_DATA*4,4096);
+    void **table=arena_alloc(nfn*4,4);
+    u32 *order=arena_alloc(nfn*4,4);
+    if(!code || !data || !ref || !table || !order) SKIP("arena_code_footprint");
+    u32 seed=seed0;
+    for(u32 i=0;i<nfn;i++) order[i]=i;
+    for(u32 i=nfn-1;i>0;i--) { u32 j=rng(&seed)%(i+1),t=order[i]; order[i]=order[j]; order[j]=t; }
+    for(u32 i=0;i<nfn;i++) {
+        const u8 *next=(chain && i+1<nfn)?code+order[i+1]*CF_FN:NULL;
+        cf_gen(seed0+order[i]*0x9e3779b9u,code+order[i]*CF_FN,next,NULL,NULL);
+        table[i]=code+order[i]*CF_FN;
+    }
+    for(u32 i=0;i<CF_DATA;i++) data[i]=ref[i]=rng(&seed);
+    u32 st[3]={1,2,3},sr[3]={1,2,3},calls=chain?1:nfn;
+    /* the first pass checked against the model, function by function in the same order */
+    cf_run(st,data,table,calls);
+    for(u32 i=0;i<nfn;i++) cf_gen(seed0+order[i]*0x9e3779b9u,NULL,NULL,sr,ref);
+    for(u32 i=0;i<3;i++) CHECK_EQ(st[i],sr[i]);
+    CHECK_EQ(kmemcmp(data,ref,CF_DATA*4),0);
+    for(u32 p=1;p<passes;p++) cf_run(st,data,table,calls);
+    t_ops(passes*nfn*12); return st[0]^st[1]^st[2]^data[seed%CF_DATA];
+}
+static u32 int_code_footprint_128k(void) { return code_footprint(2048,256,0xc0de128u,1); }
+static u32 int_code_footprint_512k(void) { return code_footprint(8192,64,0xc0de512u,1); }
+static u32 int_code_footprint_calls(void) { return code_footprint(2048,256,0xc0dec11u,0); }
 static u32 int_alu(void) {
     u32 seed=0x12345678,sum=0;
     static const u32 edge[]={0,1,0xffffffffu,0x80000000u,0x7fffffffu,0xffffu,0xffu,0x80u};
@@ -1141,6 +1399,15 @@ const test_t tests_int[]={
     {"int_partial_boundaries",int_partial_boundaries,REQ_486},
     {"int_divide_state",int_divide_state,REQ_486},
     {"int_alu",int_alu,REQ_486},
+    {"int_adc_shift_loop",int_adc_shift_loop,REQ_486},
+    {"int_far_ptr_copy",int_far_ptr_copy,REQ_486},
+    {"int_sha1",int_sha1,REQ_486},
+    {"int_bn_muladd",int_bn_muladd,REQ_486},
+    {"int_sha1_xdown",int_sha1_xdown,REQ_486},
+    {"int_bn_muladd_xdown",int_bn_muladd_xdown,REQ_486},
+    {"int_code_footprint_128k",int_code_footprint_128k,REQ_486},
+    {"int_code_footprint_512k",int_code_footprint_512k,REQ_486},
+    {"int_code_footprint_calls",int_code_footprint_calls,REQ_486},
     {"int_flags_exhaustive",int_flags_exhaustive,REQ_486},
     {"int_muldiv",int_muldiv,REQ_486},
     {"int_shift_rot",int_shift_rot,REQ_486},
