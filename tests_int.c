@@ -248,9 +248,10 @@ __asm__(".text\n"
 "popl %ecx\n movl %eax,(%ecx)\n movl %ebx,4(%ecx)\n movl %edx,8(%ecx)\n"
 "popl %ebx\n popl %edi\n popl %esi\n popl %ebp\n ret\n");
 enum { CF_FN=64, CF_DATA=16384 };
-/* One function's code from seed, ending with a JMP to next (a RET if next is
-   NULL); or, code NULL, its effect on st and data */
-static void cf_gen(u32 seed,u8 *code,const u8 *next,u32 *st,u32 *data) {
+/* One function's code from seed, built at code to run at at, ending with a
+   JMP to next (a RET if next is NULL); or, code NULL, its effect on st and
+   data */
+static void cf_gen(u32 seed,u8 *code,const u8 *at,const u8 *next,u32 *st,u32 *data) {
     /* A mix like compiled code's: loads and stores, register moves, ALU,
        LEA, a byte load, PUSH/POP, a shift, INC and a skipped INC */
     static const u8 mix[16]={0,0,0,1,1,2,3,4,5,6,7,8,9,10,11,12};
@@ -297,7 +298,7 @@ static void cf_gen(u32 seed,u8 *code,const u8 *next,u32 *st,u32 *data) {
         p+=len[op];
     }
     if(!code) { st[0]=a; st[1]=b; st[2]=d; return; }
-    if(next) { u32 rel=(u32)next-(u32)(code+p+5); code[p]=0xe9; kmemcpy(code+p+1,&rel,4); p+=5; }
+    if(next) { u32 rel=(u32)next-(u32)(at+p+5); code[p]=0xe9; kmemcpy(code+p+1,&rel,4); p+=5; }
     else code[p++]=0xc3;
     while(p<CF_FN) code[p++]=0xcc;
 }
@@ -310,16 +311,21 @@ static u32 code_footprint(u32 nfn,u32 passes,u32 seed0,int chain) {
     u32 seed=seed0;
     for(u32 i=0;i<nfn;i++) order[i]=i;
     for(u32 i=nfn-1;i>0;i--) { u32 j=rng(&seed)%(i+1),t=order[i]; order[i]=order[j]; order[j]=t; }
+    /* Each function built aside and written only where the code differs: an
+       invocation after another one finds its code in place and runs it as
+       compiled, rather than rewriting it with the same bytes */
     for(u32 i=0;i<nfn;i++) {
         const u8 *next=(chain && i+1<nfn)?code+order[i+1]*CF_FN:NULL;
-        cf_gen(seed0+order[i]*0x9e3779b9u,code+order[i]*CF_FN,next,NULL,NULL);
-        table[i]=code+order[i]*CF_FN;
+        u8 fn[CF_FN],*at=code+order[i]*CF_FN;
+        cf_gen(seed0+order[i]*0x9e3779b9u,fn,at,next,NULL,NULL);
+        if(kmemcmp(at,fn,CF_FN)) kmemcpy(at,fn,CF_FN);
+        table[i]=at;
     }
     for(u32 i=0;i<CF_DATA;i++) data[i]=ref[i]=rng(&seed);
     u32 st[3]={1,2,3},sr[3]={1,2,3},calls=chain?1:nfn;
     /* the first pass checked against the model, function by function in the same order */
     cf_run(st,data,table,calls);
-    for(u32 i=0;i<nfn;i++) cf_gen(seed0+order[i]*0x9e3779b9u,NULL,NULL,sr,ref);
+    for(u32 i=0;i<nfn;i++) cf_gen(seed0+order[i]*0x9e3779b9u,NULL,NULL,NULL,sr,ref);
     for(u32 i=0;i<3;i++) CHECK_EQ(st[i],sr[i]);
     CHECK_EQ(kmemcmp(data,ref,CF_DATA*4),0);
     for(u32 p=1;p<passes;p++) cf_run(st,data,table,calls);
