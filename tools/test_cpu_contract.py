@@ -113,8 +113,7 @@ class CpuContractTests(unittest.TestCase):
             process.poll.return_value = None
             api = Mock()
             api.request.side_effect = request
-            with patch("run_86box.start_display", return_value=(Mock(), ":999")), \
-                    patch("run_86box.subprocess.Popen", return_value=process), \
+            with patch("run_86box.subprocess.Popen", return_value=process), \
                     patch("run_86box.socket.socket", return_value=Mock()), \
                     patch("run_86box.Automation", return_value=api), \
                     patch("run_86box.stop_process"), \

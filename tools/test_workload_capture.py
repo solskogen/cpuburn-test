@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from qemu_smoke import parse_log
-from run_86box import arguments, complete_counts, execute, start_display, write_config
+from run_86box import arguments, complete_counts, display_environment, execute, write_config
 from workload_capture import WorkloadCapture, PerfRecorder, parse_perf_script, process_cpu_seconds
 
 
@@ -225,35 +225,13 @@ class PerfTests(unittest.TestCase):
 
 
 class RunnerTests(unittest.TestCase):
-    def test_display_readiness_waits_for_newline(self):
-        process = Mock()
-        process.poll.return_value = None
-        with tempfile.TemporaryDirectory() as directory, \
-                patch("run_86box.os.pipe", return_value=(10, 11)), \
-                patch("run_86box.os.close") as close, \
-                patch("run_86box.subprocess.Popen", return_value=process), \
-                patch("run_86box.time.monotonic", return_value=1), \
-                patch("run_86box.select.select", return_value=([10], [], [])) as select, \
-                patch("run_86box.os.read", side_effect=[b"123", b"\n"]) as read:
-            self.assertEqual(start_display(Path(directory), 10), (process, ":123"))
-            self.assertEqual(read.call_count, 2)
-            self.assertEqual(select.call_count, 2)
-            close.assert_any_call(10)
-            close.assert_any_call(11)
-
-    def test_display_incomplete_readiness_fails_and_stops_child(self):
-        process = Mock()
-        with tempfile.TemporaryDirectory() as directory, \
-                patch("run_86box.os.pipe", return_value=(10, 11)), \
-                patch("run_86box.os.close"), \
-                patch("run_86box.subprocess.Popen", return_value=process), \
-                patch("run_86box.time.monotonic", return_value=1), \
-                patch("run_86box.select.select", return_value=([10], [], [])), \
-                patch("run_86box.os.read", side_effect=[b"123", b""]), \
-                patch("run_86box.stop_process") as stop:
-            with self.assertRaisesRegex(RuntimeError, "readiness pipe"):
-                start_display(Path(directory), 10)
-            stop.assert_called_once_with(process)
+    def test_display_is_the_session_native_one_or_offscreen(self):
+        with patch.dict("run_86box.os.environ", {"WAYLAND_DISPLAY": "wayland-1", "DISPLAY": ":0"}, clear=True):
+            self.assertEqual(display_environment(), {"QT_QPA_PLATFORM": "wayland"})
+        with patch.dict("run_86box.os.environ", {"DISPLAY": ":5"}, clear=True):
+            self.assertEqual(display_environment(), {"QT_QPA_PLATFORM": "xcb"})
+        with patch.dict("run_86box.os.environ", {}, clear=True):
+            self.assertEqual(display_environment(), {"QT_QPA_PLATFORM": "offscreen"})
 
     def test_default_done_executes_single_combined_capture_and_retains_failures(self):
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
@@ -284,8 +262,7 @@ class RunnerTests(unittest.TestCase):
             process.poll.return_value = None
             api = Mock()
             api.request.side_effect = request
-            with patch("run_86box.start_display", return_value=(Mock(), ":999")), \
-                    patch("run_86box.subprocess.Popen", return_value=process), \
+            with patch("run_86box.subprocess.Popen", return_value=process), \
                     patch("run_86box.socket.socket", return_value=Mock()), \
                     patch("run_86box.Automation", return_value=api), \
                     patch("run_86box.stop_process"), \

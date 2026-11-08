@@ -11,7 +11,6 @@ import json
 import math
 import os
 from pathlib import Path
-import select
 import shutil
 import signal
 import socket
@@ -64,7 +63,7 @@ def boot_key(value):
 
 def arguments():
     parser = argparse.ArgumentParser(description=__doc__, epilog=(
-        "Requires an AUTOMATION-enabled 86Box, Xvfb, and locally installed ROMs. "
+        "Requires an AUTOMATION-enabled 86Box and locally installed ROMs; 86Box opens in the session's Wayland or X display, or offscreen without one. "
         "Never downloads firmware. --vm runs the supplied VM in place, temporarily "
         "inserting the test floppy and enabling COM1, then restores its config. Without --expect, "
         "DONE completes observation with strict nonzero summary counts, not a "
@@ -358,39 +357,15 @@ def stop_process(process):
         process.wait(timeout=3)
 
 
-def start_display(run_dir, deadline):
-    # -displayfd allocates a free server number; no shared display is reused.
-    read_fd, write_fd = os.pipe()
-    log = (run_dir / "xvfb.log").open("wb")
-    try:
-        process = subprocess.Popen(
-            ["Xvfb", "-displayfd", str(write_fd), "-screen", "0", "1024x768x24",
-             "-nolisten", "tcp", "-ac"],
-            pass_fds=(write_fd,), stdout=log, stderr=log, start_new_session=True)
-    finally:
-        os.close(write_fd)
-        log.close()
-    try:
-        limit = min(deadline, time.monotonic() + 10)
-        display_line = b""
-        # Xvfb can write the display number and newline separately.
-        while b"\n" not in display_line:
-            ready, _, _ = select.select([read_fd], [], [], max(0, limit - time.monotonic()))
-            if not ready:
-                raise RuntimeError("Xvfb did not become ready")
-            chunk = os.read(read_fd, 64)
-            if not chunk or len(display_line) + len(chunk) > 64:
-                raise RuntimeError("Xvfb readiness pipe closed or returned an invalid display")
-            display_line += chunk
-        display = display_line.decode().strip()
-        if not display.isdigit() or process.poll() is not None:
-            raise RuntimeError("Xvfb startup failed; see xvfb.log")
-        return process, ":" + display
-    except BaseException:
-        stop_process(process)
-        raise
-    finally:
-        os.close(read_fd)
+def display_environment():
+    """How 86Box shows itself: natively in the session it was started from,
+    Wayland's or X's, otherwise with Qt's offscreen platform, which needs no
+    display at all."""
+    if os.environ.get("WAYLAND_DISPLAY"):
+        return {"QT_QPA_PLATFORM": "wayland"}
+    if os.environ.get("DISPLAY"):
+        return {"QT_QPA_PLATFORM": "xcb"}
+    return {"QT_QPA_PLATFORM": "offscreen"}
 
 
 def complete_counts(result):
@@ -409,7 +384,7 @@ def complete_counts(result):
 def execute(args, run_dir, command, machine):
     started = time.monotonic()
     deadline = started + args.wall_seconds
-    display = emulator = connection = None
+    emulator = connection = None
     capture = WorkloadCapture(getattr(args, "sample_cpu_seconds", 30.0), args.step_ms)
     recorder = PerfRecorder(run_dir) if getattr(args, "perf", False) else None
     perf_stopped = False
@@ -425,10 +400,9 @@ def execute(args, run_dir, command, machine):
               "limits": {"emulated_ms": args.emulated_ms, "wall_seconds": args.wall_seconds},
               "perf": {"status": "requested" if recorder else "disabled"}}
     try:
-        display, display_name = start_display(run_dir, deadline)
         environment = os.environ.copy()
         # Keep the session runtime directory so OpenAL can reach PipeWire.
-        environment.update(DISPLAY=display_name, QT_QPA_PLATFORM="xcb")
+        environment.update(display_environment())
         if not getattr(args, "vm", None):
             environment.update(
                            XDG_CONFIG_HOME=str(run_dir / "config"),
@@ -657,7 +631,6 @@ def execute(args, run_dir, command, machine):
         if connection is not None:
             connection.close()
         stop_process(emulator)
-        stop_process(display)
         (run_dir / "result.json").write_text(json.dumps(result, indent=2) + "\n")
     return result
 
@@ -668,7 +641,7 @@ def run_existing_vm(args, emulator, image, roms):
     run_dir.mkdir(parents=True, exist_ok=True)
     artifacts = ("serial.log", "result.json", "launch.json", "automation.sock",
                  "automation.jsonl", "screen.log", "screen.png", "emulator.log",
-                 "process.log", "xvfb.log", "perf.data", "perf-record.log")
+                 "process.log", "perf.data", "perf-record.log")
     for name in artifacts:
         if (run_dir / name).exists():
             raise RuntimeError(f"output already exists: {run_dir / name}; "
@@ -711,8 +684,6 @@ def main():
             raise RuntimeError(f"not executable: {emulator}")
         if image.stat().st_size != 1474560:
             raise RuntimeError("expected a raw 1.44 MB floppy image (1474560 bytes)")
-        if not args.prepare_only and shutil.which("Xvfb") is None:
-            raise RuntimeError("Xvfb is required")
         roms = rom_directory(args.rompath)
         if args.vm:
             return run_existing_vm(args, emulator, image, roms)

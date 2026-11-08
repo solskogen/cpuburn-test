@@ -65,8 +65,10 @@ keep up with the configured CPU speed.
 
 ### Measure per-test emulation capacity
 
-On Linux, with Python 3.10+, Xvfb, installed ROMs and an
-`AUTOMATION=ON` 86Box build:
+On Linux, with Python 3.10+, installed ROMs and an `AUTOMATION=ON` 86Box
+build. 86Box opens natively in the current session (Wayland if `WAYLAND_DISPLAY`
+is set, otherwise X with `DISPLAY`); without either, it runs with Qt's
+offscreen platform, with no window:
 
 ```sh
 make -B BENCHMARKS=1
