@@ -162,9 +162,8 @@ def emulator_binary(value):
     return Path(executable).resolve(strict=True)
 
 
-@contextmanager
-def inplace_vm(args, image):
-    source = vm_config(args.vm)
+def refuse_running(source):
+    """Fail if an 86Box process already has this VM open."""
     for process in Path("/proc").iterdir():
         if not process.name.isdigit():
             continue
@@ -190,6 +189,12 @@ def inplace_vm(args, image):
                     raise RuntimeError(f"VM is already running (PID {process.name}): {source}")
             elif os.fsdecode(word) == str(source):
                 raise RuntimeError(f"VM is already running (PID {process.name}): {source}")
+
+
+@contextmanager
+def edited_config(source, edit):
+    """The VM's configuration with edit(config) applied for the run, locked
+    against a second run, and restored byte-for-byte afterwards."""
     with source.open("r+b") as handle:
         try:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -198,6 +203,22 @@ def inplace_vm(args, image):
         original = handle.read()
         config = configparser.ConfigParser(interpolation=None, strict=False)
         config.read_string(original.decode("utf-8-sig"))
+        edit(config)
+        try:
+            with source.open("w", encoding="utf-8") as output:
+                config.write(output)
+            yield config, hashlib.sha256(original).hexdigest()
+        finally:
+            with source.open("wb") as output:
+                output.write(original)
+
+
+@contextmanager
+def inplace_vm(args, image):
+    source = vm_config(args.vm)
+    refuse_running(source)
+
+    def edit(config):
         if not config.has_section("Machine"):
             raise RuntimeError("VM configuration needs a [Machine] section")
         for key in ("machine", "cpu_family", "cpu_speed", "mem_size"):
@@ -218,13 +239,9 @@ def inplace_vm(args, image):
         config["Ports (COM & LPT)"].update(serial1_enabled="1", serial1_device="automation")
         config["Floppy and CD-ROM drives"].update(
             fdd_01_type="35_2hd", fdd_01_fn=str(image), fdd_01_writeprot="1")
-        try:
-            with source.open("w", encoding="utf-8") as output:
-                config.write(output)
-            yield source, dict(config["Machine"]), hashlib.sha256(original).hexdigest()
-        finally:
-            with source.open("wb") as output:
-                output.write(original)
+
+    with edited_config(source, edit) as (config, source_hash):
+        yield source, dict(config["Machine"]), source_hash
 
 
 def write_config(args, run_dir):
@@ -338,6 +355,8 @@ class Automation:
         reply = json.loads(line)
         self.transcript.write(json.dumps({"command": command, "reply": reply}) + "\n")
         self.transcript.flush()
+        if reply.get("fatal"):
+            raise RuntimeError(f"86Box stopped on a fatal error: {reply.get('error')}")
         if not reply.get("ok") and not allow_failure:
             raise RuntimeError(f"Automation {command!r}: {reply}")
         return reply
@@ -366,6 +385,15 @@ def display_environment():
     if os.environ.get("DISPLAY"):
         return {"QT_QPA_PLATFORM": "xcb"}
     return {"QT_QPA_PLATFORM": "offscreen"}
+
+
+def bios_f1_prompt(text):
+    """A text-mode BIOS prompt to press F1 to resume or continue."""
+    return any(
+        "press" in line.lower() and
+        ("<f1>" in line.lower() or "f1 to" in line.lower()) and
+        ("resume" in line.lower() or "continue" in line.lower())
+        for line in text.splitlines())
 
 
 def complete_counts(result):
@@ -518,12 +546,7 @@ def execute(args, run_dir, command, machine):
                 if rejected:
                     result["rejected"] = sorted(set(rejected))
                     break
-                f1_prompt = any(
-                    "press" in line.lower() and
-                    ("<f1>" in line.lower() or "f1 to" in line.lower()) and
-                    ("resume" in line.lower() or "continue" in line.lower())
-                    for line in text.splitlines())
-                if args.bios_f1 and f1_prompt and now - last_f1 >= 5000:
+                if args.bios_f1 and bios_f1_prompt(text) and now - last_f1 >= 5000:
                     api.request("key down 0x3b")
                     api.request("key up 0x3b")
                     last_f1 = now
@@ -655,7 +678,8 @@ def run_existing_vm(args, emulator, image, roms):
           file=sys.stderr)
     with inplace_vm(args, image) as (source, machine, source_hash):
         command = [str(emulator), "--automation", f"unix:{run_dir / 'automation.sock'}",
-                   "--automation-hold", "--noconfirm", "--vmpath", str(source.parent),
+                   "--automation-hold", "--automation-seed", "1", "--noconfirm",
+                   "--vmpath", str(source.parent),
                    "--rompath", str(roms), "--logfile", str(run_dir / "emulator.log"),
                    str(source)]
         image_hash = hashlib.sha256(image.read_bytes()).hexdigest()
