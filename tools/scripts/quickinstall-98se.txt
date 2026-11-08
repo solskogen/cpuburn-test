@@ -1,0 +1,73 @@
+# Windows 98 QuickInstall v1.1.0 (win98qi_v1.1.0_ALL.iso in the CD drive),
+# onto an empty hard disk: one FAT32 partition over the whole disk, then
+# Windows 98SE with these Configuration options, up to "installation was
+# successful" and Reboot. For session_86box.py, with --wipe-hdd for the
+# empty disk.
+#
+# Only the CD's boot prompt is VGA text. QuickInstall's own screens (its
+# menus, cfdisk) are drawn on a Linux framebuffer, which `text` cannot read:
+# it still returns the VGA text buffer from before. So those screens get
+# fixed pauses of emulated time, long enough at any speed (the machine is
+# paced, or held and stepped, either way emulated time is what counts).
+wait text 60000 ENTER to start QuickInstall
+key enter
+pause 10000
+# Installation Variant
+key enter
+pause 10000
+# Welcome to Windows 9x
+key enter
+pause 10000
+# Main Menu: [DISK]
+mark disk
+key down enter
+pause 10000
+# Select the Hard Disk you wish to partition
+key enter
+pause 10000
+# Partition Table Issue
+key enter
+pause 10000
+# No partition table found. Will create MBR disk!
+key enter
+pause 10000
+# cfdisk: New, the whole disk, primary
+key enter
+pause 1000
+key enter
+pause 1000
+key enter
+pause 10000
+# Bootable, then Write, and "yes" to its question
+key left left left enter
+pause 1000
+key right right right right right right enter
+pause 2000
+key y e s enter
+pause 10000
+# The partition table has been altered: Quit
+key q
+pause 10000
+# Select the Hard Disk: [Back]
+key down enter
+pause 10000
+# Remember to answer
+key enter
+pause 10000
+# Main Menu: [INSTALL]
+key enter
+pause 10000
+# Installation Destination
+key enter
+pause 10000
+# Configuration
+key down down down right down down right down right
+pause 2000
+mark install
+key enter
+# Disk & Patch Preparation, then the copy, to "installation was successful"
+pause 180000
+mark done
+screenshot installed
+# Reboot
+key enter
