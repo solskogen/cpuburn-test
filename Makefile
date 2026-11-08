@@ -81,8 +81,14 @@ build/start.o: start.asm Makefile | build
 build/kernel.elf: link.ld $(OBJS)
 	$(LD) -m elf_i386 -T link.ld -Map build/kernel.map -o $@ $(OBJS)
 
+comma := ,
+# Every name in ONLY must be a test: each test's name is a whole string in the
+# kernel, so a misspelt one is an error rather than a test silently left out
 build/kernel.bin: build/kernel.elf
 	$(OBJCOPY) -O binary $< $@
+	$(if $(ONLY),@bad=; for t in $(subst $(comma), ,$(ONLY)); do \
+	    tr '\0' '\n' < $@ | grep -qxF -- "$$t" || { echo "ONLY: no test named '$$t'" >&2; bad=1; }; \
+	done; test -z "$$bad")
 
 build/rm.bin: rm.asm boot_memory.asm build/kernel.elf build/kernel.bin Makefile | build
 	$(NASM) -f bin -DKERNEL_BYTES=$$(stat -c %s build/kernel.bin) \

@@ -103,6 +103,12 @@ class BuildTests(unittest.TestCase):
         self.assertIn("custom-objcopy -O binary", commands)
         self.assertIn("custom-nm -n build/kernel.elf", commands)
 
+    def test_only_names_are_checked_against_the_kernel(self):
+        commands = self.make("-n", "-B", "ONLY=int_alu,pg_faults")
+        self.assertIn("for t in int_alu pg_faults; do", commands)
+        self.assertIn("no test named", commands)
+        self.assertNotIn("no test named", self.make("-n", "-B"))
+
     def test_build_commands_have_no_helper_or_python_dependency(self):
         commands = self.make("-n", "-B", "CC=gcc", "IS_CLANG=", "PYTHON=false", "release")
         self.assertIn("gcc -m32", commands)

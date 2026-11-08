@@ -509,7 +509,8 @@ a `FAULT`, not a successful shortened benchmark. The watchdog applies to each
 invocation, not the whole sustained window. `TEST_SECONDS` accepts 1–3600;
 use the default 5 or more for profiling, not the shortened validation build.
 `ONLY` runs just the listed tests and logs them as `CFG only=`; `SUMMARY`
-counts only those. A clean default rebuild selects the full suite.
+counts only those. A name that is no test fails the build. A clean default
+rebuild selects the full suite.
 
 ## Results for automation
 
