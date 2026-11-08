@@ -58,6 +58,7 @@ See [accuracy-only builds](#accuracy-only-builds) for details.
 |---|---|
 | Display and save serial results from your existing VM | [`capture_serial.py`](#boot-and-capture-results) |
 | Measure each test's ability to sustain the configured emulation speed | [`run_86box.py`](#measure-per-test-emulation-capacity) |
+| Drive a VM through an OS install or boot, logging its real-time speed and watching its screen | [`session_86box.py`](#drive-a-vm-and-log-its-real-time-speed) |
 
 Serial capture and guest timing alone do **not** measure host emulation
 capacity. Use the performance runner below to find workloads that cannot
@@ -232,6 +233,45 @@ Keep the socket local; do not expose it to the internet. If no results
 appear, check the VGA screen for a BIOS prompt and ensure firmware enables
 COM1. For automatic handling of supported BIOS F1 prompts, use
 [`tools/run_86box.py --bios-f1`](#sustained-host-profiling).
+
+### Drive a VM and log its real-time speed
+
+`tools/session_86box.py` runs an existing VM in place, as `run_86box.py`
+does, but with no test floppy: it plays a script of keys and waits, and
+logs 86Box's own speed reading (`speed_percent`, the window's figure) for
+every emulated second. It is for finding where an OS install or boot can't
+keep up, and for checking that it gets through:
+
+```sh
+python3 tools/session_86box.py --vm "/path/to/My VM" --output-dir /tmp/qi-run \
+  --script tools/scripts/quickinstall-98se.txt --wipe-hdd 01
+```
+
+- **Script:** one command per line: `wait text <timeout_ms> <text>` (run
+  until a row of the text screen shows it), `key <key>...` (each pressed and
+  released; names such as `enter`, `down`, `f1`, `kpdel`, letters, or set-1
+  scancodes, `ctrl+alt+del` for keys held together), `pause <ms>` (emulated),
+  `screenshot <name>` and `mark <label>` (tags the next speed sample). `#`
+  starts a comment. A `wait` that times out ends the run.
+- **Paced:** the machine runs in real time, so the log shows what the window
+  shows. `--held` runs it unpaced instead, for functional checks.
+- **Screens:** a frame is saved every `--record-ms` (default 10000) of
+  emulated time in `frames/`. A text screen after a graphical one, error
+  words on a text screen (`Exception`, `STOP: 0x`, `Fatal`, `Error`) and CPU
+  resets go into `alerts.jsonl` with a screenshot, as they happen.
+  `text` reads the VGA text buffer: a framebuffer console that only looks
+  like text (Linux's, as QuickInstall's menus use) can't be read or waited
+  for, so the script uses `pause` there.
+- **Configuration:** `--set "SECTION/KEY=VALUE"` and `--unset "SECTION/KEY"`
+  change it for the run only; it is restored byte for byte afterwards.
+  `--bios-f1` presses F1 at a text-mode BIOS prompt (fresh CMOS).
+- **`--wipe-hdd NN`** empties hard disk NN's image in place, at its size,
+  before starting: everything on it is lost. It refuses a VHD, whose
+  structure it would destroy; raw images only.
+
+`result.json` has the status, the alerts and the ten slowest seconds (the
+first emulated second, which includes 86Box starting, is left out);
+`speed.jsonl` has every sample, `automation.jsonl` every request.
 
 ## Overview
 
