@@ -115,6 +115,24 @@ class SessionTest(unittest.TestCase):
             self.assertTrue(any(r.startswith("screenshot ") and "alert-2000" in r for r in api.requests))
 
 
+class ScreenshotTest(unittest.TestCase):
+    def test_no_frame_is_an_alert_not_an_error(self):
+        class NoFrame(FakeApi):
+            def request(self, command, allow_failure=False):
+                if command.startswith("screenshot "):
+                    self.requests.append(command)
+                    if not allow_failure:
+                        raise RuntimeError("no frame")
+                    return {"ok": False, "error": "no frame rendered yet", "ms": self.ms}
+                return super().request(command, allow_failure)
+        api = NoFrame(lambda ms: (0, 0, None))
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            self.assertEqual(run_session(api, parse_script("pause 1000\nscreenshot early\npause 1000"), out, 0), "done")
+            alerts = (out / "alerts.jsonl").read_text()
+            self.assertIn("screenshot early: no frame rendered yet", alerts)
+
+
 class BiosF1Test(unittest.TestCase):
     def test_f1_pressed_once_per_five_seconds(self):
         api = FakeApi(lambda ms: (720, 400, "Press F1 to continue, DEL to enter SETUP"))

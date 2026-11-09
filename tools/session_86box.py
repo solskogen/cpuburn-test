@@ -178,7 +178,12 @@ def run_session(api, commands, out, after_ms, slice_ms=1000, clock=time.monotoni
             elif command[0] == "pause":
                 run_for(command[1])
             elif command[0] == "screenshot":
-                api.request(f"screenshot {out / (command[1] + '.png')}")
+                # No frame yet (a card the firmware never started) is noted,
+                # not the end of the run
+                shot = api.request(f"screenshot {out / (command[1] + '.png')}", allow_failure=True)
+                if not shot.get("ok"):
+                    alerts.write(json.dumps({"ms": shot.get("ms"), "alert": f"screenshot {command[1]}: {shot.get('error')}"}) + "\n")
+                    alerts.flush()
             elif command[0] == "mark":
                 mark = command[1]
         if status == "done":
