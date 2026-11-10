@@ -57,7 +57,9 @@ def key_codes(word):
 
 def parse_script(text):
     """Script lines: wait text <timeout_ms> <text> | key <key>... | pause <ms> |
-    screenshot <name> | mark <label>. '#' starts a comment line."""
+    screenshot <name> | dump <addr> <len> <name> | mark <label>. '#' starts a
+    comment line. dump saves <len> bytes of physical memory at <addr> as
+    <name>.bin, with the registers at that moment in <name>.regs.json."""
     commands = []
     for number, line in enumerate(text.splitlines(), 1):
         line = line.strip()
@@ -81,6 +83,14 @@ def parse_script(text):
                 if not re.fullmatch(r"[A-Za-z0-9_.-]+", rest):
                     raise ValueError("screenshot names are letters, digits, '_', '-' and '.'")
                 commands.append(("screenshot", rest))
+            elif word == "dump":
+                parts = rest.split()
+                if len(parts) != 3 or not re.fullmatch(r"[A-Za-z0-9_.-]+", parts[2]):
+                    raise ValueError("use: dump <addr> <len> <name>, names of letters, digits, '_', '-' and '.'")
+                length = int(parts[1], 0)
+                if not 0 < length <= 65536:
+                    raise ValueError("dump lengths are 1 to 65536 bytes")
+                commands.append(("dump", int(parts[0], 0), length, parts[2]))
             elif word == "mark":
                 commands.append(("mark", rest))
             else:
@@ -184,6 +194,11 @@ def run_session(api, commands, out, after_ms, slice_ms=1000, clock=time.monotoni
                 if not shot.get("ok"):
                     alerts.write(json.dumps({"ms": shot.get("ms"), "alert": f"screenshot {command[1]}: {shot.get('error')}"}) + "\n")
                     alerts.flush()
+            elif command[0] == "dump":
+                _, addr, length, name = command
+                memory = api.request(f"memr {addr:#x} {length}")
+                (out / (name + ".bin")).write_bytes(bytes.fromhex(memory["data"]))
+                (out / (name + ".regs.json")).write_text(json.dumps(api.request("regs"), indent=1) + "\n")
             elif command[0] == "mark":
                 mark = command[1]
         if status == "done":

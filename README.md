@@ -251,8 +251,10 @@ python3 tools/session_86box.py --vm "/path/to/My VM" --output-dir /tmp/qi-run \
   until a row of the text screen shows it), `key <key>...` (each pressed and
   released; names such as `enter`, `down`, `f1`, `kpdel`, letters, or set-1
   scancodes, `ctrl+alt+del` for keys held together), `pause <ms>` (emulated),
-  `screenshot <name>` and `mark <label>` (tags the next speed sample). `#`
-  starts a comment. A `wait` that times out ends the run.
+  `screenshot <name>`, `dump <addr> <len> <name>` (saves `len` bytes of
+  physical memory at `addr` as `<name>.bin`, with the registers at that
+  moment in `<name>.regs.json`) and `mark <label>` (tags the next speed
+  sample). `#` starts a comment. A `wait` that times out ends the run.
 - **Paced:** the machine runs in real time, so the log shows what the window
   shows. `--held` runs it unpaced instead, for functional checks.
 - **Screens:** a frame is saved every `--record-ms` (default 10000) of
