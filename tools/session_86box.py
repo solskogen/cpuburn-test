@@ -57,9 +57,11 @@ def key_codes(word):
 
 def parse_script(text):
     """Script lines: wait text <timeout_ms> <text> | key <key>... | pause <ms> |
-    screenshot <name> | dump <addr> <len> <name> | mark <label>. '#' starts a
-    comment line. dump saves <len> bytes of physical memory at <addr> as
-    <name>.bin, with the registers at that moment in <name>.regs.json."""
+    screenshot <name> | dump <addr> <len> <name> | cd load <drive> <path> |
+    mark <label>. '#' starts a comment line. dump saves <len> bytes of
+    physical memory at <addr> as <name>.bin, with the registers at that
+    moment in <name>.regs.json. cd load inserts the image at <path> (the
+    rest of the line) in CD-ROM drive <drive> as the machine runs."""
     commands = []
     for number, line in enumerate(text.splitlines(), 1):
         line = line.strip()
@@ -91,6 +93,12 @@ def parse_script(text):
                 if not 0 < length <= 65536:
                     raise ValueError("dump lengths are 1 to 65536 bytes")
                 commands.append(("dump", int(parts[0], 0), length, parts[2]))
+            elif word == "cd":
+                verb, _, rest = rest.partition(" ")
+                drive, _, path = rest.partition(" ")
+                if verb != "load" or not drive.isdigit() or not path:
+                    raise ValueError("use: cd load <drive> <path>")
+                commands.append(("cd", int(drive), path))
             elif word == "mark":
                 commands.append(("mark", rest))
             else:
@@ -199,6 +207,8 @@ def run_session(api, commands, out, after_ms, slice_ms=1000, clock=time.monotoni
                 memory = api.request(f"memr {addr:#x} {length}")
                 (out / (name + ".bin")).write_bytes(bytes.fromhex(memory["data"]))
                 (out / (name + ".regs.json")).write_text(json.dumps(api.request("regs"), indent=1) + "\n")
+            elif command[0] == "cd":
+                api.request(f"cd load {command[1]} {command[2]}")
             elif command[0] == "mark":
                 mark = command[1]
         if status == "done":
