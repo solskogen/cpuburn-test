@@ -290,7 +290,7 @@ class PerfRecorder:
         executable = shutil.which("perf")
         if executable is None:
             raise RuntimeError("--perf requested but perf is not installed")
-        self.command = [executable, "record", "-F", "99", "-g", "-p", str(pid),
+        self.command = [executable, "record", "-F", "99", "-g", "--user-callchains", "-p", str(pid),
                         "--mmap-pages", "64",
                         "-o", str(self.directory / "perf.data"), "--timestamp",
                         "--clockid", "mono"]

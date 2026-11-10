@@ -751,8 +751,9 @@ a Pi 5 measurement unless run there. The CPU-normalized ratio additionally
 charges every emulator thread; it is not a single-thread cycle estimate.
 Boot, serial capture and non-step control time are recorded separately.
 
-`--perf` explicitly attaches Linux `perf record` at 99 Hz with callchains and
-`CLOCK_MONOTONIC` timestamps. It saves `perf.data`, `perf.script`, diagnostics,
+`--perf` explicitly attaches Linux `perf record` at 99 Hz with user-space
+callchains (`--user-callchains`, which `perf_event_paranoid` 2 allows, where
+kernel callchains are refused) and `CLOCK_MONOTONIC` timestamps. It saves `perf.data`, `perf.script`, diagnostics,
 and per-ID leaf/inclusive hotpaths aligned only to interior sampling steps.
 Unresolved symbols retain their instruction addresses instead of collapsing
 every JIT location into one `[unknown]` bucket. Useful callchains still depend
