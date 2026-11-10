@@ -57,9 +57,10 @@ def key_codes(word):
 
 def parse_script(text):
     """Script lines: wait text <timeout_ms> <text> | key <key>... | pause <ms> |
-    screenshot <name> | dump <addr> <len> <name> | cd load <drive> <path> |
+    screenshot <name> | dump <addr> <len> <name> [<view>] | cd load <drive> <path> |
     mark <label>. '#' starts a comment line. dump saves <len> bytes of
-    physical memory at <addr> as <name>.bin, with the registers at that
+    memory at <addr> (physical, or through a memr view such as linear) as
+    <name>.bin, with the registers at that
     moment in <name>.regs.json. cd load inserts the image at <path> (the
     rest of the line) in CD-ROM drive <drive> as the machine runs."""
     commands = []
@@ -87,12 +88,14 @@ def parse_script(text):
                 commands.append(("screenshot", rest))
             elif word == "dump":
                 parts = rest.split()
-                if len(parts) != 3 or not re.fullmatch(r"[A-Za-z0-9_.-]+", parts[2]):
-                    raise ValueError("use: dump <addr> <len> <name>, names of letters, digits, '_', '-' and '.'")
+                if len(parts) not in (3, 4) or not re.fullmatch(r"[A-Za-z0-9_.-]+", parts[2]):
+                    raise ValueError("use: dump <addr> <len> <name> [<view>], names of letters, digits, '_', '-' and '.'")
                 length = int(parts[1], 0)
                 if not 0 < length <= 65536:
                     raise ValueError("dump lengths are 1 to 65536 bytes")
-                commands.append(("dump", int(parts[0], 0), length, parts[2]))
+                if len(parts) == 4 and not re.fullmatch(r"[a-z]+", parts[3]):
+                    raise ValueError("a dump view is a word such as bus or linear")
+                commands.append(("dump", int(parts[0], 0), length, parts[2], parts[3] if len(parts) == 4 else None))
             elif word == "cd":
                 verb, _, rest = rest.partition(" ")
                 drive, _, path = rest.partition(" ")
@@ -203,8 +206,8 @@ def run_session(api, commands, out, after_ms, slice_ms=1000, clock=time.monotoni
                     alerts.write(json.dumps({"ms": shot.get("ms"), "alert": f"screenshot {command[1]}: {shot.get('error')}"}) + "\n")
                     alerts.flush()
             elif command[0] == "dump":
-                _, addr, length, name = command
-                memory = api.request(f"memr {addr:#x} {length}")
+                _, addr, length, name, view = command
+                memory = api.request(f"memr {addr:#x} {length}" + (f" {view}" if view else ""))
                 (out / (name + ".bin")).write_bytes(bytes.fromhex(memory["data"]))
                 (out / (name + ".regs.json")).write_text(json.dumps(api.request("regs"), indent=1) + "\n")
             elif command[0] == "cd":

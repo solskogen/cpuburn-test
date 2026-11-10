@@ -251,9 +251,10 @@ python3 tools/session_86box.py --vm "/path/to/My VM" --output-dir /tmp/qi-run \
   until a row of the text screen shows it), `key <key>...` (each pressed and
   released; names such as `enter`, `down`, `f1`, `kpdel`, letters, or set-1
   scancodes, `ctrl+alt+del` for keys held together), `pause <ms>` (emulated),
-  `screenshot <name>`, `dump <addr> <len> <name>` (saves `len` bytes of
-  physical memory at `addr` as `<name>.bin`, with the registers at that
-  moment in `<name>.regs.json`), `cd load <drive> <path>` (inserts the image
+  `screenshot <name>`, `dump <addr> <len> <name> [<view>]` (saves `len`
+  bytes of memory at `addr`, physical or through a `memr` view such as
+  `linear`, as `<name>.bin`, with the registers at that moment in
+  `<name>.regs.json`), `cd load <drive> <path>` (inserts the image
   at `path`, the rest of the line, in CD-ROM drive `drive` as the machine
   runs) and `mark <label>` (tags the next speed sample). `#` starts a comment. A `wait` that times out ends the run.
 - **Paced:** the machine runs in real time, so the log shows what the window
