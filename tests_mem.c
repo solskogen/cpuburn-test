@@ -174,11 +174,93 @@ static u32 mem_cache_ctl(void) {
     return cache_page[128];
 }
 
+#define MEM_NOINLINE __attribute__((noinline))
+
+/* An integer and call loop over a small buffer, as firmware runs it: the
+   CPU's caches off (CR0.CD set, NW clear, as an Award BIOS's setup screen
+   runs). Checked against the same loop with the caches on. */
+static MEM_NOINLINE u32 uncached_step(u32 *buf, u32 v) {
+    u32 i = v & 63;
+    buf[i] = buf[i] * 3 + v;
+    return v ^ (buf[(i + 17) & 63] << 1);
+}
+static MEM_NOINLINE u32 uncached_loop(u32 *buf, u32 n) {
+    u32 v = 0x6a09e667u;
+    for (u32 i = 0; i < 64; i++) buf[i] = i * 0x9E3779B1u;
+    for (u32 i = 0; i < n; i++) {
+        v = uncached_step(buf, v + i);
+        if (v & 1) v = (v >> 1) ^ 0xedb88320u; else v >>= 1;
+    }
+    return v ^ buf[v & 63];
+}
+static u32 mem_cache_off_loop(void) {
+    u32 *buf = arena_alloc(64 * 4, 64); if (!buf) SKIP("arena too small");
+    const u32 n = 20000;
+    u32 ref = uncached_loop(buf, n);
+    u32 cr0 = rd_cr0();
+    wr_cr0((cr0 | 0x40000000u) & ~0x20000000u);
+    u32 got = uncached_loop(buf, n);
+    u32 during = rd_cr0();
+    wr_cr0(cr0);
+    CHECK_EQ(during & 0x60000000u, 0x40000000u);
+    CHECK_EQ(got, ref);
+    t_ops(n * 12);
+    return got;
+}
+
+/* A boot loader's console, as NTLDR's menu redraws it while it waits: a line
+   printed one character at a time into text-mode memory through a print
+   routine and a cursor routine, each on a page of its own, the cursor's
+   address worked out with an IMUL. Written to the text screen's second page,
+   which is not shown, and read back. */
+static volatile u8 *text_at;
+static u32 text_base, text_row, text_col;
+static MEM_NOINLINE __attribute__((aligned(4096))) void text_set_cursor(u32 row, u32 col) {
+    u32 a;
+    if (row > 24) row = 24;
+    if (col > 79) col = 79;
+    __asm__ volatile("imul $80,%1,%0" : "=r"(a) : "r"(row));
+    text_at  = (volatile u8 *)(text_base + (a + col) * 2);
+    text_row = row;
+    text_col = col;
+}
+static MEM_NOINLINE __attribute__((aligned(4096))) void text_print_char(u8 c, u8 attr) {
+    if (c == '\n') {
+        text_set_cursor(text_row + 1, 0);
+        return;
+    }
+    text_at[0] = c;
+    text_at[1] = attr;
+    text_set_cursor(text_row, text_col + 1);
+}
+static u32 mem_text_print(void) {
+    static const char line[] = "Seconds until highlighted choice will be started automatically: 30";
+    const u32 len = sizeof(line) - 1, passes = 400;
+    u32 sum = 0;
+    if (bda_read16(0x63) == 0x3B4) SKIP("monochrome adapter: no second text page");
+    text_base = 0xB9000;
+    for (u32 p = 0; p < passes; p++) {
+        text_set_cursor(p % 25, 0);
+        for (u32 i = 0; i < len; i++) text_print_char((u8) line[i], (u8) (0x07 + (p & 7)));
+        text_print_char('\n', 0x07);
+        sum = csum_mix(sum, text_row * 80 + text_col);
+    }
+    volatile u8 *row = (volatile u8 *)(text_base + ((passes - 1) % 25) * 160);
+    for (u32 i = 0; i < len; i++) {
+        CHECK_EQ(row[i * 2], (u8) line[i]);
+        CHECK_EQ(row[i * 2 + 1], (u8) (0x07 + ((passes - 1) & 7)));
+    }
+    t_ops(passes * (len + 1));
+    return sum ^ row[0];
+}
+
 const test_t tests_mem[] = {
     {"mem_walk", mem_walk, REQ_PAGING},
     {"mem_bandwidth", mem_bandwidth, REQ_PAGING},
     {"mem_unaligned", mem_unaligned, REQ_PAGING},
     {"mem_lock", mem_lock, REQ_PAGING | REQ_486},
     {"mem_cache_ctl", mem_cache_ctl, REQ_PAGING | REQ_486 | REQ_NOHV},
+    {"mem_cache_off_loop", mem_cache_off_loop, REQ_486 | REQ_NOHV},
+    {"mem_text_print", mem_text_print, REQ_PAGING},
     {0, 0, 0}
 };
