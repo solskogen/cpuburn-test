@@ -218,9 +218,9 @@ rearms and checks 1,024 deliveries. Actual periodic count varies with timing.
 
 ## Inventory and reading the tables
 
-This inventory contains **333 registered records** in the default source
+This inventory contains **335 registered records** in the default source
 registries, including `cpu_model_contract` and the core recovery test. It is an
-inventory, not a promise that all 333 execute on a particular machine. `ONLY`
+inventory, not a promise that all 335 execute on a particular machine. `ONLY`
 filters names (the contract is always selected), feature requirements and
 runtime preconditions can skip records, and `burn_mixed` runs only in the final
 round.
@@ -229,8 +229,9 @@ round.
 benchmark-sampled (they report `mode=accuracy` in benchmark builds) and
 `make SUITE=benchmark` leaves them out (`FILTER ... reason=suite_selection`).
 They are `fdiv_v1`–`fdiv_v14` in all four rounding modes, whose normal
-operands take the same FDIV path as `fdiv_v0`, and the `cs_*` platform
-records, which mostly wait on PIT/RTC edges. The tables below name every record; group descriptions apply to every
+operands take the same FDIV path as `fdiv_v0`, the `cs_*` platform
+records, which mostly wait on PIT/RTC edges, and `int_cf_consumers`, a
+check of carry-flag consumers. The tables below name every record; group descriptions apply to every
 name in that group. See [CPU contracts](cpu-contracts.md) for the distinction
 between model expectations, claimed/probed features and exercised evidence.
 
@@ -273,6 +274,8 @@ coverage unless explicitly qualified.
 | `int_divide_state` | 486 | 3,072 #DE cases for zero divisor and quotient overflow, checking fault EIP and registers, not undefined flags. |
 | `int_alu` | 486 | Deterministic 8/16/32-bit ALU results, conversions and carry chains against references; `ops` is an aggregate count. Separate records check flags. |
 | `int_adc_shift_loop` | 486 | DX:AX and EDX:EAX shifted left 1-15 bits at a time by ADD/ADC loops, as Windows 98's 16-bit bit-stream reader does; 8,192 rounds of 32 shifts against a 64-bit reference. |
+| `int_adc_carry_incdec` | 486 | ADC and SBB at 8, 16 and 32 bits with the carry in set or clear, each followed by DEC or INC (which keep CF) and SETC; edge operands mixed in, against a 64-bit reference. |
+| `int_cf_consumers` | 486 | Check-only. CF read by SETC, JC and ADC right after logic ops, INC/DEC, rotates and shifts by constant counts (some past the width) and 8/16-bit ADC/SBB with the carry in set or clear, each against PUSHF after the same instruction. |
 | `int_far_ptr_copy` | 486 | Byte copies through far pointers: per byte LES of both pointers and ES reloaded from memory, six segment loads a byte, as Windows 98's 16-bit decompressor; 256 copies of 1-4 KiB checked. |
 | `int_sha1` | 486 | SHA-1 with Windows 98's own message-schedule loops (byte swap, expansion two words a pass); the "abc" digest and a 256 KiB buffer against a C schedule. |
 | `int_bn_muladd` | 486 | Bignum multiply-accumulate and multiply-subtract rows (MUL, ADD, ADC $0, four words a pass) as RSA signature checks run them; 512 1024-bit products against a 64-bit reference. |

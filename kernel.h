@@ -83,6 +83,7 @@ extern const test_t tests_fp_edges[], tests_sweeps[];
  * are left out of SUITE=benchmark builds (kmain runs them, and tests_chipset,
  * with run_checks). */
 extern const test_t tests_fp_edges_check[];
+extern const test_t tests_int_check[];
 extern const test_t tests_priority[];
 extern const test_t tests_restart_complex[];
 extern const test_t tests_vendor[];

@@ -1117,6 +1117,7 @@ void kmain(void) {
         run_tests(tests_cpu_contract);
         run_tests(tests_core);
         run_tests(tests_int);
+        run_checks(tests_int_check);
         run_tests(tests_corpus);
         run_tests(tests_fpu);
         run_tests(tests_fp_edges);
