@@ -283,7 +283,7 @@ static volatile u64 sc_old_efer, sc_old_star;
 static volatile u32 sc_rc, sc_disabled_rc;
 static volatile u32 sc_entry_cs, sc_entry_ss, sc_entry_flags, sc_entry_sp;
 static volatile u32 sc_exit_cs, sc_exit_ss, sc_exit_flags, sc_exit_sp;
-static volatile u32 sc_return_pc, sc_wanted_pc, sc_enter_sp, sc_marker;
+static volatile u32 sc_return_pc, sc_wanted_pc, sc_enter_sp, sc_marker, sc_pre_flags;
 static u8 *sc_stack;
 
 __attribute__((naked)) static void pm_r3_syscall(void) {
@@ -291,6 +291,8 @@ __attribute__((naked)) static void pm_r3_syscall(void) {
         "movl %esp,sc_enter_sp\n\t"
         "movl $1f,sc_wanted_pc\n\t"
         "movl $0x519ac83d,%edx\n\t"
+        "pushfl\n\t"
+        "popl sc_pre_flags\n\t"
         "syscall\n"
         "1: movw %cs,%ax\n\t"
         "movzwl %ax,%eax\n\t"
@@ -334,7 +336,10 @@ static void sc_body(void) {
     wrmsr(0xc0000080u, sc_old_efer & ~1ull);
     sc_disabled_rc = ring3_call(pm_r3_syscall, (u32)sc_stack + 4096);
     wrmsr(0xc0000080u, sc_old_efer | 1);
+    /* Enter ring 3 with IF=1 so the entry check sees SYSCALL clear it. */
+    g_r3_eflags = 0x202;
     sc_rc = ring3_call(pm_r3_syscall, (u32)sc_stack + 4096);
+    g_r3_eflags = 0x2;
 }
 static u32 pm_syscall(void) {
     sc_stack = arena_alloc(4096, 16);
@@ -347,7 +352,7 @@ static u32 pm_syscall(void) {
     sc_rc = sc_disabled_rc = ~0u;
     sc_entry_cs = sc_entry_ss = sc_entry_flags = sc_entry_sp = 0;
     sc_exit_cs = sc_exit_ss = sc_exit_flags = sc_exit_sp = 0;
-    sc_return_pc = sc_wanted_pc = sc_enter_sp = sc_marker = 0;
+    sc_return_pc = sc_wanted_pc = sc_enter_sp = sc_marker = sc_pre_flags = 0;
     rc = guard_call(sc_body);
     CHECK_EQ(guard_call(sc_restore_star), 0);
     CHECK_EQ(guard_call(sc_restore_efer), 0);
@@ -356,6 +361,7 @@ static u32 pm_syscall(void) {
     CHECK_EQ(sc_rc, GUARD_R3_INT80);
     CHECK_EQ(sc_entry_cs, SEL_KCODE);
     CHECK_EQ(sc_entry_ss, SEL_KDATA);
+    CHECK_EQ(sc_pre_flags & 0x200, 0x200);
     CHECK_EQ(sc_entry_flags & 0x20200, 0);
     CHECK_EQ(sc_entry_sp, sc_enter_sp);
     CHECK_EQ(sc_exit_cs, SEL_UCODE);
@@ -457,6 +463,9 @@ __asm__(
 static void pm_prepare_task(u32 nested) {
     kmemset(&tss_b, 0, sizeof tss_b);
     tss_b.cr3 = rd_cr3();
+    /* The CPU does not save CR3 into the outgoing TSS, so the switch back to
+     * TSS_MAIN loads whatever is here; keep it the current CR3. */
+    tss_main.cr3 = tss_b.cr3;
     tss_b.eip = (u32)pm_task_entry;
     tss_b.eflags = 2;
     tss_b.esp = pm_task_stack;

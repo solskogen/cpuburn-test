@@ -278,6 +278,58 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(sum(c.startswith("serial write ") for c in commands), 1)
             self.assertTrue((run_dir / "result.json").is_file())
 
+    def fake_run(self, args, chunks, process):
+        """Run execute() against scripted serial chunks; return (result, commands)."""
+        commands = []
+        state = {"ms": 0, "serial": 0}
+
+        def request(command, allow_failure=False):
+            commands.append(command)
+            if command.startswith("step "):
+                state["ms"] += int(command.split()[1])
+                return {"ok": True, "ms": state["ms"]}
+            if command.startswith("serial read "):
+                index = state["serial"]
+                state["serial"] += 1
+                data = (chunks[index] if index < len(chunks) else "").encode()
+                return {"ok": True, "data": data.hex(), "next": state["serial"]}
+            return {"ok": True}
+
+        api = Mock()
+        api.request.side_effect = request
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory, \
+                patch("run_86box.subprocess.Popen", return_value=process), \
+                patch("run_86box.socket.socket", return_value=Mock()), \
+                patch("run_86box.Automation", return_value=api), \
+                patch("run_86box.stop_process"), \
+                patch("run_86box.host_metadata", return_value={"architecture": "test"}), \
+                patch("run_86box.process_cpu_seconds", return_value=0):
+            return execute(args, Path(directory), ["86Box"], {}), commands
+
+    def test_accuracy_expect_without_done_is_not_pass(self):
+        args = SimpleNamespace(wall_seconds=10, emulated_ms=1000, step_ms=250,
+                               expect=["SUMMARY"], reject=["FATAL"], label="", key=[],
+                               bios_f1=False, accuracy=True)
+        process = Mock(pid=42)
+        process.poll.return_value = None
+        result, _ = self.fake_run(
+            args, ["TEST r=1 name=heavy status=FAIL\n"
+                   "SUMMARY tests=1 pass=0 fail=1 skip=0 fault=0\n"], process)
+        self.assertIn("SUMMARY", result["matched"])
+        self.assertFalse(result["done"])
+        self.assertEqual(result["status"], "timeout")
+
+    def test_quit_waits_for_emulator_before_signalling(self):
+        args = SimpleNamespace(wall_seconds=10, emulated_ms=10000, step_ms=250,
+                               expect=[], reject=["FATAL"], label="", key=[], bios_f1=False)
+        process = Mock(pid=42)
+        process.poll.return_value = None
+        result, commands = self.fake_run(
+            args, ["SUMMARY tests=0 pass=0 fail=0 skip=0 fault=0\nDONE\n"], process)
+        self.assertIn("quit", commands)
+        process.wait.assert_any_call(timeout=30)
+        self.assertNotIn("quit_note", result)
+
     def test_defaults_and_mmx_233_and_pii(self):
         with patch("sys.argv", ["run_86box.py", "--profile", "mmx"]):
             args = arguments()

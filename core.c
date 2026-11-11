@@ -10,8 +10,6 @@ int kmemcmp(const void *a, const void *b, u32 n) {
     return 0;
 }
 static u32 kstrlen(const char *s) { u32 n = 0; while (s[n]) n++; return n; }
-static int kstreq(const char *a, const char *b) { while (*a && *a == *b) { a++; b++; } return *a == *b; }
-
 /* ============================ output ============================ */
 static int ser_ok, ser_fail;
 enum { NOTE_CAPACITY = 32768 };
@@ -134,9 +132,30 @@ extern u32 g_guard;
 extern void df_task_entry(void);
 extern void ring3_tramp(void);
 u32 g_r3_entry, g_r3_stack;
+u32 g_r3_eflags = 0x2;
 static volatile int g_expect_vec = -1;
 static volatile u32 g_skip;
 static volatile u32 g_wd_deadline;
+/* Watchdog scope: g_guard when the deadline was armed. A first timeout
+ * unwinds the innermost guard frame, so the code that installed it can clean
+ * up, and re-arms g_wd_grace ticks; a second timeout abandons the whole scope
+ * by unwinding to the frame directly inside g_wd_parent. Any timeout is
+ * counted in g_wd_fired so the scope owner can report it. */
+static volatile u32 g_wd_parent, g_wd_fired;
+static volatile u32 g_wd_grace = 200;
+extern void guard_unwind(u32 frame, u32 code) __attribute__((noreturn));
+
+static void wd_arm(u32 ticks) {
+    u32 deadline = pit_ticks + ticks;
+    g_wd_deadline = deadline ? deadline : 1;
+}
+
+/* Outermost frame of the armed scope, or 0 if execution is outside it. */
+static u32 wd_scope_frame(void) {
+    for (u32 f = g_guard; f; f = *(volatile u32 *)f)
+        if (*(volatile u32 *)f == g_wd_parent) return f;
+    return 0;
+}
 static u32 g_cr0_base, g_cr4_base;
 static int cr4_ok;
 u32 g_round;
@@ -248,11 +267,6 @@ u64 stamp(void) {
     return (u64)t1 * 11932 + (11932 - c);
 }
 
-void delay_ms(u32 ms) {
-    u32 target = ms_now() + ms + 10;
-    while ((s32)(ms_now() - target) < 0) hlt();
-}
-
 /* ============================ exceptions ============================ */
 void exc_expect(int vec, u32 skip) { g_expect_vec = vec; g_skip = skip; }
 void exc_expect_clear(void) { g_expect_vec = -1; g_skip = 0; }
@@ -287,9 +301,16 @@ static void irq_dispatch(regs_t *r) {
     if (int_hook[r->vec]) int_hook[r->vec](r);
     if (irq >= 8) outb(0xA0, 0x20);
     outb(0x20, 0x20);
-    if (irq == 0 && g_wd_deadline && (s32)(pit_ticks - g_wd_deadline) >= 0 && g_guard) {
-        g_wd_deadline = 0;
-        guard_recover(GUARD_WATCHDOG);
+    if (irq == 0 && g_wd_deadline && (s32)(pit_ticks - g_wd_deadline) >= 0) {
+        u32 scope = wd_scope_frame();
+        if (scope) {
+            if (g_wd_fired++) {
+                g_wd_deadline = 0;
+                guard_unwind(scope, GUARD_WATCHDOG);
+            }
+            wd_arm(g_wd_grace);
+            guard_recover(GUARD_WATCHDOG);
+        }
     }
 }
 
@@ -326,6 +347,19 @@ void *arena_alloc(u32 size, u32 align) {
     if (p + size > arena_end || p + size < p) return NULL;
     arena_ptr = p + size;
     return (void *)p;
+}
+
+int e820_claims(u32 base, u32 len) {
+    u32 n = bootinfo[5];
+    if (n > 32) n = 32;
+    u64 end = (u64)base + len;
+    for (u32 i = 0; i < n; i++) {
+        const u32 *e = &bootinfo[8 + i * 6];
+        if (!(e[5] & 1)) continue;
+        u64 rb = ((u64)e[1] << 32) | e[0], re = rb + (((u64)e[3] << 32) | e[2]);
+        if (rb < end && re > base) return 1;
+    }
+    return 0;
 }
 
 static void mem_init(void) {
@@ -706,17 +740,29 @@ static const char *missing_req(u32 req) {
 
 static void restore_state(void) {
     /* An IRQ return reloads segment selectors, so retire scratch selectors
-     * before invalidating their descriptors, with interrupts masked. */
+     * before invalidating their descriptors, with interrupts masked. A test
+     * that faulted or timed out may also have left its own GDTR/IDTR, LDTR or
+     * TR loaded, so reload the kernel's tables and selectors first. */
     cli();
-    __asm__ volatile("mov %0,%%ax; mov %%ax,%%ds; mov %%ax,%%es; mov %%ax,%%fs; mov %%ax,%%gs; mov %%ax,%%ss" ::"i"(SEL_KDATA) : "eax", "memory");
+    load_tables();
     for (int i = 0; i < 256; i++) int_hook[i] = 0;
     exc_expect_clear();
     g_wd_deadline = 0;
+    g_r3_eflags = 0x2;
     idt_init();
     for (int i = GDT_SCRATCH_FIRST; i < GDT_ENTRIES; i++) gdt[i] = 0;
-    wr_cr0(g_cr0_base);
+    __asm__ volatile("lldt %w0" ::"r"(0) : "memory");
+    gdt[6] &= ~(1ull << 41); /* task B may have been left busy */
+    ltr_main();
+    /* Leave paging before changing CR4 (PAE/PSE) or CR3, so no fetch walks a
+     * half-restored paging mode; then reapply the baseline CR0 (with PG if the
+     * kernel's paging is on). */
+    wr_cr0(rd_cr0() & ~0x80000000u);
+    __asm__ volatile("jmp 1f\n1:" ::: "memory");
     if (cr4_ok) wr_cr4(g_cr4_base);
     if (paging_on && pg_dir) wr_cr3((u32)pg_dir);
+    wr_cr0(g_cr0_base);
+    __asm__ volatile("jmp 1f\n1:" ::: "memory");
     if (cpu.has_fpu) __asm__ volatile("fninit");
     sti();
 }
@@ -769,9 +815,13 @@ static void poll_lease(u32 id) {
 #ifndef ONLY
 #define ONLY ""
 #endif
-/* ONLY is a comma-separated list of exact test names; empty runs every test. */
+/* ONLY is a comma-separated list of exact test names; empty runs every test.
+ * Kept in an array rather than a string literal: the linker may otherwise
+ * store the last test name as the tail of this string, and the Makefile's
+ * ONLY check, which looks for each name as a whole string, would miss it. */
+static const char only_tests[] = ONLY;
 static int selected(const char *name) {
-    const char *p = ONLY;
+    const char *p = only_tests;
     if (!*p) return 1;
     while (*p) {
         const char *n = name;
@@ -835,13 +885,17 @@ static void run_tests(const test_t *t) {
             g_ops = 0; g_nfail = 0; g_sum = 0;
             g_fail_what = NULL; g_skip_reason = NULL;
             sti();
-            g_wd_deadline = pit_ticks + WATCHDOG_SECONDS * 100;
+            g_wd_parent = g_guard;
+            g_wd_fired = 0;
+            wd_arm(WATCHDOG_SECONDS * 100);
             m0 = ms_now();
             c0 = stamp();
             rc = (u32)guard_call(test_tramp);
             c1 = stamp();
             m1 = ms_now();
             g_wd_deadline = 0;
+            /* A timeout the test absorbed in a nested guard still faults it. */
+            if (g_wd_fired) rc = GUARD_WATCHDOG;
             e_vec = g_exc.vec; e_err = g_exc.err; e_eip = g_exc.eip; e_cr2 = g_exc.cr2;
             note_capture = 0;
             restore_state();
@@ -923,17 +977,35 @@ static void run_tests(const test_t *t) {
 
 static void core_ud_probe(void) { __asm__ volatile("ud2"); }
 static void core_watchdog_probe(void) { for (;;) { sti(); hlt(); } }
+static volatile u32 core_wd_inner_rc;
+/* Absorbs a nested timeout and then hangs again: the second timeout must
+ * unwind this frame, not the inner one again. */
+static void core_watchdog_nested_probe(void) {
+    core_wd_inner_rc = (u32)guard_call(core_watchdog_probe);
+    core_watchdog_probe();
+}
 
 static u32 core_recovery_test(void) {
     CHECK_EQ(guard_call(core_ud_probe), GUARD_EXC(6));
     CHECK_EQ(g_exc.vec, 6);
-    u32 deadline = g_wd_deadline;
-    g_wd_deadline = pit_ticks + 2;
+    u32 deadline = g_wd_deadline, parent = g_wd_parent, fired = g_wd_fired, grace = g_wd_grace;
+    g_wd_parent = g_guard;
+    g_wd_grace = 2;
+    g_wd_fired = 0;
+    wd_arm(2);
     CHECK_EQ(guard_call(core_watchdog_probe), GUARD_WATCHDOG);
-    g_wd_deadline = deadline;
+    CHECK_EQ(g_wd_fired, 1);
+    g_wd_fired = 0;
+    core_wd_inner_rc = 0;
+    wd_arm(2);
+    CHECK_EQ(guard_call(core_watchdog_nested_probe), GUARD_WATCHDOG);
+    CHECK_EQ(core_wd_inner_rc, GUARD_WATCHDOG);
+    CHECK_EQ(g_wd_fired, 2);
+    CHECK_EQ(g_wd_deadline, 0);
+    g_wd_deadline = deadline; g_wd_parent = parent; g_wd_fired = fired; g_wd_grace = grace;
     CHECK_EQ(guard_call(core_ud_probe), GUARD_EXC(6));
-    t_ops(3);
-    return 3;
+    t_ops(4);
+    return 4;
 }
 
 static const test_t tests_core[] = {
@@ -980,7 +1052,7 @@ void kmain(void) {
             ram_top, arena_base, arena_size, (u32)_kernel_start, (u32)_end);
     kprintf("CFG rounds=%u burn_seconds=%u watchdog_seconds=%u heavy_scale=%u seed=%08x test_seconds=%u protocol=work1 benchmarks=%u\n",
             ROUNDS, BURN_SECONDS, WATCHDOG_SECONDS, HEAVY_SCALE, (u32)TEST_SEED, TEST_SECONDS, BENCHMARKS);
-    if (*ONLY) kprintf("CFG only=%s\n", ONLY);
+    if (*only_tests) kprintf("CFG only=%s\n", only_tests);
 
     if (cpu.is386) kprintf("WARN 386 detected: unsupported, results may be unreliable\n");
 

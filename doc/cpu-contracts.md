@@ -213,7 +213,7 @@ The matrix defaults to accuracy mode. For sustained checked CPU benchmarks,
 build with `BENCHMARKS=1` and select `--mode benchmark`:
 
 ```sh
-make -B BENCHMARKS=1
+make BENCHMARKS=1
 python3 tools/cpu_matrix.py --source ../86Box --output build/cpu-benchmarks \
   --run --mode benchmark --family cx6x86mx
 ```
@@ -230,6 +230,8 @@ Omit family/engine selection to execute the generated matrix. `--rompath`
 selects an existing local ROM tree; firmware is never downloaded.
 `--wall-seconds` limits each configuration. Collection continues after guest
 failures or infrastructure failures, retaining per-row details in `results.json`.
+A completed row whose guest reported FAIL/FAULT has outcome `guest_failures`,
+in either mode, and makes the matrix exit nonzero.
 Output containing execution results is not overwritten.
 
 Missing ROMs, failed boots, unsupported machine prerequisites and host deadlines

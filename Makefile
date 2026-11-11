@@ -23,6 +23,9 @@ $(error BENCHMARKS must be 0 or 1)
 endif
 endif
 ONLY ?=
+# Output locations; guest-test uses separate ones so it leaves these alone.
+BUILD ?= build
+IMAGE ?= floppy.img
 VERSION := $(strip $(shell cat VERSION))
 
 IS_CLANG := $(shell $(CC) --version 2>/dev/null | grep -qi clang && echo 1)
@@ -59,61 +62,86 @@ CFLAGS  = $(TARGET_FLAGS) -march=i486 -mtune=i486 $(STACK_FLAGS) \
           -DCPUBURN_VERSION='"$(VERSION)"'
 # Per-file overrides: FPU/MMX test files need the FPU/MMX instruction sets enabled (inline asm only, no compiler FP code on 486 path).
 SRCS    = core.c arith.c cpu_contract.c $(sort $(wildcard tests_*.c))
-OBJS    = $(SRCS:%.c=build/%.o) build/start.o
+OBJS    = $(SRCS:%.c=$(BUILD)/%.o) $(BUILD)/start.o
 DIST    = dist/cpuburn-test-$(VERSION)
 SOURCES = $(sort .gitignore LICENSE VERSION README.md RELEASE_NOTES.md Makefile \
           $(wildcard *.c *.h *.asm *.ld tools/*.py doc/*.md .github/workflows/*))
 
-all: floppy.img
+all: $(IMAGE)
 
-build:
-	mkdir -p build
+$(BUILD):
+	mkdir -p $(BUILD)
 
-build/core.o: VERSION
-build/cpu_contract.o: cpu_models.h cpu_features.h
+# Records the tools and settings the image is built with. It is rewritten
+# only when they differ from the last build, so changing BENCHMARKS, ONLY,
+# ROUNDS, CC and so on rebuilds everything without needing `make -B`.
+CONFIG_TEXT = $(CC) $(CFLAGS) | $(NASM) | $(LD) | $(OBJCOPY) | $(NM)
+$(BUILD)/config.stamp: FORCE | $(BUILD)
+	@printf '%s\n' '$(subst ','\'',$(CONFIG_TEXT))' > $@.new; \
+	if cmp -s $@.new $@; then rm -f $@.new; else mv -f $@.new $@; fi
 
-build/%.o: %.c kernel.h Makefile | build
+$(BUILD)/core.o: VERSION
+$(BUILD)/cpu_contract.o: cpu_models.h cpu_features.h
+
+$(BUILD)/%.o: %.c kernel.h Makefile $(BUILD)/config.stamp | $(BUILD)
 	$(CC) $(CFLAGS) $(CFLAGS_$*) -c $< -o $@
 
-build/start.o: start.asm Makefile | build
+$(BUILD)/start.o: start.asm Makefile $(BUILD)/config.stamp | $(BUILD)
 	$(NASM) -f elf32 $< -o $@
 
-build/kernel.elf: link.ld $(OBJS)
-	$(LD) -m elf_i386 -T link.ld -Map build/kernel.map -o $@ $(OBJS)
+$(BUILD)/kernel.elf: link.ld $(OBJS)
+	$(LD) -m elf_i386 -T link.ld -Map $(BUILD)/kernel.map -o $@ $(OBJS)
 
 comma := ,
 # Every name in ONLY must be a test: each test's name is a whole string in the
 # kernel, so a misspelt one is an error rather than a test silently left out
-build/kernel.bin: build/kernel.elf
+$(BUILD)/kernel.bin: $(BUILD)/kernel.elf
 	$(OBJCOPY) -O binary $< $@
 	$(if $(ONLY),@bad=; for t in $(subst $(comma), ,$(ONLY)); do \
 	    tr '\0' '\n' < $@ | grep -qxF -- "$$t" || { echo "ONLY: no test named '$$t'" >&2; bad=1; }; \
 	done; test -z "$$bad")
 
-build/rm.bin: rm.asm boot_memory.asm build/kernel.elf build/kernel.bin Makefile | build
-	$(NASM) -f bin -DKERNEL_BYTES=$$(stat -c %s build/kernel.bin) \
-	    -DKERNEL_END=0x$$($(NM) -n build/kernel.elf | awk '$$3 == "_end" { print $$1 }') $< -o $@
+$(BUILD)/rm.bin: rm.asm boot_memory.asm $(BUILD)/kernel.elf $(BUILD)/kernel.bin Makefile | $(BUILD)
+	$(NASM) -f bin -DKERNEL_BYTES=$$(stat -c %s $(BUILD)/kernel.bin) \
+	    -DKERNEL_END=0x$$($(NM) -n $(BUILD)/kernel.elf | awk '$$3 == "_end" { print $$1 }') $< -o $@
 
-floppy.img: boot.asm build/rm.bin build/kernel.bin
-	@set -eu; bytes=$$(( $$(stat -c %s build/rm.bin) + $$(stat -c %s build/kernel.bin) )); \
+$(IMAGE): boot.asm $(BUILD)/rm.bin $(BUILD)/kernel.bin
+	@set -eu; bytes=$$(( $$(stat -c %s $(BUILD)/rm.bin) + $$(stat -c %s $(BUILD)/kernel.bin) )); \
 	secs=$$(( (bytes + 511) / 512 )); \
 	echo "stage2: $$bytes bytes, $$secs sectors"; \
 	test $$secs -le 768 || { echo "kernel too large for low-memory loader staging"; exit 1; }; \
-	$(NASM) -f bin -DSTAGE2_SECTORS=$$secs boot.asm -o build/boot.bin; \
-	cat build/boot.bin build/rm.bin build/kernel.bin > build/floppy.tmp; \
-	truncate -s 1474560 build/floppy.tmp; \
-	mv build/floppy.tmp $@
+	$(NASM) -f bin -DSTAGE2_SECTORS=$$secs boot.asm -o $(BUILD)/boot.bin; \
+	cat $(BUILD)/boot.bin $(BUILD)/rm.bin $(BUILD)/kernel.bin > $(BUILD)/floppy.tmp; \
+	truncate -s 1474560 $(BUILD)/floppy.tmp; \
+	mv $(BUILD)/floppy.tmp $@
 	@ls -l $@
 
-run-qemu: floppy.img
-	qemu-system-i386 -cpu $(or $(CPU),pentium2) -m 32 -drive file=floppy.img,format=raw,if=floppy,readonly=on -boot a -display none -serial stdio -debugcon file:build/e9.log -no-reboot
+run-qemu: $(IMAGE)
+	qemu-system-i386 -cpu $(or $(CPU),pentium2) -m 32 -drive file=$(IMAGE),format=raw,if=floppy,readonly=on -boot a -display none -serial stdio -debugcon file:$(BUILD)/e9.log -no-reboot
 
 test:
 	$(PYTHON) -m unittest discover -s tools -p 'test_*.py' -v
 
-release: floppy.img
+# Builds the three focused images the guest tests in tools/ document, in their
+# own build directories, and runs the whole suite under QEMU with them set.
+GUEST = $(BUILD)/guest
+guest-test:
+	$(MAKE) BUILD=$(GUEST)/contract IMAGE=$(GUEST)/contract.img \
+	    ONLY=int_partial_boundaries,mmx_alu,3dnow_float
+	$(MAKE) BUILD=$(GUEST)/extension IMAGE=$(GUEST)/extension.img \
+	    BENCHMARKS=0 ONLY=pm_syscall,mmx_extended
+	$(MAKE) BUILD=$(GUEST)/boot IMAGE=$(GUEST)/boot.img \
+	    BENCHMARKS=0 BURN_SECONDS=1 TEST_SECONDS=1 ONLY=
+	CPUBURN_CONTRACT_IMAGE=$(abspath $(GUEST)/contract.img) \
+	CPUBURN_EXTENSION_IMAGE=$(abspath $(GUEST)/extension.img) \
+	CPUBURN_BOOT_IMAGE=$(abspath $(GUEST)/boot.img) \
+	    $(PYTHON) -m unittest discover -s tools -p 'test_*.py' -v
+
+release: $(IMAGE)
+	rm -rf $(DIST)
 	mkdir -p $(DIST)
-	cp floppy.img LICENSE README.md RELEASE_NOTES.md $(DIST)/
+	cp $(IMAGE) $(DIST)/floppy.img
+	cp LICENSE README.md RELEASE_NOTES.md $(DIST)/
 	cp -r doc $(DIST)/
 	{ printf 'version=%s\nrounds=%s\nbenchmarks=%s\nburn_seconds=%s\ntest_seconds=%s\nheavy_scale=%s\nwatchdog_seconds=%s\nonly=%s\n' \
 	    '$(VERSION)' '$(ROUNDS)' '$(BENCHMARKS)' '$(BURN_SECONDS)' '$(TEST_SECONDS)' '$(HEAVY_SCALE)' '$(WATCHDOG_SECONDS)' '$(ONLY)'; \
@@ -128,4 +156,4 @@ clean:
 	rm -rf build floppy.img dist
 
 .DELETE_ON_ERROR:
-.PHONY: all clean run-qemu test release
+.PHONY: all clean run-qemu test guest-test release FORCE

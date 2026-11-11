@@ -1287,21 +1287,12 @@ static u32 int_smc_rate_op_k16_n48(void) { return smc_rate_op(16,48); }
 
 /* Patched code in the last usable RAM, where chipsets that remap the RAM
    behind 0xA0000-0xFFFFF to the top of memory put it. */
-static u32 int_smc_ram_top(void) {
-    if(!arena_size) SKIP("arena_smc_top");
-    u8 *page=(u8 *)(arena_end+0x8000);
-    /* The BIOS may not report the remapped RAM: use it if RAM answers just
-       above the reported top (below the 15M ISA hole). */
-    u32 top=ram_top&~0xfffu,above=0;
-    if(top>=0x100000 && top+0x4000<=0xf00000) {
-        volatile u32 *a=(volatile u32 *)top,*b=(volatile u32 *)(top+0x3ffc);
-        *a=0x5aa5c33c; *b=0xa55a3cc3;
-        if(*a==0x5aa5c33c && *b==0xa55a3cc3) { *a=~0x5aa5c33cu; if(*a==~0x5aa5c33cu) { page=(u8 *)top; above=1; } }
-    }
-    t_note("code=%08x above_reported_top=%u ram_top=%08x",(u32)page,above,ram_top);
+static u8 *smc_top_page;
+static u32 smc_top_sum;
+static void smc_top_body(void) {
     u32 sum=0,seed=0x70b5eed;
     for(unsigned k=0;k<4;k++) {
-        u8 *p=page+k*0x1000+(k*37&0xff);
+        u8 *p=smc_top_page+k*0x1000+(k*37&0xff);
         p[0]=0xb8; p[5]=0xc3;
         for(unsigned i=0;i<4096;i++) {
             u32 a=rng(&seed); put32(p+1,a); CHECK_EQ(exec_code(p),a);
@@ -1309,7 +1300,32 @@ static u32 int_smc_ram_top(void) {
             p[5]=0xc3; sum=csum_mix(sum,a);
         }
     }
-    t_ops(4*4096*2); return sum;
+    smc_top_sum=sum;
+}
+static u32 int_smc_ram_top(void) {
+    if(!arena_size) SKIP("arena_smc_top");
+    smc_top_page=(u8 *)(arena_end+0x8000);
+    /* The BIOS may not report the remapped RAM: use it if RAM answers just
+       above the reported top (below the 15M ISA hole). Only where no E820
+       record claims it, since firmware often puts ACPI tables/NVS directly
+       after usable RAM, and the original contents are put back afterwards. */
+    u32 top=ram_top&~0xfffu,above=0;
+    u8 *saved=0;
+    if(top>=0x100000 && top+0x4000<=0xf00000 && !e820_claims(top,0x4000)
+       && (saved=arena_alloc(0x4000,16))) {
+        kmemcpy(saved,(void *)top,0x4000);
+        volatile u32 *a=(volatile u32 *)top,*b=(volatile u32 *)(top+0x3ffc);
+        *a=0x5aa5c33c; *b=0xa55a3cc3;
+        if(*a==0x5aa5c33c && *b==0xa55a3cc3) { *a=~0x5aa5c33cu; if(*a==~0x5aa5c33cu) { smc_top_page=(u8 *)top; above=1; } }
+        if(!above) { kmemcpy((void *)top,saved,0x4000); saved=0; }
+    }
+    t_note("code=%08x above_reported_top=%u ram_top=%08x",(u32)smc_top_page,above,ram_top);
+    smc_top_sum=0;
+    u32 rc=(u32)guard_call(smc_top_body);
+    if(saved) kmemcpy((void *)top,saved,0x4000);
+    /* Report an unexpected fault as the test's FAULT, after restoring. */
+    if(rc) guard_recover(rc);
+    t_ops(4*4096*2); return smc_top_sum;
 }
 
 static volatile u32 debug_hits,debug_ip,debug_flags;
@@ -1344,10 +1360,12 @@ static u32 int_cpuid_cr(void) {
     shadow_hits=shadow_bad=shadow_marker=0;int_hook[0x20]=shadow_hook;
     start=pit_ticks;outb(0x20,0x0a);
     unsigned pending=0;
-    for(unsigned i=0;i<200000;i++) if(inb(0x20)&1) {pending=1;break;}
+    for(u32 i=0;i<10000000;i++) if(inb(0x20)&1) {pending=1;break;}
     u32 stopped=pit_ticks,disabled=rd_eflags();
     __asm__ volatile("sti; incl %0; cli; sti; hlt" : "+m"(shadow_marker)::"cc","memory");
     int_hook[0x20]=0;
+    /* Without a latched IRQ0 the STI below is not shadowing anything. */
+    CHECK(pending);
     CHECK_EQ(stopped,start);CHECK(!(disabled&0x200));CHECK_EQ(shadow_marker,1);CHECK_EQ(shadow_bad,0);CHECK(shadow_hits>0);
     t_note("sti_shadow pending=%u irq_hits=%u return_eip=%08x",pending,shadow_hits,shadow_ip);
     if(cpu.has_cpuid) {

@@ -2,8 +2,7 @@
 bits 32
 
 extern kmain, c_isr, __bss_start, _end, df_handler_c, tss_main_esp_init
-global _start, guard_call, guard_recover, ring3_call_asm, isr_stub, g_guard, df_task_entry
-global load_gdt_idt
+global _start, guard_call, guard_recover, guard_unwind, isr_stub, g_guard, df_task_entry
 
 section .text.start
 _start:
@@ -45,16 +44,29 @@ guard_ret:
     pop ebp
     ret
 
-; void guard_recover(u32 code)  -- never returns
+; void guard_unwind(u32 frame, u32 code)  -- never returns
+; Unwind to a specific frame on the active guard chain, discarding the frames
+; nested inside it; that guard_call returns 'code'.
+guard_unwind:
+    mov eax, [esp + 8]
+    mov edx, [esp + 4]
+    jmp guard_unwind_to
+
+; void guard_recover(u32 code)  -- never returns; unwinds the innermost frame
 guard_recover:
     mov eax, [esp + 4]
+    xor edx, edx
+guard_unwind_to:
     mov cx, 0x10
     mov ds, cx
     mov es, cx
     mov fs, cx
     mov gs, cx
     mov ss, cx
+    test edx, edx
+    jnz .frame
     mov edx, [g_guard]
+.frame:
     test edx, edx
     jz .nog
     mov esp, edx
@@ -65,9 +77,9 @@ guard_recover:
     hlt
     jmp .nog
 
-; int ring3_call_asm(entry, stack_top) : called inside a guard frame by C wrapper (see ring3_tramp)
+; ring3_tramp: run inside a guard frame by ring3_call() in core.c; never returns here
 global ring3_tramp
-extern g_r3_entry, g_r3_stack
+extern g_r3_entry, g_r3_stack, g_r3_eflags
 ring3_tramp:
     mov ax, 0x23
     mov ds, ax
@@ -76,11 +88,10 @@ ring3_tramp:
     mov gs, ax
     push dword 0x23           ; ss
     push dword [g_r3_stack]   ; esp
-    push dword 0x2            ; eflags (IF=0, IOPL=0)
+    push dword [g_r3_eflags]  ; eflags (default 0x2: IF=0, IOPL=0)
     push dword 0x1B           ; cs
     push dword [g_r3_entry]   ; eip
     iretd
-ring3_call_asm: ret
 
 ; ---- ISR stubs: one per vector 0..255 ----
 %macro STUB 1

@@ -39,7 +39,12 @@ entry:
     cld
     mov [drive], dl
 
-    ; fetch geometry (ignore failures, keep BPB defaults)
+    ; A floppy keeps the BPB geometry: the image is always 1.44M, while
+    ; AH=08 reports the drive type's maximum (36 sectors for a 2.88M drive).
+    ; Only a BIOS presenting the image as a hard disk gets its geometry
+    ; queried (ignore failures, keep BPB defaults).
+    test dl, 0x80
+    jz .nogeo
     mov ah, 0x08
     xor di, di
     int 0x13
@@ -50,8 +55,8 @@ entry:
     xor ah, ah
     mov [spt], ax
     mov al, dh
-    inc al
     xor ah, ah
+    inc ax                           ; DH=0xFF means 256 heads
     mov [heads], ax
 .nogeo:
     mov dl, [drive]

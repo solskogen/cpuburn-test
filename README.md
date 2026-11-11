@@ -22,10 +22,10 @@ Version **0.1.0 preview**. Licensed under [MIT](LICENSE).
   configuration and host conditions consistent when comparing builds.
   `python tools/perf_report.py serial.log --output report.json` summarizes
   a complete log; users decide how to assess regressions.
-- **Shorter runs:** `make clean && make BURN_SECONDS=1 TEST_SECONDS=1` keeps the selected
+- **Shorter runs:** `make BURN_SECONDS=1 TEST_SECONDS=1` keeps the selected
   test cases but reduces repetition/stress and timing confidence. Defaults
   are 10 and 5 guest seconds; invocations are never cut short.
-- **Correctness only:** `make -B BENCHMARKS=0` removes timed harness repetition,
+- **Correctness only:** `make BENCHMARKS=0` removes timed harness repetition,
   not test cases or assertions. See [accuracy-only builds](#accuracy-only-builds).
 
 ## Usage
@@ -33,18 +33,14 @@ Version **0.1.0 preview**. Licensed under [MIT](LICENSE).
 ### Choose what to build
 
 ```sh
-make                         # initial build; benchmarks enabled by default
-make -B BENCHMARKS=0          # force rebuild without benchmark sampling
-make -B BENCHMARKS=1          # force rebuild with benchmark sampling
+make                         # default build; benchmarks enabled
+make BENCHMARKS=0            # accuracy only, without benchmark sampling
 ```
 
-**Keep `-B` when switching settings.** Make tracks file timestamps, not
-changes to command-line variables. Once an image exists, `make BENCHMARKS=0`
-or `make BENCHMARKS=1` alone may say "Nothing to be done" and leave the
-existing image unchanged. Plain `make` does not restore defaults in an
-already-built image either. Use `make -B` to rebuild with defaults, or
-`make -B BENCHMARKS=0` for accuracy only. Unlike `make clean`, `-B` preserves
-saved run results under `build/`.
+Settings are not sticky: each `make` builds the image for the variables on
+that command line, and plain `make` goes back to the defaults. The Makefile
+records the compiler, flags and settings in `build/config.stamp` and rebuilds
+whenever they change, so `-B` and `make clean` are not needed when switching.
 
 The accuracy-only build keeps the same selected workloads, vectors, scale and
 assertions. Each eligible workload normally runs a checked warm-up and one
@@ -72,7 +68,7 @@ is set, otherwise X with `DISPLAY`); without either, it runs with Qt's
 offscreen platform, with no window:
 
 ```sh
-make -B BENCHMARKS=1
+make BENCHMARKS=1
 python3 tools/run_86box.py --vm "/path/to/My VM"
 ```
 
@@ -106,10 +102,15 @@ Nothing is copied: the VM uses its own NVRAM, disks, devices and relative paths.
 The runner temporarily inserts the test image in drive A: (write-protected),
 enables COM1 capture and applies any explicit CPU/RAM/FPU overrides. After
 86Box exits, the original configuration is restored byte-for-byte, including
-the previous floppy and COM1 settings, also on ordinary errors or Ctrl+C.
-NVRAM and disks remain live and can be updated by firmware or the guest;
-they are **not** rolled back. Abrupt termination such as SIGKILL or a host
-power failure cannot guarantee configuration restoration.
+the previous floppy and COM1 settings, also on ordinary errors, Ctrl+C,
+SIGTERM or SIGHUP (closed terminal or dropped SSH session). The runner asks
+86Box to quit and waits for it, so firmware can save NVRAM, before it stops
+the process. NVRAM and disks remain live and can be updated by firmware or the
+guest; they are **not** rolled back. Before changing anything the runner saves
+the original as `86box.cfg.cpuburn-backup` next to it and deletes that file
+once the restore is written. If SIGKILL or a power failure prevents the
+restore, the backup remains and the next run refuses to start until you move
+it back over the configuration or delete it.
 Ensure the BIOS boots drive A:, not your installed OS. Inspect `screen.log`
 or `screen.png` if boot stalls.
 Use `--rompath /path/to/roms` for firmware outside standard locations.
@@ -331,7 +332,9 @@ incomplete runs, not architectural failures. Fast-forward and host emulation
 capacity do not determine architectural verdicts. The performance report
 retains these correctness outcomes but does not treat them as benchmark samples.
 With a benchmark-enabled image, sustained benchmarking remains the default
-unless `--accuracy` is selected.
+unless `--accuracy` is selected. Benchmark runs that reach DONE keep status
+`observed` and all their timing data, but also exit nonzero when the guest
+reported FAIL/FAULT.
 
 ### Accuracy-only builds
 
@@ -345,8 +348,7 @@ their intrinsic stress durations are not removed. Warmup and one checked
 invocation still run unless a fault or skip prevents completion, but their
 times are diagnostic data, not benchmark samples. `ROUNDS`, `ONLY`,
 `HEAVY_SCALE`, `BURN_SECONDS` and watchdog behavior still apply.
-BUILD/CFG records and release BUILD.txt identify the setting. Use `-B` when
-changing it, just as for the other Makefile build settings.
+BUILD/CFG records and release BUILD.txt identify the setting.
 
 ### Model coverage and matrices
 
@@ -397,12 +399,13 @@ feature bit and an incorrect expected model. These check the test harness,
 not whether QEMU is an accuracy oracle for 86Box:
 
 ```sh
-make -B ONLY=int_partial_boundaries,mmx_alu,3dnow_float
-CPUBURN_CONTRACT_IMAGE="$PWD/floppy.img" python3 -m unittest discover -s tools -p test_cpu_contract.py
-make -B BENCHMARKS=0 ONLY=pm_syscall,mmx_extended
-CPUBURN_EXTENSION_IMAGE="$PWD/floppy.img" python3 -m unittest discover -s tools -p test_cpu_contract.py
-make -B # restore the complete default image after focused validation
+make guest-test
 ```
+
+`make guest-test` builds the focused contract and extension images and a
+shortened full accuracy image under `build/guest/`, leaving `floppy.img` and
+`build/` untouched, then runs every host test with them, including the
+otherwise skipped QEMU guest tests. It needs `qemu-system-i386`.
 
 ## Build and boot
 
@@ -419,7 +422,7 @@ source with the same i486 instruction baseline.
 
 ```sh
 make
-make clean && make CC=clang
+make CC=clang
 make run-qemu CPU=pentium2
 ```
 
@@ -453,9 +456,8 @@ an aarch64-targeting GCC: the **host** may be aarch64, but the **output**
 must remain 32-bit i486-compatible x86. Building and running the image are
 separate: the image still boots inside an x86 PC emulated by 86Box on either host.
 
-Force a rebuild with `make -B` when changing compilers, flags or test settings
-(or clean first, noting that `make clean` also removes `build/` results and
-`dist/`). Make tracks file dependencies, not command-line changes.
+Changing compilers, flags or test settings rebuilds automatically through
+`build/config.stamp`; `make clean` also removes `build/` results and `dist/`.
 Compilation, linking,
 image creation and packaging are direct Makefile recipes, without helper
 scripts or generated provenance headers. `VERSION` supplies the guest version;
@@ -536,12 +538,12 @@ and end automatically.
 Clean-rebuild when changing settings, for example:
 
 ```sh
-make clean && make ROUNDS=1 BURN_SECONDS=5 WATCHDOG_SECONDS=90
-make clean && make ROUNDS=4 HEAVY_SCALE=8 BURN_SECONDS=20
+make ROUNDS=1 BURN_SECONDS=5 WATCHDOG_SECONDS=90
+make ROUNDS=4 HEAVY_SCALE=8 BURN_SECONDS=20
 # Shorter validation build; identical algorithm and checks, less sampling time:
-make clean && make ROUNDS=1 BURN_SECONDS=1 TEST_SECONDS=1
+make ROUNDS=1 BURN_SECONDS=1 TEST_SECONDS=1
 # Only the named tests (comma-separated, exact names); ids match a full run:
-make clean && make ONLY=corpus_integer_sequences,int_smc
+make ONLY=corpus_integer_sequences,int_smc
 ```
 
 `HEAVY_SCALE` accepts 1–32 and scales the new stress workloads, not every legacy
@@ -550,7 +552,10 @@ normal Makefile setting; it is logged with the scale in
 `CFG` so a failing vector can be reproduced. `ROUNDS` accepts 1–32. Larger
 scales on a slow 486 may need a larger `WATCHDOG_SECONDS`; a watchdog abort is
 a `FAULT`, not a successful shortened benchmark. The watchdog applies to each
-invocation, not the whole sustained window. `TEST_SECONDS` accepts 1–3600;
+invocation, not the whole sustained window. A timeout inside a nested probe
+first returns to that probe's caller so the test can clean up; the test is
+then given two more seconds before it is abandoned, and either way it is
+reported as `FAULT`. `TEST_SECONDS` accepts 1–3600;
 use the default 5 or more for profiling, not the shortened validation build.
 `ONLY` runs just the listed tests and logs them as `CFG only=`; `SUMMARY`
 counts only those. A name that is no test fails the build. A clean default
@@ -669,6 +674,9 @@ python tools/qemu_smoke.py --cpus host --accel kvm --output build/kvm
 The runner boots the actual image read-only, requires nonempty test results,
 `SUMMARY`, and `DONE`, rejects FAIL/FAULT/FATAL, terminates the halted VM, and
 retains serial logs, QEMU diagnostics, host duration, and parsed records.
+`results.json` is rewritten after each CPU, so an interrupted matrix keeps the
+CPUs already run. Each CPU gets 30 minutes once the guest reports an accuracy
+build, otherwise 8 hours; `--timeout` overrides both.
 `build/kernel.elf` and `build/kernel.map` retain symbols for fault investigation.
 
 For distributions and automated regression comparisons, build with four or
@@ -871,7 +879,7 @@ not certified by these local x86-64 Linux runs.
 
 ```sh
 make test
-make clean && make release CC=gcc
+make release CC=gcc
 cd dist/cpuburn-test-0.1.0
 sha256sum -c SHA256SUMS
 ```

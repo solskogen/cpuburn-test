@@ -48,19 +48,26 @@ def parse_log(text):
                          if x.startswith("CPU ") and "mhz=" not in x]}
 
 
+SUSTAINED_TIMEOUT = 8 * 3600
+ACCURACY_TIMEOUT = 30 * 60
+ACCURACY_BUILD = re.compile(r"(?m)^BUILD [^\n]*\bbenchmarks=0\r?$")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cpus", nargs="+", default=["486", "pentium", "pentium2", "qemu32"])
     parser.add_argument("--machine", default="pc")
     parser.add_argument("--accel", choices=["tcg", "kvm"], default="tcg")
     parser.add_argument("--memory", type=int, default=32)
-    parser.add_argument("--timeout", type=int, default=28800,
-                        help="host deadline in seconds (default: 8 hours for sustained workloads)")
+    parser.add_argument("--timeout", type=int, default=None,
+                        help="host deadline per CPU in seconds (default: 30 minutes once the "
+                             "guest reports an accuracy build, otherwise 8 hours for "
+                             "sustained benchmark workloads)")
     parser.add_argument("--image", default="floppy.img")
     parser.add_argument("--output", default="build/smoke")
     parser.add_argument("--label", default="", help="emulator build/mode identifier")
     args = parser.parse_args()
-    if args.memory < 1 or args.timeout < 1:
+    if args.memory < 1 or (args.timeout is not None and args.timeout < 1):
         parser.error("memory and timeout must be positive")
     out = pathlib.Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
@@ -68,6 +75,14 @@ def main():
     image_sha256 = hashlib.sha256(pathlib.Path(args.image).read_bytes()).hexdigest()
     emulator_version = subprocess.check_output(
         ["qemu-system-i386", "--version"], text=True).splitlines()[0]
+    results_path = out / "results.json"
+
+    def save():
+        # Rewritten after every CPU, so an interrupt or hang keeps earlier results.
+        staging = results_path.with_suffix(".json.tmp")
+        staging.write_text(json.dumps(results, indent=2) + "\n")
+        staging.replace(results_path)
+
     for cpu in args.cpus:
         stem = re.sub(r"[^a-zA-Z0-9_-]", "_", cpu)
         log = out / f"{stem}.serial.log"
@@ -85,9 +100,12 @@ def main():
         done = False
         with errors.open("w") as err:
             proc = subprocess.Popen(cmd, stdout=err, stderr=err)
+            timeout = args.timeout or SUSTAINED_TIMEOUT
             try:
-                while proc.poll() is None and time.monotonic() - start < args.timeout:
+                while proc.poll() is None and time.monotonic() - start < timeout:
                     text = log.read_text(errors="replace")
+                    if args.timeout is None and ACCURACY_BUILD.search(text):
+                        timeout = ACCURACY_TIMEOUT
                     if "\nDONE\n" in text or text.startswith("DONE\n"):
                         done = True
                         elapsed = time.monotonic() - start
@@ -119,12 +137,13 @@ def main():
                       ok=done and bool(result["tests"]) and bool(result["summary"])
                       and consistent and not bad and "FATAL" not in text)
         results.append(result)
+        save()
         print(f"{cpu}: {'OK' if result['ok'] else 'FAILED'} "
               f"tests={len(result['tests'])} bad={len(bad)} "
               f"host_seconds={result['host_seconds']}", flush=True)
         for test in bad:
             print(" ", test)
-    (out / "results.json").write_text(json.dumps(results, indent=2) + "\n")
+    save()
     raise SystemExit(0 if all(r["ok"] for r in results) else 1)
 
 

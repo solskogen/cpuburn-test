@@ -1,3 +1,4 @@
+import os
 import configparser
 from pathlib import Path
 import tempfile
@@ -5,7 +6,8 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from run_86box import arguments, emulator_binary, inplace_vm, run_existing_vm, vm_config
+from run_86box import (arguments, emulator_binary, exit_status, inplace_vm,
+                       run_existing_vm, vm_config, vm_in_command)
 
 
 CONFIG = """; preserve this comment
@@ -85,6 +87,67 @@ class VMInputTests(unittest.TestCase):
                     with inplace_vm(self.options(root, dynarec="on"), root / "test.img"):
                         raise error
                 self.assertEqual(source.read_text(), CONFIG)
+                self.assertFalse((root / "86box.cfg.cpuburn-backup").exists())
+
+    def test_backup_kept_until_restored_and_overrides_emulator_writes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "86box.cfg"
+            source.write_text(CONFIG)
+            backup = root / "86box.cfg.cpuburn-backup"
+            with inplace_vm(self.options(root), root / "test.img"):
+                self.assertEqual(backup.read_text(), CONFIG)
+                # 86Box saves its configuration on exit.
+                source.write_text("[Machine]\nmachine = rewritten\n")
+            self.assertEqual(source.read_text(), CONFIG)
+            self.assertFalse(backup.exists())
+            self.assertEqual(sorted(p.name for p in root.iterdir()), ["86box.cfg"])
+
+    def test_leftover_backup_refuses_to_start(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "86box.cfg"
+            source.write_text("[Machine]\nmachine = left modified\n")
+            backup = root / "86box.cfg.cpuburn-backup"
+            backup.write_text(CONFIG)
+            with self.assertRaisesRegex(RuntimeError, "interrupted before it restored"):
+                with inplace_vm(self.options(root), root / "test.img"):
+                    self.fail("must not start")
+            self.assertEqual(backup.read_text(), CONFIG)
+            self.assertEqual(source.read_text(), "[Machine]\nmachine = left modified\n")
+
+    def test_exit_status_fails_completed_runs_with_guest_failures(self):
+        failed = {"complete": True, "passed": False}
+        self.assertEqual(exit_status({"status": "observed", "correctness": failed}), 1)
+        self.assertEqual(exit_status({"status": "observed",
+                                      "correctness": {"complete": True, "passed": True}}), 0)
+        # An explicit --expect marker match is the caller's chosen criterion.
+        self.assertEqual(exit_status({"status": "pass", "correctness": failed}), 0)
+        for status in ("timeout", "failed", "error"):
+            self.assertEqual(exit_status({"status": status}), 1)
+
+    def test_running_vm_detection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            vm = root / "My VM"
+            vm.mkdir()
+            source = vm / "86box.cfg"
+            source.write_text(CONFIG)
+            other = root / "other"
+            other.mkdir()
+            cases = [
+                ([b"86Box"], vm, True),                        # bare start inside the VM dir
+                ([b"86Box"], other, False),
+                ([b"86Box", b"--vmpath", b"My VM"], root, True),
+                ([b"86Box", b"-P", os.fsencode(vm)], other, True),
+                ([b"86Box", b"86box.cfg"], vm, True),          # relative config path
+                ([b"86Box", os.fsencode(source)], other, True),
+                ([b"86Box", b"--vmpath", b"../other"], vm, False),
+                ([b"86Box", b"elsewhere.cfg"], vm, False),
+            ]
+            for command, cwd, running in cases:
+                with self.subTest(command=command, cwd=cwd.name):
+                    self.assertEqual(vm_in_command(command, cwd, source), running)
 
     def test_output_defaults_and_override(self):
         for override in (False, True):
@@ -104,7 +167,8 @@ class VMInputTests(unittest.TestCase):
                     self.assertEqual(machine["cpu_use_dynarec"], "0")
                     (root / "nvr-touched").write_text("no copy")
                     return dict(status="observed", directory=str(output),
-                                emulated_ms=100, matched=[])
+                                emulated_ms=100, matched=[],
+                                correctness={"complete": True, "passed": True})
                 with patch("run_86box.execute", side_effect=execute):
                     self.assertEqual(run_existing_vm(args, image, image, root), 0)
                 self.assertEqual(source.read_text(), CONFIG)
