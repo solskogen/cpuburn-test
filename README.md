@@ -538,7 +538,7 @@ For execution without timed harness repetition, use
 The default is one suite round and the final mixed burn, whose individual
 invocations last 10 seconds. Heavy workloads use `HEAVY_SCALE=8`; each invocation
 does real fixed-count work, rather than sleeping to fill its window.
-The default inventory is 333 records, including unavailable-feature skips.
+The default inventory is 335 records, including unavailable-feature skips.
 Suite duration varies with CPU, applicable features and invocation lengths;
 it is not a fixed wall-clock deadline. In benchmark mode, the
 [host profiling runner](#sustained-host-profiling) can extend sampling to

@@ -61,6 +61,140 @@ static u32 alu_ref(unsigned op,u32 a,u32 b,u32 cin,unsigned w,u32 *flags) {
 static u32 run_alu(unsigned w,unsigned op,u32 a,u32 b,u32 c,u32 *f) {
     return w==8?alu8(op,a,b,c,f):w==16?alu16(op,a,b,c,f):alu32(op,a,b,c,f);
 }
+/* CF read back by SETC, JC and ADC right after the instruction that set it:
+   logic ops, INC and DEC (which keep it), rotates and shifts by constant
+   counts (some past the width), and 8- and 16-bit ADC and SBB with the
+   carry in set or clear; each against PUSHF after the same instruction. */
+static u32 int_cf_consumers(void) {
+    static const u32 edge[]={0,1,0x7f,0x80,0xff,0x7fff,0x8000,0xffff,0x7fffffffu,0x80000000u,0xfffffffeu,0xffffffffu};
+    u32 seed=0xcf5e7c0du,sum=0;
+    const unsigned rounds=1u<<10;
+    for(unsigned i=0;i<rounds;i++) {
+        u32 a=rng(&seed),b=rng(&seed),r=rng(&seed);
+        if(r&1) a=edge[(r>>1)%12];
+        if(r&0x20) b=edge[(r>>6)%12];
+        u32 cin=(r>>12)&1;
+#define CFT(P) do { \
+            u32 x,y=b,z,f; u8 o1,o2; \
+            x=a; __asm__ volatile("btl $0,%[c]; " P "; setc %[o]" : [x]"+q"(x),[o]"=q"(o1) : [y]"q"(y),[c]"r"(cin) : "cc"); \
+            x=a; __asm__ volatile("btl $0,%[c]; " P "; jc 1f; movb $0,%[o]; jmp 2f; 1: movb $1,%[o]; 2:" : [x]"+q"(x),[o]"=q"(o2) : [y]"q"(y),[c]"r"(cin) : "cc"); \
+            x=a; __asm__ volatile("btl $0,%[c]; " P "; movl $0,%[z]; adcl $0,%[z]" : [x]"+q"(x),[z]"=&r"(z) : [y]"q"(y),[c]"r"(cin) : "cc"); \
+            x=a; __asm__ volatile("btl $0,%[c]; " P "; pushfl; popl %[f]" : [x]"+q"(x),[f]"=r"(f) : [y]"q"(y),[c]"r"(cin) : "cc"); \
+            CHECK_EQ(o1,f&1); CHECK_EQ(o2,f&1); CHECK_EQ(z,f&1); \
+            sum=csum_mix(sum,x^(f&0x8d5)); \
+        } while(0)
+        CFT("andb %b[y],%b[x]");
+        CFT("orb %b[y],%b[x]");
+        CFT("xorb %b[y],%b[x]");
+        CFT("testb %b[y],%b[x]");
+        CFT("incb %b[x]");
+        CFT("decb %b[x]");
+        CFT("rolb $1,%b[x]");
+        CFT("rolb $3,%b[x]");
+        CFT("rolb $7,%b[x]");
+        CFT("rorb $1,%b[x]");
+        CFT("rorb $3,%b[x]");
+        CFT("rorb $7,%b[x]");
+        CFT("shlb $1,%b[x]");
+        CFT("shlb $3,%b[x]");
+        CFT("shlb $7,%b[x]");
+        CFT("shlb $8,%b[x]");
+        CFT("shlb $9,%b[x]");
+        CFT("shrb $1,%b[x]");
+        CFT("shrb $3,%b[x]");
+        CFT("shrb $7,%b[x]");
+        CFT("shrb $8,%b[x]");
+        CFT("shrb $9,%b[x]");
+        CFT("sarb $1,%b[x]");
+        CFT("sarb $3,%b[x]");
+        CFT("sarb $7,%b[x]");
+        CFT("sarb $8,%b[x]");
+        CFT("sarb $9,%b[x]");
+        CFT("adcb %b[y],%b[x]");
+        CFT("sbbb %b[y],%b[x]");
+        CFT("andw %w[y],%w[x]");
+        CFT("orw %w[y],%w[x]");
+        CFT("xorw %w[y],%w[x]");
+        CFT("testw %w[y],%w[x]");
+        CFT("incw %w[x]");
+        CFT("decw %w[x]");
+        CFT("rolw $1,%w[x]");
+        CFT("rolw $3,%w[x]");
+        CFT("rolw $15,%w[x]");
+        CFT("rorw $1,%w[x]");
+        CFT("rorw $3,%w[x]");
+        CFT("rorw $15,%w[x]");
+        CFT("shlw $1,%w[x]");
+        CFT("shlw $3,%w[x]");
+        CFT("shlw $15,%w[x]");
+        CFT("shlw $16,%w[x]");
+        CFT("shlw $17,%w[x]");
+        CFT("shrw $1,%w[x]");
+        CFT("shrw $3,%w[x]");
+        CFT("shrw $15,%w[x]");
+        CFT("shrw $16,%w[x]");
+        CFT("shrw $17,%w[x]");
+        CFT("sarw $1,%w[x]");
+        CFT("sarw $3,%w[x]");
+        CFT("sarw $15,%w[x]");
+        CFT("sarw $16,%w[x]");
+        CFT("sarw $17,%w[x]");
+        CFT("adcw %w[y],%w[x]");
+        CFT("sbbw %w[y],%w[x]");
+        CFT("andl %[y],%[x]");
+        CFT("orl %[y],%[x]");
+        CFT("xorl %[y],%[x]");
+        CFT("testl %[y],%[x]");
+        CFT("incl %[x]");
+        CFT("decl %[x]");
+        CFT("roll $1,%[x]");
+        CFT("roll $3,%[x]");
+        CFT("roll $31,%[x]");
+        CFT("rorl $1,%[x]");
+        CFT("rorl $3,%[x]");
+        CFT("rorl $31,%[x]");
+        CFT("shll $1,%[x]");
+        CFT("shll $3,%[x]");
+        CFT("shll $31,%[x]");
+        CFT("shrl $1,%[x]");
+        CFT("shrl $3,%[x]");
+        CFT("shrl $31,%[x]");
+        CFT("sarl $1,%[x]");
+        CFT("sarl $3,%[x]");
+        CFT("sarl $31,%[x]");
+#undef CFT
+    }
+    t_ops(rounds*79*4); return sum;
+}
+/* The carry an ADC or SBB leaves, read through an INC or DEC after it
+   (which keeps CF) and SETC, at each width, with the carry in set or clear
+   and operands at the edges of the range. */
+static u32 int_adc_carry_incdec(void) {
+    static const u32 edge[]={0,1,0x7f,0x80,0xff,0x7fff,0x8000,0xffff,0x7fffffffu,0x80000000u,0xfffffffeu,0xffffffffu};
+    u32 seed=0xadcc0de5u,sum=0;
+    const unsigned rounds=1u<<12;
+    for(unsigned i=0;i<rounds;i++) {
+        u32 a=rng(&seed),b=rng(&seed),r=rng(&seed);
+        if(r&1) a=edge[(r>>1)%12];
+        if(r&0x20) b=edge[(r>>6)%12];
+        u32 cin=(r>>12)&1,d=r;
+        for(unsigned w=8;w<=32;w*=2) {
+            u32 m=w==32?0xffffffffu:((1u<<w)-1);
+            u32 want[2]={(u32)(((u64)(a&m)+(b&m)+cin)>>w)&1,((u64)(a&m)<(u64)(b&m)+cin)?1:0};
+            for(unsigned k=0;k<4;k++) {
+                u32 x=a; u8 c;
+#define ADCC(OP,ID) __asm__ volatile("btl $0,%[c]; " OP "; " ID " %[d]; setc %[o]" : [x]"+q"(x),[d]"+r"(d),[o]"=q"(c) : [b]"q"(b),[c]"r"(cin) : "cc")
+                if(w==8) { if(k==0) ADCC("adcb %b[b],%b[x]","decl"); else if(k==1) ADCC("adcb %b[b],%b[x]","incl"); else if(k==2) ADCC("sbbb %b[b],%b[x]","decl"); else ADCC("sbbb %b[b],%b[x]","incl"); }
+                else if(w==16) { if(k==0) ADCC("adcw %w[b],%w[x]","decl"); else if(k==1) ADCC("adcw %w[b],%w[x]","incl"); else if(k==2) ADCC("sbbw %w[b],%w[x]","decl"); else ADCC("sbbw %w[b],%w[x]","incl"); }
+                else { if(k==0) ADCC("adcl %[b],%[x]","decl"); else if(k==1) ADCC("adcl %[b],%[x]","incl"); else if(k==2) ADCC("sbbl %[b],%[x]","decl"); else ADCC("sbbl %[b],%[x]","incl"); }
+#undef ADCC
+                CHECK_EQ(c,want[k>>1]);
+                sum=csum_mix(sum,x^c);
+            }
+        }
+    }
+    t_ops(rounds*3*2*4); return sum;
+}
 /* A bit-stream reader's shift, as Windows 98's 16-bit code does it as it
    boots: DX:AX (or EDX:EAX) shifted left by CL one bit at a time with ADD
    and ADC, each ADC taking the carry the ADD before it left. */
@@ -1427,12 +1561,20 @@ static u32 int_alu_burn(void) {
     t_ops(16384*45+512*64*32);return sum;
 }
 
+/* Correctness checks, run once as in accuracy mode and left out of
+   benchmark-only builds (run_checks()) */
+const test_t tests_int_check[]={
+    {"int_cf_consumers",int_cf_consumers,REQ_486},
+    {0,0,0}
+};
+
 const test_t tests_int[]={
     {"int_flags_boundaries",int_flags_boundaries,REQ_486},
     {"int_partial_boundaries",int_partial_boundaries,REQ_486},
     {"int_divide_state",int_divide_state,REQ_486},
     {"int_alu",int_alu,REQ_486},
     {"int_adc_shift_loop",int_adc_shift_loop,REQ_486},
+    {"int_adc_carry_incdec",int_adc_carry_incdec,REQ_486},
     {"int_far_ptr_copy",int_far_ptr_copy,REQ_486},
     {"int_sha1",int_sha1,REQ_486},
     {"int_bn_muladd",int_bn_muladd,REQ_486},
