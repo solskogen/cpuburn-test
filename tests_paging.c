@@ -125,6 +125,7 @@ static void ad_body(void) {
         *(volatile u32 *)WIN = i; invlpg((void *)WIN); wr_cr3((u32)pd);
         CHECK(pt[0] & 0x40);
     }
+    t_ops(256); /* checked accesses, each after a TLB flush */
     pt[0] = (u32)page | 5; wr_cr3((u32)pd); wr_cr0(old0 | 0x10000);
     fault_check(store_target, WIN, 3, 7);
     CHECK(!(pt[0] & 0x40));
@@ -166,6 +167,7 @@ static void global_body(void) {
     pt[0] = (u32)page | 0x107; wr_cr4(old4 & ~0x80u); wr_cr4(old4 | 0x80);
     CHECK_EQ(*(volatile u32 *)WIN, 1);
     wr_cr4(old4 & ~0x80u); wr_cr3((u32)pd);
+    t_ops(9); /* INVLPG, CR3 and CR4.PGE flushes */
 }
 static u32 pg_global(void) { return run_page(global_body); }
 
@@ -178,6 +180,7 @@ static void pse_body(void) {
         *(volatile u32 *)(0x80000000u + i * PAGE) = i ^ 0x1F46ABCD;
         CHECK_EQ(large[i * 1024], i ^ 0x1F46ABCD);
     }
+    t_ops(1024); /* checked stores through the 4 MiB page */
     CHECK((pd[512] & 0x60) == 0x60);
     pt[0] = (u32)large | 7; invlpg((void *)WIN);
     CHECK_EQ(*(volatile u32 *)WIN, large[0]);
@@ -246,6 +249,7 @@ static void pae_body(void) {
         else t_note("reserved PDPTE reload rc=%x: reserved-bit validation not exposed", rc);
     } else t_note("invalid PDPTE reload skipped under hypervisor");
     t_note("PAE identity 0..16MiB, 2MiB pages, alias/A/D/#PF checked");
+    t_ops(4); /* checked PAE accesses and page faults */
     wr_cr0(old0 & ~0x80000000u); wr_cr4(old4); wr_cr3((u32)pd); wr_cr0(old0); sti();
 }
 static u32 pg_pae(void) { return run_page(pae_body); }
@@ -261,6 +265,7 @@ static void read_apic(void) {
     invlpg((void *)0xFEE00000u);
     volatile u32 *a = (volatile u32 *)0xFEE00000u;
     u32 id = a[0x20 / 4], ver = a[0x30 / 4], svr = a[0xF0 / 4];
+    t_ops(3); /* APIC MMIO reads */
     t_note("APIC_BASE=%llx ID=%08x VERSION=%08x SVR=%08x", apic_base, id, ver, svr);
 }
 static u32 pg_apic_mmio(void) {

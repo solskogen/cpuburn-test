@@ -866,6 +866,145 @@ static u32 hp_context(void) {
     return hp_sum;
 }
 
+/*
+ * V86 code under a monitor, as DOS runs under EMM386 or in a Win9x DOS box:
+ * at IOPL=0 without VME every CLI, STI, PUSHF, POPF, INT and IRET raises #GP,
+ * and the monitor emulates it against a virtual IF. Each loop iteration traps
+ * eight times; the INT 21h handler does 16-bit ALU work through DS and ES.
+ * Checked in bulk: trap counts per instruction, the blob's virtual-IF error
+ * counter and the ALU result against a C reference.
+ */
+extern const u8 v86m_begin[], v86m_end[], v86m_hlt[], v86m_handler[];
+__asm__(
+    ".text\n"
+    ".global v86m_begin,v86m_end,v86m_hlt,v86m_handler\n"
+    "v86m_begin:\n .code16\n"
+    "movw 0x202,%cx\n xorw %bx,%bx\n"
+    "1: cli\n pushfw\n popw %ax\n testw $0x200,%ax\n jz 2f\n incw %bx\n"
+    "2: sti\n pushfw\n popw %ax\n testw $0x200,%ax\n jnz 3f\n incw %bx\n"
+    "3: pushfw\n popfw\n"
+    "movw %cx,%ax\n int $0x21\n"
+    "loop 1b\n"
+    "movw %bx,0x200\n"
+    "v86m_hlt: hlt\n"
+    "v86m_handler:\n"
+    "addw %ax,%es:0x206\n movw %es:0x206,%dx\n rolw $3,%dx\n xorw %ax,%dx\n"
+    "movw %dx,%ds:0x208\n addw %dx,%es:0x206\n iret\n"
+    ".code32\n v86m_end:\n");
+
+enum { V86M_CLI, V86M_STI, V86M_PUSHF, V86M_POPF, V86M_INT, V86M_IRET, V86M_KINDS };
+static const u32 v86m_per_iteration[V86M_KINDS] = { 1, 1, 3, 1, 1, 1 };
+static volatile u32 v86m_vif, v86m_unknown, v86m_traps[V86M_KINDS], v86m_result;
+
+static u8 *v86m_lin(u32 seg, u32 off) { return (u8 *)((seg & 0xffff) * 16 + (off & 0xffff)); }
+static void v86m_push(regs_t *r, u16 v) {
+    u32 sp = (r->useresp - 2) & 0xffff;
+    *(volatile u16 *)v86m_lin(r->ss, sp) = v;
+    r->useresp = (r->useresp & ~0xffffu) | sp;
+}
+static u16 v86m_pop(regs_t *r) {
+    u32 sp = r->useresp & 0xffff;
+    u16 v = *(volatile u16 *)v86m_lin(r->ss, sp);
+    r->useresp = (r->useresp & ~0xffffu) | ((sp + 2) & 0xffff);
+    return v;
+}
+/* Arithmetic flags and DF come from the real EFLAGS; IF is the virtual one. */
+static u16 v86m_flags(regs_t *r) { return (u16)((r->eflags & 0x0cd5) | 2 | (v86m_vif ? 0x200 : 0)); }
+static void v86m_set_flags(regs_t *r, u16 f) {
+    r->eflags = (r->eflags & ~0x0cd5u) | (f & 0x0cd5);
+    v86m_vif = !!(f & 0x200);
+}
+static void v86m_next(regs_t *r, u32 len, u32 kind) {
+    r->eip = (r->eip + len) & 0xffff;
+    v86m_traps[kind]++;
+}
+static void v86m_monitor(regs_t *r) {
+    if (!(r->eflags & 0x20000)) guard_recover(GUARD_EXC(13)); /* not from V86 */
+    const u8 *ip = v86m_lin(r->cs, r->eip);
+    switch (ip[0]) {
+    case 0xfa: v86m_vif = 0; v86m_next(r, 1, V86M_CLI); return;
+    case 0xfb: v86m_vif = 1; v86m_next(r, 1, V86M_STI); return;
+    case 0x9c: v86m_push(r, v86m_flags(r)); v86m_next(r, 1, V86M_PUSHF); return;
+    case 0x9d: v86m_set_flags(r, v86m_pop(r)); v86m_next(r, 1, V86M_POPF); return;
+    case 0xcd:
+        if (ip[1] != 0x21) break;
+        v86m_push(r, v86m_flags(r));
+        v86m_push(r, (u16)r->cs);
+        v86m_push(r, (u16)(r->eip + 2));
+        v86m_vif = 0;
+        r->eflags &= ~0x100u; /* TF */
+        r->cs = 0x7000;
+        r->eip = (u32)(v86m_handler - v86m_begin);
+        v86m_traps[V86M_INT]++;
+        return;
+    case 0xcf: {
+        u16 ip16 = v86m_pop(r), cs16 = v86m_pop(r), f = v86m_pop(r);
+        r->eip = ip16; r->cs = cs16;
+        v86m_set_flags(r, f);
+        v86m_traps[V86M_IRET]++;
+        return;
+    }
+    case 0xf4: guard_recover(GUARD_EXC(13)); /* end of the run */
+    }
+    v86m_unknown = 0x100u | ip[0];
+    guard_recover(GUARD_EXC(13));
+}
+
+static void v86m_body(void) {
+    const u32 n = 1024u * HEAVY_SCALE;
+    u8 *p = (u8 *)0x70000;
+    kmemcpy(p, v86m_begin, v86m_end - v86m_begin);
+    *(u16 *)(p + 0x200) = 0xffff;
+    *(u16 *)(p + 0x202) = (u16)n;
+    *(u16 *)(p + 0x206) = 0;
+    *(u16 *)(p + 0x208) = 0;
+    v86m_vif = 0; v86m_unknown = 0; v86m_result = 0;
+    for (u32 i = 0; i < V86M_KINDS; i++) v86m_traps[i] = 0;
+    int_hook[13] = v86m_monitor;
+    hp_vm_flags = 0x20002; /* VM, IOPL=0, IF=0 */
+    int rc = guard_call(hp_vm_enter);
+    int_hook[13] = 0;
+    CHECK_EQ(rc, GUARD_EXC(13));
+    CHECK_EQ(v86m_unknown, 0);
+    CHECK_EQ(g_exc.eip, (u32)(v86m_hlt - v86m_begin));
+    CHECK_EQ(*(u16 *)(p + 0x200), 0); /* virtual IF seen correctly */
+    u32 total = 0;
+    for (u32 i = 0; i < V86M_KINDS; i++) {
+        CHECK_EQ(v86m_traps[i], n * v86m_per_iteration[i]);
+        total += v86m_traps[i];
+    }
+    u16 sum = 0, dx = 0;
+    for (u32 c = n; c; c--) {
+        sum = (u16)(sum + c);
+        dx = (u16)(((sum << 3) | (sum >> 13)) ^ c);
+        sum = (u16)(sum + dx);
+    }
+    CHECK_EQ(*(u16 *)(p + 0x206), sum);
+    CHECK_EQ(*(u16 *)(p + 0x208), dx);
+    v86m_result = *(u16 *)(p + 0x206);
+    t_ops(total);
+}
+
+static u32 hp_v86_monitor(void) {
+    void *save = arena_alloc(8192, 16);
+    CHECK(save);
+    if (!save) return 0;
+    /* With CR4.VME set, CLI/STI would not trap; clear it for the run. */
+    u32 cr4 = cpu_test_feature(REQ_VME) ? rd_cr4() : 0;
+    if (cr4 & 1) wr_cr4(cr4 & ~1u);
+    kmemcpy(save, (void *)0x70000, 4096);
+    kmemcpy((u8 *)save + 4096, (void *)0x7f000, 4096);
+    hp_run(v86m_body);
+    int_hook[13] = 0;
+    kmemcpy((void *)0x70000, save, 4096);
+    kmemcpy((void *)0x7f000, (u8 *)save + 4096, 4096);
+    if (cr4 & 1) wr_cr4(cr4);
+    t_note("V86 monitor iterations=%u traps CLI/STI/PUSHF/POPF/INT/IRET=%u/%u/%u/%u/%u/%u",
+           1024u * HEAVY_SCALE, v86m_traps[0], v86m_traps[1], v86m_traps[2],
+           v86m_traps[3], v86m_traps[4], v86m_traps[5]);
+    return csum_mix(v86m_traps[2], v86m_result);
+}
+
 const test_t tests_heavy_pmode[] = {
     { "heavy_pm_code_context", hp_context, REQ_486 },
     { "heavy_pm_16bit", hp_16bit, REQ_486 },
@@ -876,6 +1015,7 @@ const test_t tests_heavy_pmode[] = {
     { "heavy_pm_privilege", hp_privilege, REQ_486 },
     { "heavy_pm_pvi", hp_pvi, REQ_VME },
     { "heavy_pm_vme", hp_vme, REQ_VME },
+    { "heavy_pm_v86_monitor", hp_v86_monitor, REQ_486 },
     { "heavy_pm_irq_shadows", hp_shadows, REQ_486 },
     { 0, 0, 0 }
 };

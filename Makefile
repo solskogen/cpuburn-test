@@ -16,6 +16,25 @@ BURN_SECONDS ?= 10
 WATCHDOG_SECONDS ?= 90
 HEAVY_SCALE ?= 8
 TEST_SECONDS ?= 5
+# SUITE selects what the image runs: full (default), benchmark (the sampled
+# workloads only, skipping check-only records) or accuracy (every record,
+# checked once; the same as BENCHMARKS=0).
+SUITE ?= full
+ifeq ($(filter full benchmark accuracy,$(SUITE)),)
+$(error SUITE must be full, benchmark or accuracy)
+endif
+SUITE_BENCHMARKS_full =
+SUITE_BENCHMARKS_benchmark = 1
+SUITE_BENCHMARKS_accuracy = 0
+SUITE_BENCHMARKS := $(SUITE_BENCHMARKS_$(SUITE))
+ifneq ($(SUITE_BENCHMARKS),)
+ifneq ($(origin BENCHMARKS),undefined)
+ifneq ($(BENCHMARKS),$(SUITE_BENCHMARKS))
+$(error SUITE=$(SUITE) implies BENCHMARKS=$(SUITE_BENCHMARKS); drop BENCHMARKS=$(BENCHMARKS))
+endif
+endif
+BENCHMARKS ?= $(SUITE_BENCHMARKS)
+endif
 BENCHMARKS ?= 1
 ifneq ($(BENCHMARKS),0)
 ifneq ($(BENCHMARKS),1)
@@ -58,7 +77,7 @@ CFLAGS  = $(TARGET_FLAGS) -march=i486 -mtune=i486 $(STACK_FLAGS) \
           -fno-strict-aliasing \
           -DROUNDS=$(ROUNDS) -DBURN_SECONDS=$(BURN_SECONDS) -DWATCHDOG_SECONDS=$(WATCHDOG_SECONDS) \
           -DHEAVY_SCALE=$(HEAVY_SCALE) -DTEST_SECONDS=$(TEST_SECONDS) -DONLY='"$(ONLY)"' \
-          -DBENCHMARKS=$(BENCHMARKS) \
+          -DBENCHMARKS=$(BENCHMARKS) -DSUITE_BENCHMARK=$(if $(filter benchmark,$(SUITE)),1,0) \
           -DCPUBURN_VERSION='"$(VERSION)"'
 # Per-file overrides: FPU/MMX test files need the FPU/MMX instruction sets enabled (inline asm only, no compiler FP code on 486 path).
 SRCS    = core.c arith.c cpu_contract.c $(sort $(wildcard tests_*.c))
@@ -126,11 +145,11 @@ test:
 # own build directories, and runs the whole suite under QEMU with them set.
 GUEST = $(BUILD)/guest
 guest-test:
-	$(MAKE) BUILD=$(GUEST)/contract IMAGE=$(GUEST)/contract.img \
+	$(MAKE) SUITE=full BUILD=$(GUEST)/contract IMAGE=$(GUEST)/contract.img \
 	    ONLY=int_partial_boundaries,mmx_alu,3dnow_float
-	$(MAKE) BUILD=$(GUEST)/extension IMAGE=$(GUEST)/extension.img \
+	$(MAKE) SUITE=full BUILD=$(GUEST)/extension IMAGE=$(GUEST)/extension.img \
 	    BENCHMARKS=0 ONLY=pm_syscall,mmx_extended
-	$(MAKE) BUILD=$(GUEST)/boot IMAGE=$(GUEST)/boot.img \
+	$(MAKE) SUITE=full BUILD=$(GUEST)/boot IMAGE=$(GUEST)/boot.img \
 	    BENCHMARKS=0 BURN_SECONDS=1 TEST_SECONDS=1 ONLY=
 	CPUBURN_CONTRACT_IMAGE=$(abspath $(GUEST)/contract.img) \
 	CPUBURN_EXTENSION_IMAGE=$(abspath $(GUEST)/extension.img) \
@@ -143,8 +162,8 @@ release: $(IMAGE)
 	cp $(IMAGE) $(DIST)/floppy.img
 	cp LICENSE README.md RELEASE_NOTES.md $(DIST)/
 	cp -r doc $(DIST)/
-	{ printf 'version=%s\nrounds=%s\nbenchmarks=%s\nburn_seconds=%s\ntest_seconds=%s\nheavy_scale=%s\nwatchdog_seconds=%s\nonly=%s\n' \
-	    '$(VERSION)' '$(ROUNDS)' '$(BENCHMARKS)' '$(BURN_SECONDS)' '$(TEST_SECONDS)' '$(HEAVY_SCALE)' '$(WATCHDOG_SECONDS)' '$(ONLY)'; \
+	{ printf 'version=%s\nsuite=%s\nrounds=%s\nbenchmarks=%s\nburn_seconds=%s\ntest_seconds=%s\nheavy_scale=%s\nwatchdog_seconds=%s\nonly=%s\n' \
+	    '$(VERSION)' '$(SUITE)' '$(ROUNDS)' '$(BENCHMARKS)' '$(BURN_SECONDS)' '$(TEST_SECONDS)' '$(HEAVY_SCALE)' '$(WATCHDOG_SECONDS)' '$(ONLY)'; \
 	  $(CC) --version && $(NASM) --version && $(LD) --version && $(OBJCOPY) --version && $(NM) --version; \
 	} > $(DIST)/BUILD.txt
 	tar --format=gnu --owner=0 --group=0 --numeric-owner --mtime=@0 --mode=0644 \

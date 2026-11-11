@@ -34,7 +34,7 @@ static void pm_check_exc(u32 vec, u32 err) {
 
 static u32 pm_exceptions(void) {
     u32 sum = 0;
-    u32 before;
+    u32 before, delivered = g_exc.count;
 
     before = g_exc.count;
     exc_expect(0, 2);
@@ -117,6 +117,7 @@ static u32 pm_exceptions(void) {
     CHECK_EQ(g_exc.count, before + 1);
     pm_check_exc(12, SEL_SCRATCH0);
 
+    t_ops(g_exc.count - delivered); /* exceptions delivered */
     return sum;
 }
 
@@ -200,7 +201,7 @@ static void pm_r3_unaligned(void) {
 }
 
 static u32 pm_gates_rings(void) {
-    u32 sum = 0;
+    u32 sum = 0, delivered = g_exc.count;
     void *stack = arena_alloc(4096, 16);
     CHECK(stack != NULL);
     if (!stack) return 0;
@@ -225,6 +226,7 @@ static u32 pm_gates_rings(void) {
     CHECK_EQ(g_exc.vec, 13);
     CHECK_EQ(g_exc.err, (0x81u << 3) | 2u);
     sum = csum_mix(sum, g_exc.err);
+    t_ops(g_exc.count - delivered); /* gate faults and ring transitions */
     return sum;
 }
 
@@ -276,6 +278,7 @@ static u32 pm_sysenter(void) {
     CHECK_EQ(pm_sep_cs, SEL_KCODE);
     CHECK_EQ(pm_sep_ds, SEL_UDATA);
     sum = csum_mix(sum, pm_sep_ss | (pm_sep_cs << 16));
+    t_ops(1); /* SYSENTER/SYSEXIT round trip */
     return sum;
 }
 
@@ -562,6 +565,7 @@ static u32 pm_v86(void) {
     CHECK_EQ(g_exc.vec, 13);
     CHECK_EQ(g_exc.err, 0);
     CHECK(g_exc.eflags & (1u << 17));
+    t_ops(2); /* V86 entries, each ending in #GP */
     return csum_mix(sum, g_exc.eflags);
 }
 

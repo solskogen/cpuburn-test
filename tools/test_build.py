@@ -109,6 +109,17 @@ class BuildTests(unittest.TestCase):
         self.assertIn("no test named", commands)
         self.assertNotIn("no test named", self.make("-n", "-B"))
 
+    def test_suite_selects_benchmarks_and_check_only_records(self):
+        self.assertIn("-DBENCHMARKS=1 -DSUITE_BENCHMARK=0", self.make("-n", "-B"))
+        self.assertIn("-DBENCHMARKS=1 -DSUITE_BENCHMARK=1",
+                      self.make("-n", "-B", "SUITE=benchmark"))
+        self.assertIn("-DBENCHMARKS=0 -DSUITE_BENCHMARK=0",
+                      self.make("-n", "-B", "SUITE=accuracy"))
+        for args in (("SUITE=accuracy", "BENCHMARKS=1"), ("SUITE=benchmark", "BENCHMARKS=0"),
+                     ("SUITE=fast",)):
+            with self.subTest(args=args), self.assertRaises(subprocess.CalledProcessError):
+                self.make("-n", "-B", *args)
+
     def test_build_commands_have_no_helper_or_python_dependency(self):
         commands = self.make("-n", "-B", "CC=gcc", "IS_CLANG=", "PYTHON=false", "release")
         self.assertIn("gcc -m32", commands)

@@ -25,6 +25,8 @@ Version **0.1.0 preview**. Licensed under [MIT](LICENSE).
 - **Shorter runs:** `make BURN_SECONDS=1 TEST_SECONDS=1` keeps the selected
   test cases but reduces repetition/stress and timing confidence. Defaults
   are 10 and 5 guest seconds; invocations are never cut short.
+- **Benchmarks only:** `make SUITE=benchmark` builds just the sampled
+  workloads, leaving out check-only correctness records.
 - **Correctness only:** `make BENCHMARKS=0` removes timed harness repetition,
   not test cases or assertions. See [accuracy-only builds](#accuracy-only-builds).
 
@@ -33,9 +35,16 @@ Version **0.1.0 preview**. Licensed under [MIT](LICENSE).
 ### Choose what to build
 
 ```sh
-make                         # default build; benchmarks enabled
-make BENCHMARKS=0            # accuracy only, without benchmark sampling
+make                         # default build: every record, benchmarks enabled
+make SUITE=benchmark         # only the benchmark workloads, sampled
+make SUITE=accuracy          # every record checked once (same as BENCHMARKS=0)
 ```
+
+`SUITE=benchmark` leaves out the check-only records (the extra FDIV vectors
+and the `cs_*` platform probes; see the
+[workload catalogue](doc/workloads.md#inventory-and-reading-the-tables)) and
+logs them as `FILTER ... reason=suite_selection`. `CFG` records the suite.
+`BENCHMARKS=0` still works; combining it with a conflicting `SUITE` is an error.
 
 Settings are not sticky: each `make` builds the image for the variables on
 that command line, and plain `make` goes back to the defaults. The Makefile
@@ -529,7 +538,7 @@ For execution without timed harness repetition, use
 The default is one suite round and the final mixed burn, whose individual
 invocations last 10 seconds. Heavy workloads use `HEAVY_SCALE=8`; each invocation
 does real fixed-count work, rather than sleeping to fill its window.
-The default inventory is 327 records, including unavailable-feature skips.
+The default inventory is 333 records, including unavailable-feature skips.
 Suite duration varies with CPU, applicable features and invocation lengths;
 it is not a fixed wall-clock deadline. In benchmark mode, the
 [host profiling runner](#sustained-host-profiling) can extend sampling to
