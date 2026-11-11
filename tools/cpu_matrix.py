@@ -381,6 +381,9 @@ def run_matrix(rows, args):
                         if mode == "benchmark" and result.get("mode") != "benchmark":
                             entry["outcome"] = "benchmark_unavailable"
                             entry["result_error"] = "guest did not confirm benchmark mode; use BENCHMARKS=1"
+                        if (entry["outcome"] == "observed" and
+                                not result.get("correctness", {}).get("passed")):
+                            entry["outcome"] = "guest_failures"
                         if not any(t.get("status") == "PASS" for t in entry["contract_tests"]):
                             if entry["outcome"] in ("pass", "observed"):
                                 entry["outcome"] = "unverified_identity"

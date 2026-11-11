@@ -66,8 +66,8 @@ def arguments():
         "Requires an AUTOMATION-enabled 86Box and locally installed ROMs; 86Box opens in the session's Wayland or X display, or offscreen without one. "
         "Never downloads firmware. --vm runs the supplied VM in place, temporarily "
         "inserting the test floppy and enabling COM1, then restores its config. Without --expect, "
-        "DONE completes observation with strict nonzero summary counts, not a "
-        "guest-test PASS (FAIL/FAULT remain visible). Default limits: 24 guest "
+        "DONE completes observation with strict nonzero summary counts; guest "
+        "FAIL/FAULT results give a nonzero exit. Default limits: 24 guest "
         "hours and 8 host hours. Ratios measure unthrottled speed capacity, not "
         "the GUI's actual-speed percentage. All emulator threads are charged; "
         "boundary steps and non-step RPC work are excluded from workload ratios. COM1 is "
@@ -162,6 +162,51 @@ def emulator_binary(value):
     return Path(executable).resolve(strict=True)
 
 
+# Signals that end a run through the normal cleanup path (see __main__).
+CLEANUP_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+BACKUP_SUFFIX = ".cpuburn-backup"
+QUIT_SECONDS = 30
+
+
+def config_backup(source):
+    return source.with_name(source.name + BACKUP_SUFFIX)
+
+
+def write_durably(path, data):
+    with path.open("wb") as output:
+        output.write(data)
+        output.flush()
+        os.fsync(output.fileno())
+
+
+def vm_in_command(command, cwd, source):
+    """Whether an 86Box command line (argv bytes, working directory) runs `source`.
+
+    Covers --vmpath/-P, a configuration path given absolutely or relative to
+    the process directory, and a bare `86Box` started inside the VM directory,
+    whose VM path defaults to the working directory."""
+    def resolve(word):
+        path = Path(os.fsdecode(word))
+        if not path.is_absolute():
+            if cwd is None:
+                return None
+            path = cwd / path
+        return path.resolve()
+
+    vm_dir, config = source.parent.resolve(), source.resolve()
+    explicit = False
+    for index, word in enumerate(command[1:], 1):
+        if word in (b"--vmpath", b"-P"):
+            explicit = True
+            if index + 1 < len(command) and resolve(command[index + 1]) == vm_dir:
+                return True
+        elif word.endswith(b".cfg") and not word.startswith(b"-"):
+            explicit = True
+            if resolve(word) == config:
+                return True
+    return not explicit and cwd is not None and cwd.resolve() == vm_dir
+
+
 def refuse_running(source):
     """Fail if an 86Box process already has this VM open."""
     for process in Path("/proc").iterdir():
@@ -178,23 +223,24 @@ def refuse_running(source):
             cwd = (process / "cwd").resolve(strict=True)
         except (FileNotFoundError, PermissionError, ProcessLookupError):
             pass
-        for index, word in enumerate(command):
-            if word in (b"--vmpath", b"-P") and index + 1 < len(command):
-                path = Path(os.fsdecode(command[index + 1]))
-                if not path.is_absolute():
-                    if cwd is None:
-                        continue
-                    path = cwd / path
-                if path.resolve() == source.parent.resolve():
-                    raise RuntimeError(f"VM is already running (PID {process.name}): {source}")
-            elif os.fsdecode(word) == str(source):
-                raise RuntimeError(f"VM is already running (PID {process.name}): {source}")
+        if vm_in_command(command, cwd, source):
+            raise RuntimeError(f"VM is already running (PID {process.name}): {source}")
 
 
 @contextmanager
 def edited_config(source, edit):
     """The VM's configuration with edit(config) applied for the run, locked
-    against a second run, and restored byte-for-byte afterwards."""
+    against a second run, and restored byte-for-byte afterwards.
+
+    The original is also kept as <config>.cpuburn-backup until it has been
+    written back, so even an uncatchable termination (SIGKILL, power loss)
+    leaves it recoverable; a leftover backup refuses the next run."""
+    backup = config_backup(source)
+    if backup.exists():
+        raise RuntimeError(
+            f"{backup} exists: an earlier run was interrupted before it restored "
+            f"{source.name}. Compare the two, move the backup over {source.name} "
+            "(or delete it if the configuration is already correct), then rerun.")
     with source.open("r+b") as handle:
         try:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -204,13 +250,22 @@ def edited_config(source, edit):
         config = configparser.ConfigParser(interpolation=None, strict=False)
         config.read_string(original.decode("utf-8-sig"))
         edit(config)
+        staging = backup.with_name(backup.name + ".tmp")
+        write_durably(staging, original)
+        shutil.copymode(source, staging)
+        os.replace(staging, backup)
         try:
             with source.open("w", encoding="utf-8") as output:
                 config.write(output)
             yield config, hashlib.sha256(original).hexdigest()
         finally:
-            with source.open("wb") as output:
-                output.write(original)
+            # A second Ctrl+C must not interrupt the truncate-and-write.
+            mask = signal.pthread_sigmask(signal.SIG_BLOCK, CLEANUP_SIGNALS)
+            try:
+                write_durably(source, original)
+                backup.unlink()
+            finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, mask)
 
 
 @contextmanager
@@ -362,6 +417,26 @@ class Automation:
         return reply
 
 
+def shutdown_emulator(api, emulator, seconds):
+    """Ask 86Box to quit, so it can save NVRAM and flush disks, and wait for it.
+
+    Returns True if it is no longer running. The caller still signals the
+    process group afterwards, which is a no-op once 86Box has exited."""
+    if emulator is None or emulator.poll() is not None:
+        return True
+    if api is not None:
+        api.deadline = time.monotonic() + seconds
+        try:
+            api.request("quit", allow_failure=True)
+        except (OSError, RuntimeError, ValueError, TimeoutError):
+            pass
+    try:
+        emulator.wait(timeout=seconds)
+    except subprocess.TimeoutExpired:
+        return False
+    return True
+
+
 def stop_process(process):
     if process is None or process.poll() is not None:
         return
@@ -412,7 +487,7 @@ def complete_counts(result):
 def execute(args, run_dir, command, machine):
     started = time.monotonic()
     deadline = started + args.wall_seconds
-    emulator = connection = None
+    emulator = connection = api = None
     capture = WorkloadCapture(getattr(args, "sample_cpu_seconds", 30.0), args.step_ms)
     recorder = PerfRecorder(run_dir) if getattr(args, "perf", False) else None
     perf_stopped = False
@@ -597,6 +672,7 @@ def execute(args, run_dir, command, machine):
                                 "failed" if result["done"] and not result["counts_consistent"] else
                                 "pass" if args.expect and
                                 all(marker in seen for marker in args.expect)
+                                and (result["done"] or not accuracy)
                                 else "observed" if result["done"] else "timeout")
             if not serial_text:
                 result["capture_note"] = (
@@ -607,7 +683,9 @@ def execute(args, run_dir, command, machine):
                 recorder.stop()
                 perf_stopped = True
                 result["perf"] = recorder.report(capture.windows)
-            api.request("quit")
+            if not shutdown_emulator(api, emulator, QUIT_SECONDS):
+                result["quit_note"] = (f"86Box did not exit within {QUIT_SECONDS}s "
+                                       "of quit; it was terminated")
     except TimeoutError as error:
         serial_path = run_dir / "serial.log"
         if serial_path.exists():
@@ -652,10 +730,21 @@ def execute(args, run_dir, command, machine):
             result["non_step_process_cpu_seconds"] = max(
                 0, result["process_cpu_seconds_total"] - result["step_process_cpu_seconds"])
         if connection is not None:
+            # Error or interrupt paths have not asked 86Box to quit yet.
+            shutdown_emulator(api, emulator, 10)
             connection.close()
         stop_process(emulator)
         (run_dir / "result.json").write_text(json.dumps(result, indent=2) + "\n")
     return result
+
+
+def exit_status(result):
+    """0 for a matched --expect run, or a complete run without guest FAIL/FAULT."""
+    if result["status"] == "pass":
+        return 0
+    if result["status"] == "observed":
+        return 0 if result.get("correctness", {}).get("passed") else 1
+    return 1
 
 
 def run_existing_vm(args, emulator, image, roms):
@@ -696,7 +785,7 @@ def run_existing_vm(args, emulator, image, roms):
                       ("status", "directory", "emulated_ms", "matched")}))
     if "error" in result:
         print(result["error"], file=sys.stderr)
-    return 0 if result["status"] in ("pass", "observed") else 1
+    return exit_status(result)
 
 
 def main():
@@ -749,7 +838,7 @@ def main():
                           ("status", "directory", "emulated_ms", "matched")}))
         if "error" in result:
             print(result["error"], file=sys.stderr)
-        return 0 if result["status"] in ("pass", "observed") else 1
+        return exit_status(result)
     except (OSError, RuntimeError, ValueError, configparser.Error) as error:
         print(f"86Box smoke: {error}", file=sys.stderr)
         return 1
@@ -759,5 +848,8 @@ if __name__ == "__main__":
     def interrupt(signum, frame):
         raise KeyboardInterrupt
 
-    signal.signal(signal.SIGTERM, interrupt)
+    # SIGHUP (closed terminal, dropped SSH) must also restore an in-place VM
+    # configuration and stop 86Box, which runs in its own session.
+    for number in CLEANUP_SIGNALS[1:]:
+        signal.signal(number, interrupt)
     sys.exit(main())

@@ -143,6 +143,7 @@ extern u32 arena_base, arena_size; /* usable, test-owned RAM above 1 MiB (physic
 extern u32 arena_end;               /* end of the arena; the 64 KiB above it is usable RAM nothing else touches */
 extern u32 ram_top;                /* highest usable address from E820/INT15 (bytes, capped 4 GiB-1) */
 void *arena_alloc(u32 size, u32 align); /* bump allocator; reset automatically before every test */
+int e820_claims(u32 base, u32 len); /* any enabled E820 record (of any type) overlaps [base, base+len) */
 extern u32 *pg_dir;                /* persistent page directory (identity 0..16 MiB, 4K pages, P|RW|US) */
 void paging_enable(void);
 void paging_disable(void);
@@ -154,7 +155,6 @@ int kmemcmp(const void *a, const void *b, u32 n);
 extern volatile u32 pit_ticks;     /* 100 Hz, driven by IRQ0 (needs IF=1) */
 u64 stamp(void);                   /* TSC if available else PIT-derived 1.193 MHz count */
 extern int stamp_is_tsc;
-void delay_ms(u32 ms);             /* needs IF=1 */
 static inline u32 ms_now(void) { return pit_ticks * 10; }
 
 /* ---- Exceptions / guard ---- */
@@ -197,10 +197,12 @@ u64 gdt_get(int idx);
 extern u64 gdt[GDT_ENTRIES];
 extern u8 idt_ptr_dummy;
 
-/* Ring-3 helper: iret to flat ring3 (CS=SEL_UCODE, SS/DS/ES/FS/GS=SEL_UDATA, EFLAGS=0x2 i.e. IF=0, IOPL=0)
+/* Ring-3 helper: iret to flat ring3 (CS=SEL_UCODE, SS/DS/ES/FS/GS=SEL_UDATA, EFLAGS=g_r3_eflags,
+   default 0x2 i.e. IF=0, IOPL=0; restore_state resets it)
    at 'entry' with 'stack_top'. Ring-3 code returns by INT 0x80 (DPL3 gate; returns GUARD_R3_INT80)
    or SYSENTER/exception. Wrapped in guard_call. Needs user-accessible pages if paging is on. */
 int ring3_call(void (*entry)(void), u32 stack_top);
+extern u32 g_r3_eflags;
 
 /* TSS (32-bit) */
 typedef struct tss32 {

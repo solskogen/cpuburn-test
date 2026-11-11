@@ -20,7 +20,7 @@ CPU-aware execution adds independently sourced minimum contracts for all
 mandatory feature witnesses and explicit sampled/untested coverage records.
 The source-bound matrix generator selects compatible machines, FPU variants,
 both runtime engines and optionally both FPU backends.
-`make -B BENCHMARKS=0` builds an accuracy-only image without timed harness
+`make BENCHMARKS=0` builds an accuracy-only image without timed harness
 repetition; benchmark-enabled builds remain the default. See
 [CPU contracts and coverage](doc/cpu-contracts.md) for commands and boundaries.
 

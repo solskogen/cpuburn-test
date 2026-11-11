@@ -259,7 +259,7 @@ coverage unless explicitly qualified.
 | Record | Requirements | Checked work / unit and limitations |
 |---|---|---|
 | `cpu_model_contract` | — | One model-contract check: identity, configured FPU and required advertised/probed features; skips if no model expectation is available. Model selection and partial evidence are explained in the linked contracts document. |
-| `core_fault_watchdog_recovery` | — | Three guard checks for fault, watchdog and subsequent #UD recovery; requires the PIT/watchdog. |
+| `core_fault_watchdog_recovery` | — | Four guard checks: fault, watchdog, a nested timeout that hangs again and must abandon its enclosing frame, then #UD recovery; requires the PIT/watchdog. |
 | `int_flags_boundaries` | 486 | 4,096 ADD/SUB producer/consumer cases across branches/calls and SETcc/ADC/SBB. |
 | `int_partial_boundaries` | 486 | 8,192 partial AL/AH/AX writes and preserved-register checks across control flow. |
 | `int_divide_state` | 486 | 3,072 #DE cases for zero divisor and quotient overflow, checking fault EIP and registers, not undefined flags. |
