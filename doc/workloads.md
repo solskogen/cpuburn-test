@@ -136,7 +136,8 @@ nearby mantissas and scaled/signed ratios with exact raw x87 reference values
 under all four rounding controls. `fprem_v*` and `fprem1_v*` exercise FPREM and FPREM1
 with extreme extended-range exponents, signed zeros, nearest-even ties,
 denormals and nonfinite status checks. Each of the 15 FDIV vectors and four
-rounding controls has its own record (60 total); each of 11 remainder
+rounding controls has its own record (60 total; only `fdiv_v0_*` are
+benchmark-sampled, the other 56 are check-only); each of 11 remainder
 vectors/instructions has its own record (22 total). Four classification records
 independently exercise FPREM/FPREM1 denormals, finite/infinity and invalid
 infinity/finite. A failure in one record cannot hide any other vector or
@@ -217,12 +218,19 @@ rearms and checks 1,024 deliveries. Actual periodic count varies with timing.
 
 ## Inventory and reading the tables
 
-This inventory contains **327 registered records** in the default source
+This inventory contains **333 registered records** in the default source
 registries, including `cpu_model_contract` and the core recovery test. It is an
-inventory, not a promise that all 327 execute on a particular machine. `ONLY`
+inventory, not a promise that all 333 execute on a particular machine. `ONLY`
 filters names (the contract is always selected), feature requirements and
 runtime preconditions can skip records, and `burn_mixed` runs only in the final
-round. The tables below name every record; group descriptions apply to every
+round.
+
+**Check-only records** run as correctness checks: they are never
+benchmark-sampled (they report `mode=accuracy` in benchmark builds) and
+`make SUITE=benchmark` leaves them out (`FILTER ... reason=suite_selection`).
+They are `fdiv_v1`–`fdiv_v14` in all four rounding modes, whose normal
+operands take the same FDIV path as `fdiv_v0`, and the `cs_*` platform
+records, which mostly wait on PIT/RTC edges. The tables below name every record; group descriptions apply to every
 name in that group. See [CPU contracts](cpu-contracts.md) for the distinction
 between model expectations, claimed/probed features and exercised evidence.
 
@@ -344,6 +352,7 @@ the count is not necessarily the number of assertions or lanes.
 | `fpu_p6` | FPU + CMOV | P6 x87 conditional moves and comparisons/flags. |
 | `fpu_fxsr` | FPU + FXSR | FXSAVE/FXRSTOR x87 state round-trip; not SSE arithmetic. |
 | `fpu_burn` | FPU | Fixed-count x87 arithmetic, series and transcendental identities with checked references/tolerances; not a wall-clock burn. |
+| `fpu_ftol` | FPU | Float-to-int as pre-SSE compilers emit it for every `(int)` cast: FNSTCW, force truncation, FLDCW, FISTP, FLDCW restore, plus a FISTP under round-to-nearest, so the rounding control changes twice per value. 8,192×`HEAVY_SCALE` values of the form i + 0.75, checked in bulk. `ops` counts conversions. |
 | `mmx_alu` | MMX | Seeded packed arithmetic, saturation, packing, compares and logical instructions against scalar lane references. |
 | `mmx_shifts` | MMX | Packed shifts, including counts beyond lane widths, checked against scalar references. |
 | `mmx_state` | MMX | MMX register/state and EMMS behavior. |
@@ -463,6 +472,7 @@ arena memory and restore temporary descriptor/interrupt state.
 | `heavy_pm_privilege` | 486 | Selected privileged instruction, gate and descriptor faults; aggregate operations. |
 | `heavy_pm_pvi` | VME | Protected-mode virtual interrupt flags and VIP faults; runtime CR4 support needed. |
 | `heavy_pm_vme` | VME | Virtual-8086 virtual flags and interrupt redirection/faults; runtime CR4 support needed. |
+| `heavy_pm_v86_monitor` | 486 | V86 code under a monitor, as DOS under EMM386 or a Win9x DOS box: at IOPL=0 without VME (CR4.VME is cleared for the run) every CLI, STI, PUSHF, POPF, INT 21h and IRET traps with #GP and is emulated against a virtual IF; the INT 21h handler does 16-bit ALU work through DS/ES. 1,024×`HEAVY_SCALE` iterations of 8 traps; trap counts per instruction, virtual-IF results and the ALU result are checked in bulk. `ops` counts traps. |
 | `heavy_pm_irq_shadows` | 486 | STI/IRET pending IRQ samples and MOV SS/POP SS debug-trap shadows, not all asynchronous IRQ ordering. |
 
 Each exception-priority record requires PAGING + 486 and executes 16,384
@@ -525,8 +535,8 @@ fault-time registers.
 ### System, platform and sustained interactions
 
 Platform records are bounded probes or observations, not comprehensive
-chipset tests. Several `cs_*` and `sys_*` records have no explicit `t_ops`
-count; zero `ops` must not be interpreted as no work. Timed waits, polling,
+chipset tests. The `cs_*` records are check-only and have no `t_ops` count;
+zero `ops` must not be interpreted as no work. Timed waits, polling,
 setup, result checks and any diagnostic output belong to the checked
 invocation. Device/firmware and available memory may also cause skips.
 
@@ -554,6 +564,7 @@ invocation. Device/firmware and available memory may also cause skips.
 | `sys_debug_extensions` | DE | Two DR4/DR5 #UD checks with CR4.DE enabled/restored. |
 | `sys_cpuid_leaves` | CPUID | CPUID leaf inventory and repeated consistency checks; 32 generic operations, not exhaustive leaf semantics. |
 | `sys_irq_timer` | — | Approximately 500 ms IRQ0 delivery against PIT/TSC; `ops` counts observed ticks. |
+| `sys_irq_rate_3800`, `sys_irq_rate_15700` | — | A checked integer workload while IRQ0 runs at 3.8 or 15.7 kHz (PIT divisors 314 and 76), as PC-speaker PCM and DOS sound code program it; the result must match a 100 Hz reference. Guest time stays exact across rate changes. With a TSC, more interrupts than possible fail; fewer are reported as `irq_rate_achieved=`, since a slow CPU or core may lose ticks it cannot service. `ops` counts loop iterations. |
 | `heavy_mix_transitions` | PAGING + 486 | Seeded integer/memory, page remaps, optional x87/MMX and interrupts; aggregate operation count depends on available features. |
 | `heavy_state_interrupt` | 486 | 32,768 software interrupt deliveries and checked register/optional FPU/MMX state; `ops` counts mixed state work. |
 | `heavy_x87_save_restore` | 486 + FPU | 65,536 FNSAVE/FRSTOR iterations at default scale; `ops` counts 18 operations per iteration. |

@@ -284,6 +284,7 @@ static u32 sys_debug_extensions(void) {
 static u32 sys_cr_regs(void) {
     u32 save0 = rd_cr0(), save2 = rd_cr2(), save3 = rd_cr3();
     const u32 bits[] = {0x10000, 0x40000, 0x20, 2};
+    t_ops(12); /* CR0, CR3 and CR2 writes; CR4 writes are counted below */
     for (u32 i = 0; i < 4; i++) {
         wr_cr0(save0 ^ bits[i]); CHECK_EQ(rd_cr0() & bits[i], (save0 ^ bits[i]) & bits[i]); wr_cr0(save0);
     }
@@ -308,6 +309,7 @@ static u32 sys_cr_regs(void) {
         }
         else t_note("CR4 bit=%x rejected rc=%x", bit, rc);
         arg = save4; CHECK_EQ(guard_call(write_cr4), 0);
+        t_ops(2);
     }
     int rc;
     if (!cpu.hv) {
@@ -401,6 +403,64 @@ static u32 sys_irq_timer(void) {
     t_ops(ticks); return ticks;
 }
 
+/* A checked integer workload while IRQ0 runs at kHz rates, as PC-speaker
+ * PCM playback and DOS sound code program the PIT: every interrupt ends the
+ * current block of work and re-enters it. The result must not depend on the
+ * interrupts; the achieved rate is reported, since a slow 486 or FPGA core
+ * can legitimately lose ticks it cannot service in time. */
+static void irq_rate_fill(u32 *buf, u32 words) {
+    for (u32 i = 0; i < words; i++) buf[i] = i * 0x9E3779B9u ^ 0x5bd1e995u;
+}
+static u32 irq_rate_work(u32 *buf, u32 words, u32 passes) {
+    u32 sum = 0x2545F491u;
+    for (u32 p = 0; p < passes; p++)
+        for (u32 i = 0; i < words; i++) {
+            u32 v = buf[i] * 2654435761u + p;
+            buf[i] = v ^ (v >> 13);
+            sum = csum_mix(sum, buf[i]);
+        }
+    return sum;
+}
+static u32 irq_rate_ref;
+static int irq_rate_ref_ok;
+static u32 irq_rate(u32 mult) {
+    /* Long enough for many interrupts per invocation even where the guest
+     * runs at host speed: each invocation reprograms the PIT, restarting it. */
+    const u32 words = 8192, passes = 4u * HEAVY_SCALE;
+    u32 *buf = arena_alloc(words * 4, 16);
+    if (!buf) SKIP("arena too small");
+    if (!irq_rate_ref_ok) { /* reference once, at the normal 100 Hz */
+        irq_rate_fill(buf, words);
+        irq_rate_ref = irq_rate_work(buf, words, passes);
+        irq_rate_ref_ok = 1;
+    }
+    irq_rate_fill(buf, words);
+    sti();
+    int tsc = cpu_test_feature(REQ_TSC) && cpu.tsc_per_ms;
+    CHECK(pit_set_multiplier(mult));
+    u32 fast0 = pit_fast_ticks;
+    u64 t0 = tsc ? rdtsc() : 0;
+    u32 sum = irq_rate_work(buf, words, passes);
+    u64 t1 = tsc ? rdtsc() : 0;
+    u32 fast = pit_fast_ticks - fast0;
+    pit_set_multiplier(1);
+    CHECK_EQ(sum, irq_rate_ref);
+    if (tsc) {
+        u64 us = (t1 - t0) * 1000 / cpu.tsc_per_ms, expected = us * mult / 10000;
+        /* More interrupts than the PIT can generate is impossible; fewer is a
+         * legitimate inability to keep up, so it is only reported. None at all
+         * while several were due means IRQ0 is not being delivered. */
+        CHECK(fast <= expected + expected / 4 + 2);
+        if (expected >= 4) CHECK(fast > 0);
+        t_note("rate_hz=%u irqs=%u expected=%llu irq_rate_achieved=%llu%% us=%llu",
+               100 * mult, fast, expected, expected ? (u64)fast * 100 / expected : 0, us);
+    } else t_note("rate_hz=%u irqs=%u (no TSC: achieved rate not measured)", 100 * mult, fast);
+    t_ops((u64)words * passes);
+    return sum;
+}
+static u32 sys_irq_rate_3800(void) { return irq_rate(38); }
+static u32 sys_irq_rate_15700(void) { return irq_rate(157); }
+
 const test_t tests_sys[] = {
     {"sys_tsc", sys_tsc, REQ_TSC},
     {"sys_msr_probe", sys_msr_probe, REQ_MSR},
@@ -415,5 +475,7 @@ const test_t tests_sys[] = {
     {"sys_debug_extensions", sys_debug_extensions, REQ_DE},
     {"sys_cpuid_leaves", sys_cpuid_leaves, REQ_CPUID},
     {"sys_irq_timer", sys_irq_timer, 0},
+    {"sys_irq_rate_3800", sys_irq_rate_3800, 0},
+    {"sys_irq_rate_15700", sys_irq_rate_15700, 0},
     {0, 0, 0}
 };

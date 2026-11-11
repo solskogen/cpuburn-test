@@ -474,10 +474,45 @@ static u32 fpu_burn(void) {
     }
     init(); return sum;
 }
+/* Float-to-int as pre-SSE compilers emit it for every (int) cast (MSVC's
+ * _ftol): save the control word, force truncation, FISTP, restore. Each value
+ * is also stored once under the restored round-to-nearest mode, so the
+ * rounding control changes twice per conversion pair. Checked in bulk. */
+static u32 fpu_ftol(void) {
+    static const u64 three_quarters = 0x3FE8000000000000ull; /* 0.75 */
+    const s32 n = 4096 * HEAVY_SCALE;
+    u32 sum = 0, bad = 0;
+    init();
+    for (s32 i = -n; i < n; i++) {
+        s32 trunc, nearest; u16 old, forced;
+        __asm__ volatile(
+            "fildl %[i]\n\t"
+            "faddl %[c]\n\t"
+            "fld %%st(0)\n\t"
+            "fnstcw %[old]\n\t"
+            "movzwl %[old],%%eax\n\t"
+            "orl $0x0c00,%%eax\n\t"
+            "movw %%ax,%[forced]\n\t"
+            "fldcw %[forced]\n\t"
+            "fistpl %[t]\n\t"
+            "fldcw %[old]\n\t"
+            "fistpl %[r]"
+            : [t]"=m"(trunc), [r]"=m"(nearest), [old]"=m"(old), [forced]"=m"(forced)
+            : [i]"m"(i), [c]"m"(three_quarters)
+            : "eax", "cc", "memory");
+        /* i + 0.75 truncates toward zero and rounds to i + 1. */
+        bad += (trunc != (i >= 0 ? i : i + 1)) + (nearest != i + 1);
+        sum = csum_mix(sum, (u32)trunc ^ ((u32)nearest << 1));
+    }
+    CHECK_EQ(bad, 0);
+    t_ops((u64)n * 4); /* two conversions per value, 2n values */
+    return sum;
+}
+
 const test_t tests_fpu[] = {
     {"fpu_arith",fpu_arith,REQ_FPU}, {"fpu_formats",fpu_formats,REQ_FPU},
     {"fpu_compare",fpu_compare,REQ_FPU}, {"fpu_round",fpu_round,REQ_FPU},
     {"fpu_trans",fpu_trans,REQ_FPU}, {"fpu_exceptions",fpu_exceptions,REQ_FPU},
     {"fpu_stack",fpu_stack,REQ_FPU}, {"fpu_p6",fpu_p6,REQ_FPU|REQ_CMOV}, {"fpu_fxsr",fpu_fxsr,REQ_FPU|REQ_FXSR},
-    {"fpu_burn",fpu_burn,REQ_FPU}, {0,0,0}
+    {"fpu_burn",fpu_burn,REQ_FPU}, {"fpu_ftol",fpu_ftol,REQ_FPU}, {0,0,0}
 };

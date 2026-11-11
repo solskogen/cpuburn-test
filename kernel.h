@@ -79,6 +79,10 @@ extern const test_t tests_paging[], tests_mem[], tests_sys[], tests_burn[];
 extern const test_t tests_heavy_paging[], tests_heavy_pmode[], tests_heavy_state[];
 extern const test_t tests_corpus[];
 extern const test_t tests_fp_edges[], tests_sweeps[];
+/* Check-only tables: correctness records that are never benchmark-sampled and
+ * are left out of SUITE=benchmark builds (kmain runs them, and tests_chipset,
+ * with run_checks). */
+extern const test_t tests_fp_edges_check[];
 extern const test_t tests_priority[];
 extern const test_t tests_restart_complex[];
 extern const test_t tests_vendor[];
@@ -153,6 +157,8 @@ int kmemcmp(const void *a, const void *b, u32 n);
 
 /* ---- Time ---- */
 extern volatile u32 pit_ticks;     /* 100 Hz, driven by IRQ0 (needs IF=1) */
+extern volatile u32 pit_fast_ticks; /* every IRQ0, including multiplied rates */
+int pit_set_multiplier(u32 m);      /* IRQ0 at 100*m Hz, m dividing 11932; restore_state resets to 1 */
 u64 stamp(void);                   /* TSC if available else PIT-derived 1.193 MHz count */
 extern int stamp_is_tsc;
 static inline u32 ms_now(void) { return pit_ticks * 10; }

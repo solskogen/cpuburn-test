@@ -304,15 +304,23 @@ static u32 rem1_invalid(void) { return remainder_class_check(3); }
 #define REM_TEST(n) \
     { "fprem_v" #n, rem_##n, REQ_FPU }, \
     { "fprem1_v" #n, rem1_##n, REQ_FPU },
+/* Normal operands take the same FDIV path, so vector 0 is the benchmark in
+ * each rounding mode; vectors 1-14 are correctness checks in their own
+ * check-only table. */
 const test_t tests_fp_edges[] = {
-    DIV_TEST(0) DIV_TEST(1) DIV_TEST(2) DIV_TEST(3) DIV_TEST(4)
-    DIV_TEST(5) DIV_TEST(6) DIV_TEST(7) DIV_TEST(8) DIV_TEST(9)
-    DIV_TEST(10) DIV_TEST(11) DIV_TEST(12) DIV_TEST(13) DIV_TEST(14)
+    DIV_TEST(0)
     REM_TEST(0) REM_TEST(1) REM_TEST(2) REM_TEST(3) REM_TEST(4) REM_TEST(5)
     REM_TEST(6) REM_TEST(7) REM_TEST(8) REM_TEST(9) REM_TEST(10)
     { "fprem_denormal", rem_denormal, REQ_FPU },
     { "fprem1_denormal", rem1_denormal, REQ_FPU },
     { "fprem_finite_inf", rem_infinity, REQ_FPU },
     { "fprem1_inf_invalid", rem1_invalid, REQ_FPU },
+    { 0, 0, 0 }
+};
+
+const test_t tests_fp_edges_check[] = {
+    DIV_TEST(1) DIV_TEST(2) DIV_TEST(3) DIV_TEST(4)
+    DIV_TEST(5) DIV_TEST(6) DIV_TEST(7) DIV_TEST(8) DIV_TEST(9)
+    DIV_TEST(10) DIV_TEST(11) DIV_TEST(12) DIV_TEST(13) DIV_TEST(14)
     { 0, 0, 0 }
 };

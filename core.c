@@ -233,6 +233,38 @@ static void pic_init(void) {
     outb(0x40, 11932 >> 8);
 }
 
+/* PIT channel 0 normally divides by 11932: 100 Hz, one pit_ticks tick per
+ * IRQ0. Interrupt-rate workloads program a smaller divisor. Time stays exact
+ * because every IRQ0 adds its divisor to pit_clocks and each 11932 input
+ * clocks is one 10 ms tick, so ms_now(), the watchdog and leases keep their
+ * meaning. Reprogramming restarts the count, so a divisor change first
+ * credits the part of the current period that has already elapsed.
+ * pit_fast_ticks counts every IRQ0. */
+static volatile u32 pit_div = 11932, pit_clocks;
+volatile u32 pit_fast_ticks;
+static u32 pit_latch(void) {
+    outb(0x43, 0);
+    u32 c = inb(0x40);
+    return c | (u32)inb(0x40) << 8;
+}
+static void pit_credit(u32 clocks) { /* interrupts off */
+    pit_clocks += clocks;
+    while (pit_clocks >= 11932) { pit_clocks -= 11932; pit_ticks++; }
+}
+int pit_set_multiplier(u32 m) {
+    if (!m || 11932 % m) return 0;
+    u32 f = rd_eflags(), div = 11932 / m;
+    cli();
+    u32 c = pit_latch();
+    if (c && c <= pit_div) pit_credit(pit_div - c);
+    outb(0x43, 0x34);
+    outb(0x40, div & 0xFF);
+    outb(0x40, div >> 8);
+    pit_div = div;
+    wr_eflags(f);
+    return 1;
+}
+
 static int timer_ready(void) {
     u8 saved = inb(0x61);
     if (saved == 0xFF) return 0;
@@ -256,15 +288,13 @@ u64 stamp(void) {
         __asm__ volatile("" ::: "memory");
         return v;
     }
-    u32 t1, t2, c;
+    u32 t1, t2, k1, k2, d, c;
     do {
-        t1 = pit_ticks;
-        outb(0x43, 0);
-        c = inb(0x40);
-        c |= (u32)inb(0x40) << 8;
-        t2 = pit_ticks;
-    } while (t1 != t2);
-    return (u64)t1 * 11932 + (11932 - c);
+        t1 = pit_ticks; k1 = pit_clocks; d = pit_div;
+        c = pit_latch();
+        t2 = pit_ticks; k2 = pit_clocks;
+    } while (t1 != t2 || k1 != k2);
+    return (u64)t1 * 11932 + k1 + (d - c);
 }
 
 /* ============================ exceptions ============================ */
@@ -295,8 +325,10 @@ static void irq_dispatch(regs_t *r) {
         if (!(inb(p) & 0x80)) { spurious++; if (irq == 15) outb(0x20, 0x20); return; }
     }
     if (irq == 0) {
-        pit_ticks++;
-        if (lease_active_id) poll_lease(lease_active_id);
+        u32 before = pit_ticks;
+        pit_fast_ticks++;
+        pit_credit(pit_div);
+        if (pit_ticks != before && lease_active_id) poll_lease(lease_active_id);
     }
     if (int_hook[r->vec]) int_hook[r->vec](r);
     if (irq >= 8) outb(0xA0, 0x20);
@@ -749,6 +781,7 @@ static void restore_state(void) {
     exc_expect_clear();
     g_wd_deadline = 0;
     g_r3_eflags = 0x2;
+    if (pit_div != 11932) pit_set_multiplier(1);
     idt_init();
     for (int i = GDT_SCRATCH_FIRST; i < GDT_ENTRIES; i++) gdt[i] = 0;
     __asm__ volatile("lldt %w0" ::"r"(0) : "memory");
@@ -815,6 +848,9 @@ static void poll_lease(u32 id) {
 #ifndef ONLY
 #define ONLY ""
 #endif
+#ifndef SUITE_BENCHMARK
+#define SUITE_BENCHMARK 0
+#endif
 /* ONLY is a comma-separated list of exact test names; empty runs every test.
  * Kept in an array rather than a string literal: the linker may otherwise
  * store the last test name as the tail of this string, and the Makefile's
@@ -833,17 +869,21 @@ static int selected(const char *name) {
     return 0;
 }
 
-static void run_tests(const test_t *t) {
+/* check_only: correctness records, never benchmark-sampled and left out of
+ * SUITE=benchmark builds. */
+static void run_table(const test_t *t, int check_only) {
     for (; t->name; t++) {
         ++test_index;
-        if (!selected(t->name) && t != tests_cpu_contract) {
-            kprintf("FILTER name=%s id=%u req=%08x reason=build_selection\n",
-                    t->name, test_index, t->req);
+        int suite_skip = SUITE_BENCHMARK && check_only;
+        if ((suite_skip || !selected(t->name)) && t != tests_cpu_contract) {
+            kprintf("FILTER name=%s id=%u req=%08x reason=%s\n",
+                    t->name, test_index, t->req,
+                    suite_skip ? "suite_selection" : "build_selection");
             cpu_feature_result(t, "FILTERED");
             continue;
         }
         u32 runtime_start = ms_now();
-        int accuracy_test = cpu_accuracy_mode() || t == tests_cpu_contract;
+        int accuracy_test = cpu_accuracy_mode() || t == tests_cpu_contract || check_only;
         g_cur = t;
         tot_tests++;
         post((u8)test_index);
@@ -974,6 +1014,8 @@ static void run_tests(const test_t *t) {
         report_runtime(t->name, runtime_start, warmup_ms, sample_ms);
     }
 }
+static void run_tests(const test_t *t) { run_table(t, 0); }
+static void run_checks(const test_t *t) { run_table(t, 1); }
 
 static void core_ud_probe(void) { __asm__ volatile("ud2"); }
 static void core_watchdog_probe(void) { for (;;) { sti(); hlt(); } }
@@ -1050,8 +1092,9 @@ void kmain(void) {
             cpu.ext_edx, cpu.has_3dnow, cpu.has_3dnowext, cpu.has_emmi);
     kprintf("MEM ram_top=%08x arena_base=%08x arena_size=%08x kernel_start=%08x kernel_end=%08x\n",
             ram_top, arena_base, arena_size, (u32)_kernel_start, (u32)_end);
-    kprintf("CFG rounds=%u burn_seconds=%u watchdog_seconds=%u heavy_scale=%u seed=%08x test_seconds=%u protocol=work1 benchmarks=%u\n",
-            ROUNDS, BURN_SECONDS, WATCHDOG_SECONDS, HEAVY_SCALE, (u32)TEST_SEED, TEST_SECONDS, BENCHMARKS);
+    kprintf("CFG rounds=%u burn_seconds=%u watchdog_seconds=%u heavy_scale=%u seed=%08x test_seconds=%u protocol=work1 benchmarks=%u suite=%s\n",
+            ROUNDS, BURN_SECONDS, WATCHDOG_SECONDS, HEAVY_SCALE, (u32)TEST_SEED, TEST_SECONDS, BENCHMARKS,
+            SUITE_BENCHMARK ? "benchmark" : BENCHMARKS ? "full" : "accuracy");
     if (*only_tests) kprintf("CFG only=%s\n", only_tests);
 
     if (cpu.is386) kprintf("WARN 386 detected: unsupported, results may be unreliable\n");
@@ -1065,12 +1108,14 @@ void kmain(void) {
         run_tests(tests_corpus);
         run_tests(tests_fpu);
         run_tests(tests_fp_edges);
+        run_checks(tests_fp_edges_check);
         run_tests(tests_mmx);
         run_tests(tests_vendor);
         run_tests(tests_cyrix);
         run_tests(tests_pmode);
         run_tests(tests_heavy_pmode);
-        run_tests(tests_chipset);
+        /* Platform checks: mostly waiting on PIT/RTC edges, so never benchmarked. */
+        run_checks(tests_chipset);
         paging_enable();
         run_tests(tests_paging);
         run_tests(tests_priority);
