@@ -241,6 +241,9 @@ static void pic_init(void) {
  * credits the part of the current period that has already elapsed.
  * pit_fast_ticks counts every IRQ0. */
 static volatile u32 pit_div = 11932, pit_clocks;
+/* Set when a reprogram found IRQ0 pending and credited the period it ends:
+ * the interrupt, delivered after the new divisor is in place, adds nothing. */
+static volatile u32 pit_irq_credited;
 volatile u32 pit_fast_ticks;
 static u32 pit_latch(void) {
     outb(0x43, 0);
@@ -256,6 +259,14 @@ int pit_set_multiplier(u32 m) {
     u32 f = rd_eflags(), div = 11932 / m;
     cli();
     u32 c = pit_latch();
+    /* An IRQ0 already raised but not yet taken ends a period of the old
+     * divisor, which the counter has reloaded and started again: credit
+     * that whole period here, as its interrupt will run with the new one. */
+    outb(0x20, 0x0A); /* OCW3: read IRR */
+    if (inb(0x20) & 1) {
+        if (!pit_irq_credited) pit_credit(pit_div);
+        pit_irq_credited = 1;
+    }
     if (c && c <= pit_div) pit_credit(pit_div - c);
     outb(0x43, 0x34);
     outb(0x40, div & 0xFF);
@@ -327,7 +338,8 @@ static void irq_dispatch(regs_t *r) {
     if (irq == 0) {
         u32 before = pit_ticks;
         pit_fast_ticks++;
-        pit_credit(pit_div);
+        if (pit_irq_credited) pit_irq_credited = 0; /* pit_set_multiplier() did */
+        else pit_credit(pit_div);
         if (pit_ticks != before && lease_active_id) poll_lease(lease_active_id);
     }
     if (int_hook[r->vec]) int_hook[r->vec](r);
