@@ -69,7 +69,13 @@ typedef struct test {
     const char *name;     /* short snake_case id, e.g. "int_alu" */
     u32 (*fn)(void);      /* returns informational checksum; use CHECK()/t_fail()/t_skip() */
     u32 req;              /* REQ_* flags */
+    u32 flags;            /* T_* flags */
 } test_t;
+
+/* Correctness only: run once, never benchmark-sampled, left out of
+ * SUITE=benchmark builds. For workloads that run far above full speed on
+ * every emulated CPU, so timing them finds no slowdown. */
+#define T_CHECK 1u
 
 /* Each module exports a NULL-terminated array; kmain owns the execution order.
  * Integer/corpus/FPU/protected-mode/chipset modules run with paging OFF.
@@ -81,7 +87,7 @@ extern const test_t tests_corpus[];
 extern const test_t tests_fp_edges[], tests_sweeps[];
 /* Check-only tables: correctness records that are never benchmark-sampled and
  * are left out of SUITE=benchmark builds (kmain runs them, and tests_chipset,
- * with run_checks). */
+ * with run_checks). Single records elsewhere use T_CHECK. */
 extern const test_t tests_fp_edges_check[];
 extern const test_t tests_int_check[];
 extern const test_t tests_priority[];
@@ -89,6 +95,7 @@ extern const test_t tests_restart_complex[];
 extern const test_t tests_vendor[];
 extern const test_t tests_cpu_contract[];
 extern const test_t tests_cyrix[];
+extern const test_t tests_realworld[];
 void cpu_control(int serial_available);
 void cpu_contract_init(void);
 u32 cpu_required_features(void);

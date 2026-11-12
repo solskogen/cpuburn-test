@@ -155,8 +155,8 @@ static u32 mediagx_cpuid(void) {
 }
 
 const test_t tests_cyrix[] = {
-    {"cyrix_cpuid_control", cyrix_cpuid_control, 0},
-    {"cyrix_smm_disabled", cyrix_smm_disabled, 0},
-    {"mediagx_cpuid", mediagx_cpuid, REQ_CPUID},
-    {0, 0, 0}
+    {"cyrix_cpuid_control", cyrix_cpuid_control, 0, T_CHECK},
+    {"cyrix_smm_disabled", cyrix_smm_disabled, 0, T_CHECK},
+    {"mediagx_cpuid", mediagx_cpuid, REQ_CPUID, T_CHECK},
+    {0, 0, 0, 0}
 };

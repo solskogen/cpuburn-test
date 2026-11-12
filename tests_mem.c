@@ -255,12 +255,12 @@ static u32 mem_text_print(void) {
 }
 
 const test_t tests_mem[] = {
-    {"mem_walk", mem_walk, REQ_PAGING},
-    {"mem_bandwidth", mem_bandwidth, REQ_PAGING},
+    {"mem_walk", mem_walk, REQ_PAGING, T_CHECK},
+    {"mem_bandwidth", mem_bandwidth, REQ_PAGING, T_CHECK},
     {"mem_unaligned", mem_unaligned, REQ_PAGING},
-    {"mem_lock", mem_lock, REQ_PAGING | REQ_486},
-    {"mem_cache_ctl", mem_cache_ctl, REQ_PAGING | REQ_486 | REQ_NOHV},
+    {"mem_lock", mem_lock, REQ_PAGING | REQ_486, T_CHECK},
+    {"mem_cache_ctl", mem_cache_ctl, REQ_PAGING | REQ_486 | REQ_NOHV, T_CHECK},
     {"mem_cache_off_loop", mem_cache_off_loop, REQ_486 | REQ_NOHV},
-    {"mem_text_print", mem_text_print, REQ_PAGING},
+    {"mem_text_print", mem_text_print, REQ_PAGING, T_CHECK},
     {0, 0, 0}
 };

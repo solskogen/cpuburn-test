@@ -479,14 +479,14 @@ const test_t tests_vendor[] = {
     { "3dnow_float", now_float, NOW_REQ },
     { "3dnow_convert", now_convert, NOW_REQ },
     { "3dnow_integer", now_integer, NOW_REQ },
-    { "3dnow_reciprocal", now_reciprocal, NOW_REQ },
-    { "3dnow_state", now_state, NOW_REQ },
+    { "3dnow_reciprocal", now_reciprocal, NOW_REQ, T_CHECK },
+    { "3dnow_state", now_state, NOW_REQ, T_CHECK },
     { "3dnow_enhanced_float", now_enhanced_float, NOW_REQ | REQ_3DNOWEXT },
     { "3dnow_word_convert", now_word_convert, NOW_REQ | REQ_3DNOWEXT },
-    { "3dnow_swap", now_swap, NOW_REQ | REQ_3DNOWEXT },
-    { "cyrix_emmi_arithmetic", emmi_arithmetic, REQ_MMX | REQ_EMMI },
-    { "cyrix_emmi_moves", emmi_moves, REQ_MMX | REQ_EMMI },
-#define SINGLE(n, code) { "cyrix_emmi_" #n, emmi_only_##n, REQ_MMX | REQ_EMMI },
+    { "3dnow_swap", now_swap, NOW_REQ | REQ_3DNOWEXT, T_CHECK },
+    { "cyrix_emmi_arithmetic", emmi_arithmetic, REQ_MMX | REQ_EMMI, T_CHECK },
+    { "cyrix_emmi_moves", emmi_moves, REQ_MMX | REQ_EMMI, T_CHECK },
+#define SINGLE(n, code) { "cyrix_emmi_" #n, emmi_only_##n, REQ_MMX | REQ_EMMI, T_CHECK },
     EMMI_OPS(SINGLE)
 #undef SINGLE
     { NULL, NULL, 0 }

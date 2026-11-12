@@ -211,8 +211,8 @@ static u32 cpu_identity(void) {
 }
 
 const test_t tests_cpu_contract[] = {
-    { "cpu_model_contract", cpu_identity, 0 },
-    { NULL, NULL, 0 }
+    { "cpu_model_contract", cpu_identity, 0, 0 },
+    { NULL, NULL, 0, 0 }
 };
 
 u32 cpu_detected_features(void) {

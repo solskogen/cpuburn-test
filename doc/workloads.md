@@ -136,9 +136,9 @@ nearby mantissas and scaled/signed ratios with exact raw x87 reference values
 under all four rounding controls. `fprem_v*` and `fprem1_v*` exercise FPREM and FPREM1
 with extreme extended-range exponents, signed zeros, nearest-even ties,
 denormals and nonfinite status checks. Each of the 15 FDIV vectors and four
-rounding controls has its own record (60 total; only `fdiv_v0_*` are
-benchmark-sampled, the other 56 are check-only); each of 11 remainder
-vectors/instructions has its own record (22 total). Four classification records
+rounding controls has its own record (60 total, all check-only); each of 11
+remainder vectors/instructions has its own record (22 total; only `fprem1_v9`
+is benchmark-sampled, the rest are check-only). Four classification records
 independently exercise FPREM/FPREM1 denormals, finite/infinity and invalid
 infinity/finite. A failure in one record cannot hide any other vector or
 rounding mode. Default totals on a passing CPU are 122,880 divisions,
@@ -215,12 +215,32 @@ each save/restore record runs 65,536 checked iterations. LAPIC periodic stress
 requires at least 2,048 deliveries over at least two seconds; one-shot stress
 rearms and checks 1,024 deliveries. Actual periodic count varies with timing.
 
+### Real-world-style code workloads
+
+These six records generate, load, patch or dispatch code the way real
+programs do, to find paths where an emulator slows down on that kind of code.
+Everything stays in RAM, nothing is written to disk. Each result is checked
+against a C reference that never runs the generated code. They require 486.
+
+| Record | What it does | `ops` (unit) per invocation |
+|---|---|---:|
+| `rw_jit_tiering` | A tiering JIT for a small stack bytecode: calls are interpreted first, hot functions are translated to x86 with inline caches for globals, unstable globals deoptimise, and the code cache is flushed and refilled. | 16,384 (`jit_call`) |
+| `rw_exe_loader` | Decompresses a packed program image, applies its relocations at a changing load address, and runs it (a main calling eight functions). | 1,024 (`image_load`) |
+| `rw_overlay` | An overlay manager swapping relocated images into one region, with runs of calls between swaps. | 8,192 (`overlay_call`) |
+| `rw_decrypt_run` | A decryptor stub decodes the body behind it on its own page and falls into it; the body is encrypted again with a new key before each pass. | 2,048 (`decrypt_pass`) |
+| `rw_thunks` | Per-object call thunks (`mov ecx,this; jmp method`), like window-procedure and callback thunks, created and freed while others on the same pages keep being called. | 65,536 (`thunk_call`) |
+| `rw_threaded_vm` | A register bytecode run by a computed-goto interpreter (one indirect jump per instruction), checked against a switch interpreter. | executed bytecode instructions (`vm_instruction`) |
+
+Two drafts were dropped because they ran far above full speed on every CPU
+tested and so found nothing: a span rasteriser and a copy-on-write fork.
+
 
 ## Inventory and reading the tables
 
-This inventory contains **335 registered records** in the default source
-registries, including `cpu_model_contract` and the core recovery test. It is an
-inventory, not a promise that all 335 execute on a particular machine. `ONLY`
+This inventory contains **342 registered records** in the default source
+registries, including `cpu_model_contract` and the core recovery test; 163 of
+them are benchmark-sampled. It is an
+inventory, not a promise that all 342 execute on a particular machine. `ONLY`
 filters names (the contract is always selected), feature requirements and
 runtime preconditions can skip records, and `burn_mixed` runs only in the final
 round.
@@ -228,10 +248,42 @@ round.
 **Check-only records** run as correctness checks: they are never
 benchmark-sampled (they report `mode=accuracy` in benchmark builds) and
 `make SUITE=benchmark` leaves them out (`FILTER ... reason=suite_selection`).
-They are `fdiv_v1`–`fdiv_v14` in all four rounding modes, whose normal
-operands take the same FDIV path as `fdiv_v0`, the `cs_*` platform
-records, which mostly wait on PIT/RTC edges, and `int_cf_consumers`, a
-check of carry-flag consumers. The tables below name every record; group descriptions apply to every
+A record is check-only when timing it says nothing about emulator speed:
+
+- The `cs_*` platform records, which mostly wait on PIT/RTC edges.
+- Records whose slowest result was at least 200% of real time on every one of
+  the 26 dynarec CPU families tested at their fastest speed (86Box master,
+  Ryzen 9 9950X host). They still check the same cases; they just are not
+  timed.
+  - All `fdiv_v*` records and every `fprem_v*`/`fprem1_v*` vector except
+    `fprem1_v9`, plus `fprem_denormal`, `fprem1_denormal`, `fprem_finite_inf`
+    and `fprem1_inf_invalid`.
+  - `fpu_arith`, `fpu_compare`, `fpu_round`, `fpu_trans`, `fpu_p6`,
+    `fpu_fxsr`.
+  - `mmx_x87_transitions`, `mmx_state`, `mmx_alias`, `mmx_exc`;
+    `3dnow_reciprocal`, `3dnow_state`, `3dnow_swap`.
+  - Every `cyrix_emmi_*` record, `cyrix_cpuid_control`,
+    `cyrix_smm_disabled`, `mediagx_cpuid`.
+  - `int_flags_boundaries`, `int_partial_boundaries`, `int_divide_state`,
+    `int_muldiv`, `int_bcd`, `int_cmov`, `int_cx8`, `int_cpuid_cr`,
+    `core_fault_watchdog_recovery`.
+  - The immediate-only n=256 SMC rates, `int_smc_rate_k*_n256`.
+  - `mem_bandwidth`, `mem_cache_ctl`, `mem_lock`, `mem_text_print`,
+    `mem_walk`, `pg_pae`, `pg_tlb_stress`.
+  - `pm_alignment_check`, `pm_debug_regs`, `pm_gates_rings`, `pm_syscall`,
+    `pm_sysenter`, `pm_task_switch`, `pm_v86`, `priority_fetch_operand`,
+    `priority_page_permissions`, `priority_privileged_page`,
+    `priority_segment_page`.
+  - `sys_cpuid_leaves`, `sys_cr_regs`, `sys_debug_extensions`,
+    `sys_irq_timer`, `sys_mca_state`, `sys_mce_control`, `sys_msr_probe`,
+    `sys_msr_rw`, `sys_msr_tsc`, `sys_mtrr_state`, `sys_pat_state`,
+    `sys_rdpmc`, `sys_tsc`.
+- Pure correctness records added later: `int_cf_consumers`, a check of
+  carry-flag consumers, and `int_smc_alu_family_flags`.
+
+Records from 100% to 200% stay benchmarks, so a regression in them is still
+visible. In the source, check-only records carry `T_CHECK` in their table entry
+(or sit in a table run by `run_checks`). The tables below name every record; group descriptions apply to every
 name in that group. See [CPU contracts](cpu-contracts.md) for the distinction
 between model expectations, claimed/probed features and exercised evidence.
 
@@ -297,11 +349,13 @@ coverage unless explicitly qualified.
 | `int_smc_split_w_chunk`, `int_smc_split_d_chunk`, `int_smc_split_w_page`, `int_smc_split_d_page` | 486 | Misaligned word (`w`) or dword (`d`) stores starting 1-3 bytes before a 64-byte boundary (`chunk`) or a page end (`page`) that change only the opcode and immediate of a snippet starting past it, in pages holding generated code; 1,024 checked patches per offset. Catches dirty tracking that marks only where the store starts. |
 | `int_smc_rep_stos` | 486 | REP STOSB, STOSW and STOSD, forwards and backwards, rewrite the INC, DEC or NOP body of a snippet that has already run, some of them across a page end; 256 rewrites, each run 256 times. Catches string stores that fill code pages without marking every byte they replace. |
 | `int_smc_alu_family_exit` | 486 | Patches flip a snippet's opcodes between ADD, OR, AND, SUB and XOR EAX,imm32, each version run 32 times; every eighth puts ADC, SBB or CMP in, and the next puts the family back. Catches a recompiler that reads such opcodes as it runs and does not leave the code when one is no longer of the family. |
+| `int_smc_alu_family_flags` | 486 | Check-only. CLC, MOV EAX, eight ALU EAX,imm32 instructions, then PUSHFD: patches alternately change one opcode (any of ADD, OR, ADC, SBB, AND, SUB, XOR, CMP, anywhere in the snippet) or one or two immediates (with carry/overflow edge values), and each version runs 12 times. EAX and CF, PF, AF, ZF, SF, OF are compared with an integer reference (AF after OR/AND/XOR is undefined and not checked). Catches a recompiler that reads such opcodes or immediates as it runs but leaves wrong results or flags. |
 | `int_smc_alu_ops_k1_n8`, `int_smc_alu_ops_k4_n16`, `int_smc_alu_ops_k16_n8`, `int_smc_alu_ops_k16_n32` | 486 | As `int_smc_rate_op`, picking from ADD, OR, AND, SUB, XOR, ADC, SBB and CMP EAX,imm32 (never in the first slot, where ADC and SBB would take the caller's carry); `k` calls per patch, `n` instructions. |
 | `int_smc_ram_top` | 486 | Generated-code rewrites near the RAM top; counts 32,768 operations. Probes by writing just above firmware-reported RAM when below the 15 MiB hole, and may execute there if readback succeeds; this is not limited to firmware-reported owned RAM. |
 | `int_cpuid_cr` | 486 | CPUID where present, EFLAGS and control-register state checks; 100 generic operations, not exhaustive register semantics. |
 | `int_alu_burn` | 486 | Repeated integer arithmetic, flags and branch-intensive checks; aggregate counted work, not duration-based. |
 | `corpus_integer_sequences` | 486 | Deterministic generated ALU instruction blocks with independent bit-serial references; 4,194,304 generated instructions at default scale, with checkpoint checks. |
+| `rw_jit_tiering`, `rw_exe_loader`, `rw_overlay`, `rw_decrypt_run`, `rw_thunks`, `rw_threaded_vm` | 486 | Real-world-style generated, loaded, patched and dispatched code; see [real-world-style code workloads](#real-world-style-code-workloads). |
 
 The following four records share a 4 KiB page between a patched snippet and a
 hot loop. `k` is snippet calls per patch, `h` hot-loop calls per patch; each
