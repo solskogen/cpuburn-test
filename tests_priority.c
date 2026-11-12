@@ -366,11 +366,11 @@ static u32 pr_pg_test(void) { return pr_run(4); }
 static u32 pr_fetch_test(void) { return pr_run(5); }
 
 const test_t tests_priority[] = {
-    { "priority_segment_page", pr_seg_test, REQ_PAGING | REQ_486 },
+    { "priority_segment_page", pr_seg_test, REQ_PAGING | REQ_486, T_CHECK },
     { "priority_alignment_page", pr_ac_test, REQ_PAGING | REQ_486 },
-    { "priority_privileged_page", pr_priv_test, REQ_PAGING | REQ_486 },
+    { "priority_privileged_page", pr_priv_test, REQ_PAGING | REQ_486, T_CHECK },
     { "priority_lock_decode_page", pr_lock_test, REQ_PAGING | REQ_486 },
-    { "priority_page_permissions", pr_pg_test, REQ_PAGING | REQ_486 },
-    { "priority_fetch_operand", pr_fetch_test, REQ_PAGING | REQ_486 },
+    { "priority_page_permissions", pr_pg_test, REQ_PAGING | REQ_486, T_CHECK },
+    { "priority_fetch_operand", pr_fetch_test, REQ_PAGING | REQ_486, T_CHECK },
     { NULL, NULL, 0 }
 };

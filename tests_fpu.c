@@ -510,9 +510,9 @@ static u32 fpu_ftol(void) {
 }
 
 const test_t tests_fpu[] = {
-    {"fpu_arith",fpu_arith,REQ_FPU}, {"fpu_formats",fpu_formats,REQ_FPU},
-    {"fpu_compare",fpu_compare,REQ_FPU}, {"fpu_round",fpu_round,REQ_FPU},
-    {"fpu_trans",fpu_trans,REQ_FPU}, {"fpu_exceptions",fpu_exceptions,REQ_FPU},
-    {"fpu_stack",fpu_stack,REQ_FPU}, {"fpu_p6",fpu_p6,REQ_FPU|REQ_CMOV}, {"fpu_fxsr",fpu_fxsr,REQ_FPU|REQ_FXSR},
+    {"fpu_arith",fpu_arith,REQ_FPU, T_CHECK}, {"fpu_formats",fpu_formats,REQ_FPU},
+    {"fpu_compare",fpu_compare,REQ_FPU, T_CHECK}, {"fpu_round",fpu_round,REQ_FPU, T_CHECK},
+    {"fpu_trans",fpu_trans,REQ_FPU, T_CHECK}, {"fpu_exceptions",fpu_exceptions,REQ_FPU},
+    {"fpu_stack",fpu_stack,REQ_FPU}, {"fpu_p6",fpu_p6,REQ_FPU|REQ_CMOV, T_CHECK}, {"fpu_fxsr",fpu_fxsr,REQ_FPU|REQ_FXSR, T_CHECK},
     {"fpu_burn",fpu_burn,REQ_FPU}, {"fpu_ftol",fpu_ftol,REQ_FPU}, {0,0,0}
 };

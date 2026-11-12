@@ -40,8 +40,9 @@ make SUITE=benchmark         # only the benchmark workloads, sampled
 make SUITE=accuracy          # every record checked once (same as BENCHMARKS=0)
 ```
 
-`SUITE=benchmark` leaves out the check-only records (the extra FDIV vectors
-and the `cs_*` platform probes; see the
+`SUITE=benchmark` leaves out the check-only records (the `cs_*` platform
+probes and records that run at least twice real time on every emulated CPU
+tested; see the
 [workload catalogue](doc/workloads.md#inventory-and-reading-the-tables)) and
 logs them as `FILTER ... reason=suite_selection`. `CFG` records the suite.
 `BENCHMARKS=0` still works; combining it with a conflicting `SUITE` is an error.
@@ -538,7 +539,8 @@ For execution without timed harness repetition, use
 The default is one suite round and the final mixed burn, whose individual
 invocations last 10 seconds. Heavy workloads use `HEAVY_SCALE=8`; each invocation
 does real fixed-count work, rather than sleeping to fill its window.
-The default inventory is 335 records, including unavailable-feature skips.
+The default inventory is 342 records (163 of them benchmarks), including
+unavailable-feature skips.
 Suite duration varies with CPU, applicable features and invocation lengths;
 it is not a fixed wall-clock deadline. In benchmark mode, the
 [host profiling runner](#sustained-host-profiling) can extend sampling to

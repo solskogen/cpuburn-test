@@ -395,9 +395,9 @@ static u32 mmx_extended(void) {
 }
 
 const test_t tests_mmx[] = {
-    {"mmx_extended",mmx_extended,REQ_MMX|REQ_MMXEXT},
-    {"mmx_x87_transitions",mmx_x87_transitions,REQ_MMX|REQ_FPU},
-    {"mmx_alu",mmx_alu,REQ_MMX}, {"mmx_shifts",mmx_shifts,REQ_MMX},
-    {"mmx_state",mmx_state,REQ_MMX}, {"mmx_alias",mmx_alias,REQ_MMX}, {"mmx_exc",mmx_exc,REQ_MMX},
-    {"mmx_burn",mmx_burn,REQ_MMX}, {0,0,0}
+    {"mmx_extended",mmx_extended,REQ_MMX|REQ_MMXEXT, 0},
+    {"mmx_x87_transitions",mmx_x87_transitions,REQ_MMX|REQ_FPU, T_CHECK},
+    {"mmx_alu",mmx_alu,REQ_MMX, 0}, {"mmx_shifts",mmx_shifts,REQ_MMX, 0},
+    {"mmx_state",mmx_state,REQ_MMX, T_CHECK}, {"mmx_alias",mmx_alias,REQ_MMX, T_CHECK}, {"mmx_exc",mmx_exc,REQ_MMX, T_CHECK},
+    {"mmx_burn",mmx_burn,REQ_MMX, 0}, {0,0,0,0}
 };

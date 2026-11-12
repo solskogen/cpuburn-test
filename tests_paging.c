@@ -279,10 +279,10 @@ const test_t tests_paging[] = {
     {"pg_map_alias", pg_map_alias, REQ_PAGING | REQ_486},
     {"pg_faults", pg_faults, REQ_PAGING | REQ_486},
     {"pg_accessed_dirty", pg_accessed_dirty, REQ_PAGING | REQ_486},
-    {"pg_tlb_stress", pg_tlb_stress, REQ_PAGING | REQ_486},
+    {"pg_tlb_stress", pg_tlb_stress, REQ_PAGING | REQ_486, T_CHECK},
     {"pg_global", pg_global, REQ_PAGING | REQ_PGE | REQ_P5},
     {"pg_pse4m", pg_pse4m, REQ_PAGING | REQ_486 | REQ_PSE | REQ_MEM8M},
-    {"pg_pae", pg_pae, REQ_PAGING | REQ_486 | REQ_PAE | REQ_MEM8M},
+    {"pg_pae", pg_pae, REQ_PAGING | REQ_486 | REQ_PAE | REQ_MEM8M, T_CHECK},
     {"pg_pse36_permissions", pg_pse36_permissions, REQ_PAGING | REQ_PSE | REQ_PSE36},
     {"pg_apic_mmio", pg_apic_mmio, REQ_PAGING | REQ_APIC | REQ_MSR},
     {0, 0, 0}

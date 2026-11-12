@@ -297,24 +297,28 @@ static u32 rem_infinity(void) { return remainder_class_check(2); }
 static u32 rem1_invalid(void) { return remainder_class_check(3); }
 
 #define DIV_TEST(n) \
-    { "fdiv_v" #n "_rn", div_##n##_0, REQ_FPU }, \
-    { "fdiv_v" #n "_rd", div_##n##_1, REQ_FPU }, \
-    { "fdiv_v" #n "_ru", div_##n##_2, REQ_FPU }, \
-    { "fdiv_v" #n "_rz", div_##n##_3, REQ_FPU },
+    { "fdiv_v" #n "_rn", div_##n##_0, REQ_FPU, T_CHECK }, \
+    { "fdiv_v" #n "_rd", div_##n##_1, REQ_FPU, T_CHECK }, \
+    { "fdiv_v" #n "_ru", div_##n##_2, REQ_FPU, T_CHECK }, \
+    { "fdiv_v" #n "_rz", div_##n##_3, REQ_FPU, T_CHECK },
 #define REM_TEST(n) \
-    { "fprem_v" #n, rem_##n, REQ_FPU }, \
-    { "fprem1_v" #n, rem1_##n, REQ_FPU },
-/* Normal operands take the same FDIV path, so vector 0 is the benchmark in
- * each rounding mode; vectors 1-14 are correctness checks in their own
- * check-only table. */
+    { "fprem_v" #n, rem_##n, REQ_FPU, T_CHECK }, \
+    { "fprem1_v" #n, rem1_##n, REQ_FPU, T_CHECK },
+/* FDIV and the remainder vectors run far above full speed on every
+ * emulated CPU, so they are correctness checks; vector 9's FPREM1 is the
+ * one that is still timed. FDIV vectors 1-14 are in their own check-only
+ * table. */
 const test_t tests_fp_edges[] = {
     DIV_TEST(0)
     REM_TEST(0) REM_TEST(1) REM_TEST(2) REM_TEST(3) REM_TEST(4) REM_TEST(5)
-    REM_TEST(6) REM_TEST(7) REM_TEST(8) REM_TEST(9) REM_TEST(10)
-    { "fprem_denormal", rem_denormal, REQ_FPU },
-    { "fprem1_denormal", rem1_denormal, REQ_FPU },
-    { "fprem_finite_inf", rem_infinity, REQ_FPU },
-    { "fprem1_inf_invalid", rem1_invalid, REQ_FPU },
+    REM_TEST(6) REM_TEST(7) REM_TEST(8)
+    { "fprem_v9", rem_9, REQ_FPU, T_CHECK },
+    { "fprem1_v9", rem1_9, REQ_FPU },
+    REM_TEST(10)
+    { "fprem_denormal", rem_denormal, REQ_FPU, T_CHECK },
+    { "fprem1_denormal", rem1_denormal, REQ_FPU, T_CHECK },
+    { "fprem_finite_inf", rem_infinity, REQ_FPU, T_CHECK },
+    { "fprem1_inf_invalid", rem1_invalid, REQ_FPU, T_CHECK },
     { 0, 0, 0 }
 };
 

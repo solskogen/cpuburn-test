@@ -571,14 +571,14 @@ static u32 pm_v86(void) {
 
 const test_t tests_pmode[] = {
     { "pm_exceptions", pm_exceptions, REQ_486 },
-    { "pm_alignment_check", pm_alignment_check, REQ_486 | REQ_AC },
+    { "pm_alignment_check", pm_alignment_check, REQ_486 | REQ_AC, T_CHECK },
     { "pm_segments", pm_segments, REQ_486 },
-    { "pm_gates_rings", pm_gates_rings, REQ_486 },
-    { "pm_task_switch", pm_task_switch, REQ_486 },
-    { "pm_v86", pm_v86, REQ_486 },
-    { "pm_sysenter", pm_sysenter, REQ_SEP | REQ_MSR },
-    { "pm_syscall", pm_syscall, REQ_SYSCALL | REQ_MSR },
+    { "pm_gates_rings", pm_gates_rings, REQ_486, T_CHECK },
+    { "pm_task_switch", pm_task_switch, REQ_486, T_CHECK },
+    { "pm_v86", pm_v86, REQ_486, T_CHECK },
+    { "pm_sysenter", pm_sysenter, REQ_SEP | REQ_MSR, T_CHECK },
+    { "pm_syscall", pm_syscall, REQ_SYSCALL | REQ_MSR, T_CHECK },
     { "pm_irq_nesting", pm_irq_nesting, REQ_486 },
-    { "pm_debug_regs", pm_debug_regs, REQ_486 },
+    { "pm_debug_regs", pm_debug_regs, REQ_486, T_CHECK },
     { 0, 0, 0 }
 };

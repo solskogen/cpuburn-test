@@ -881,10 +881,11 @@ static int selected(const char *name) {
     return 0;
 }
 
-/* check_only: correctness records, never benchmark-sampled and left out of
- * SUITE=benchmark builds. */
-static void run_table(const test_t *t, int check_only) {
+/* check_only (whole table, or T_CHECK per test): correctness records, never
+ * benchmark-sampled and left out of SUITE=benchmark builds. */
+static void run_table(const test_t *t, int table_check_only) {
     for (; t->name; t++) {
+        int check_only = table_check_only || (t->flags & T_CHECK);
         ++test_index;
         int suite_skip = SUITE_BENCHMARK && check_only;
         if ((suite_skip || !selected(t->name)) && t != tests_cpu_contract) {
@@ -1063,7 +1064,7 @@ static u32 core_recovery_test(void) {
 }
 
 static const test_t tests_core[] = {
-    { "core_fault_watchdog_recovery", core_recovery_test, 0 },
+    { "core_fault_watchdog_recovery", core_recovery_test, 0, T_CHECK },
     { NULL, NULL, 0 }
 };
 
@@ -1119,6 +1120,7 @@ void kmain(void) {
         run_tests(tests_int);
         run_checks(tests_int_check);
         run_tests(tests_corpus);
+        run_tests(tests_realworld);
         run_tests(tests_fpu);
         run_tests(tests_fp_edges);
         run_checks(tests_fp_edges_check);

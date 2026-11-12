@@ -1342,6 +1342,67 @@ static u32 int_smc_alu_family_exit(void) {
     }
     t_ops(2048*k*(n+2)); return sum;
 }
+/* EAX and EFLAGS after a snippet that ends PUSHFD; POP EDX; RET. */
+static NOINLINE u32 exec_code_flags(u8 *p,u32 *fl) {
+    u32 r,f; smc_sync();
+    __asm__ volatile("call *%2" : "=a"(r), "=d"(f) : "r"(p) : "ecx","cc","memory");
+    *fl=f; return r;
+}
+static u32 alu_eax_ref(u8 o,u32 a,u32 b,u32 *cf,u32 *fl) {
+    u32 r=a,c=*cf,ov=0,af=0;
+    switch(o) {
+        case 0x05: r=a+b; c=r<a; break;
+        case 0x15: { u64 t=(u64)a+b+c; r=(u32)t; c=(u32)(t>>32); } break;
+        case 0x2d: case 0x3d: r=a-b; c=a<b; break;
+        case 0x1d: { u64 t=(u64)a-b-c; r=(u32)t; c=(u32)((t>>32)&1); } break;
+        case 0x0d: r=a|b; c=0; break;
+        case 0x25: r=a&b; c=0; break;
+        default:   r=a^b; c=0; break;
+    }
+    if(o==0x05||o==0x15) { ov=(~(a^b)&(a^r))>>31; af=((a^b^r)>>4)&1; }
+    else if(o==0x2d||o==0x3d||o==0x1d) { ov=((a^b)&(a^r))>>31; af=((a^b^r)>>4)&1; }
+    u32 p=r&0xff; p^=p>>4; p^=p>>2; p^=p>>1;
+    *fl=c|((~p&1)<<2)|(af<<4)|((r==0)<<6)|((r>>31)<<7)|(ov<<11);
+    *cf=c;
+    return o==0x3d?a:r;
+}
+/* ALU EAX,imm32 snippets patched while compiled: alternately one opcode
+   (any of ADD, OR, ADC, SBB, AND, SUB, XOR, CMP, anywhere) or immediates,
+   including carry/overflow edges. A recompiler that reads those opcodes or
+   immediates as it runs must leave EAX and every defined flag as the
+   instructions would. AF after OR/AND/XOR is undefined and not checked. */
+static u32 int_smc_alu_family_flags(void) {
+    static const u8 ops[8]={0x05,0x0d,0x15,0x1d,0x25,0x2d,0x35,0x3d};
+    static const u32 edge[6]={0,1,0x7fffffffu,0x80000000u,0xffffffffu,0x0000000fu};
+    const unsigned n=8,k=12,rounds=4096,body=6;
+    u8 *snip=arena_alloc(4096,4096); if(!snip) SKIP("arena_smc_alu_flags");
+    u32 imm[8],seed=0xf1a65000u,sum=0;
+    snip[0]=0xf8; snip[1]=0xb8;
+    for(unsigned i=0;i<n;i++) { imm[i]=0x89abcdefu*(i+1); snip[body+5*i]=0x05; put32(snip+body+1+5*i,imm[i]); }
+    snip[body+5*n]=0x9c; snip[body+5*n+1]=0x5a; snip[body+5*n+2]=0xc3;
+    for(unsigned round=0;round<rounds;round++) {
+        u32 r=rng(&seed),a=(r&0x700)==0x700?edge[(r>>12)%6]:rng(&seed);
+        put32(snip+2,a);
+        if(round&1) snip[body+5*(r%n)]=ops[(r>>4)%8];
+        else {
+            for(unsigned j=0;j<1+(r>>20)%2;j++) {
+                u32 q=rng(&seed); unsigned i=q%n;
+                imm[i]=(q&0x30)==0x30?edge[(q>>8)%6]:rng(&seed);
+                put32(snip+body+1+5*i,imm[i]);
+            }
+        }
+        u32 want=a,cf=0,wfl=0; u8 last=0;
+        for(unsigned i=0;i<n;i++) { last=snip[body+5*i]; want=alu_eax_ref(last,want,imm[i],&cf,&wfl); }
+        u32 mask=(last==0x0d||last==0x25||last==0x35)?0x8c5u:0x8d5u;
+        for(unsigned i=0;i<k;i++) {
+            u32 fl,got=exec_code_flags(snip,&fl);
+            CHECK_EQ(got,want);
+            CHECK_EQ(fl&mask,wfl&mask);
+        }
+        sum=csum_mix(sum,want^wfl);
+    }
+    t_ops(rounds*k*(n+3)); return sum;
+}
 static u32 int_smc_alu_ops_k1_n8(void) { return smc_alu_ops(1,8); }
 static u32 int_smc_alu_ops_k4_n16(void) { return smc_alu_ops(4,16); }
 static u32 int_smc_alu_ops_k16_n8(void) { return smc_alu_ops(16,8); }
@@ -1569,9 +1630,9 @@ const test_t tests_int_check[]={
 };
 
 const test_t tests_int[]={
-    {"int_flags_boundaries",int_flags_boundaries,REQ_486},
-    {"int_partial_boundaries",int_partial_boundaries,REQ_486},
-    {"int_divide_state",int_divide_state,REQ_486},
+    {"int_flags_boundaries",int_flags_boundaries,REQ_486, T_CHECK},
+    {"int_partial_boundaries",int_partial_boundaries,REQ_486, T_CHECK},
+    {"int_divide_state",int_divide_state,REQ_486, T_CHECK},
     {"int_alu",int_alu,REQ_486},
     {"int_adc_shift_loop",int_adc_shift_loop,REQ_486},
     {"int_adc_carry_incdec",int_adc_carry_incdec,REQ_486},
@@ -1584,12 +1645,12 @@ const test_t tests_int[]={
     {"int_code_footprint_512k",int_code_footprint_512k,REQ_486},
     {"int_code_footprint_calls",int_code_footprint_calls,REQ_486},
     {"int_flags_exhaustive",int_flags_exhaustive,REQ_486},
-    {"int_muldiv",int_muldiv,REQ_486},
+    {"int_muldiv",int_muldiv,REQ_486, T_CHECK},
     {"int_shift_rot",int_shift_rot,REQ_486},
     {"int_bits_misc",int_bits_misc,REQ_486},
-    {"int_cx8",int_cx8,REQ_CX8},
-    {"int_cmov",int_cmov,REQ_CMOV},
-    {"int_bcd",int_bcd,REQ_486},
+    {"int_cx8",int_cx8,REQ_CX8, T_CHECK},
+    {"int_cmov",int_cmov,REQ_CMOV, T_CHECK},
+    {"int_bcd",int_bcd,REQ_486, T_CHECK},
     {"int_string",int_string,REQ_486},
     {"int_prefix_addr",int_prefix_addr,REQ_486},
     {"int_smc",int_smc,REQ_486},
@@ -1599,6 +1660,7 @@ const test_t tests_int[]={
     {"int_smc_split_d_page",int_smc_split_d_page,REQ_486},
     {"int_smc_rep_stos",int_smc_rep_stos,REQ_486},
     {"int_smc_alu_family_exit",int_smc_alu_family_exit,REQ_486},
+    {"int_smc_alu_family_flags",int_smc_alu_family_flags,REQ_486,T_CHECK},
     {"int_smc_alu_ops_k1_n8",int_smc_alu_ops_k1_n8,REQ_486},
     {"int_smc_alu_ops_k4_n16",int_smc_alu_ops_k4_n16,REQ_486},
     {"int_smc_alu_ops_k16_n8",int_smc_alu_ops_k16_n8,REQ_486},
@@ -1620,18 +1682,18 @@ const test_t tests_int[]={
     {"int_smc_rate_k24_n16",int_smc_rate_k24_n16,REQ_486},
     {"int_smc_rate_k32_n16",int_smc_rate_k32_n16,REQ_486},
     {"int_smc_rate_k64_n16",int_smc_rate_k64_n16,REQ_486},
-    {"int_smc_rate_k1_n256",int_smc_rate_k1_n256,REQ_486},
-    {"int_smc_rate_k2_n256",int_smc_rate_k2_n256,REQ_486},
-    {"int_smc_rate_k4_n256",int_smc_rate_k4_n256,REQ_486},
-    {"int_smc_rate_k8_n256",int_smc_rate_k8_n256,REQ_486},
-    {"int_smc_rate_k12_n256",int_smc_rate_k12_n256,REQ_486},
-    {"int_smc_rate_k15_n256",int_smc_rate_k15_n256,REQ_486},
-    {"int_smc_rate_k16_n256",int_smc_rate_k16_n256,REQ_486},
-    {"int_smc_rate_k17_n256",int_smc_rate_k17_n256,REQ_486},
-    {"int_smc_rate_k20_n256",int_smc_rate_k20_n256,REQ_486},
-    {"int_smc_rate_k24_n256",int_smc_rate_k24_n256,REQ_486},
-    {"int_smc_rate_k32_n256",int_smc_rate_k32_n256,REQ_486},
-    {"int_smc_rate_k64_n256",int_smc_rate_k64_n256,REQ_486},
+    {"int_smc_rate_k1_n256",int_smc_rate_k1_n256,REQ_486, T_CHECK},
+    {"int_smc_rate_k2_n256",int_smc_rate_k2_n256,REQ_486, T_CHECK},
+    {"int_smc_rate_k4_n256",int_smc_rate_k4_n256,REQ_486, T_CHECK},
+    {"int_smc_rate_k8_n256",int_smc_rate_k8_n256,REQ_486, T_CHECK},
+    {"int_smc_rate_k12_n256",int_smc_rate_k12_n256,REQ_486, T_CHECK},
+    {"int_smc_rate_k15_n256",int_smc_rate_k15_n256,REQ_486, T_CHECK},
+    {"int_smc_rate_k16_n256",int_smc_rate_k16_n256,REQ_486, T_CHECK},
+    {"int_smc_rate_k17_n256",int_smc_rate_k17_n256,REQ_486, T_CHECK},
+    {"int_smc_rate_k20_n256",int_smc_rate_k20_n256,REQ_486, T_CHECK},
+    {"int_smc_rate_k24_n256",int_smc_rate_k24_n256,REQ_486, T_CHECK},
+    {"int_smc_rate_k32_n256",int_smc_rate_k32_n256,REQ_486, T_CHECK},
+    {"int_smc_rate_k64_n256",int_smc_rate_k64_n256,REQ_486, T_CHECK},
     {"int_smc_rate_op_k1_n16",int_smc_rate_op_k1_n16,REQ_486},
     {"int_smc_rate_op_k2_n16",int_smc_rate_op_k2_n16,REQ_486},
     {"int_smc_rate_op_k4_n16",int_smc_rate_op_k4_n16,REQ_486},
@@ -1680,7 +1742,7 @@ const test_t tests_int[]={
     {"int_smc_rate_op_k12_n48",int_smc_rate_op_k12_n48,REQ_486},
     {"int_smc_rate_op_k14_n48",int_smc_rate_op_k14_n48,REQ_486},
     {"int_smc_rate_op_k16_n48",int_smc_rate_op_k16_n48,REQ_486},
-    {"int_cpuid_cr",int_cpuid_cr,REQ_486},
+    {"int_cpuid_cr",int_cpuid_cr,REQ_486, T_CHECK},
     {"int_alu_burn",int_alu_burn,REQ_486},
     {0,0,0}
 };
