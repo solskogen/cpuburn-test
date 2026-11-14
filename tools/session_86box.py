@@ -2,21 +2,26 @@
 """Run an existing 86Box VM in place through a script of inputs and waits,
 logging its speed every emulated second and watching its screen.
 
-The machine runs paced to real time (or, with --held, as fast as the host
+The machine runs paced to real time (or, with --held or --ff, as fast as the host
 allows), so the speed log shows what the 86Box window shows. Frames are
 recorded on emulated time for looking through afterwards, and a screen that
 turns to text mode after a graphical one, error words on a text screen, and
 CPU resets are flagged as they happen."""
 
 import argparse
+import hashlib
+from itertools import accumulate
 import json
+from operator import add
 import os
 from pathlib import Path
 import re
 import socket
+import struct
 import subprocess
 import sys
 import time
+import zlib
 
 from run_86box import (Automation, bios_f1_prompt, display_environment, edited_config,
                        emulator_binary, refuse_running, rom_directory, stop_process, vm_config)
@@ -37,6 +42,102 @@ for row, first in (("qwertyuiop", 0x10), ("asdfghjkl", 0x1e), ("zxcvbnm", 0x2c))
 
 ERROR_WORDS = ("STOP: 0x", "Exception", "exception", "Fatal", "fatal", "Error", "error")
 
+# How often `wait screen` looks at the screen, in emulated ms: often for a
+# screen that comes soon, as a dialog after a key does, then every second (a
+# screenshot is a PNG encoded on the emulation thread, which a long wait
+# would otherwise keep doing four times a second)
+SCREEN_POLL_MS = 250
+SCREEN_POLL_SLOW_AFTER_MS = 5000
+SCREEN_POLL_SLOW_MS = 1000
+
+
+def unfilter_row(kind, line, above, bpp):
+    """A PNG scanline without its filter (PNG specification, section 9),
+    given the unfiltered line above it."""
+    if kind == 0:
+        return bytes(line)
+    if kind == 1:  # Sub: a running sum along each channel
+        out = bytearray(len(line))
+        for channel in range(bpp):
+            out[channel::bpp] = bytes(map((255).__and__, accumulate(line[channel::bpp])))
+        return bytes(out)
+    if kind == 2:  # Up
+        return bytes(map((255).__and__, map(add, line, above)))
+    out = bytearray(line)
+    if kind == 3:  # Average
+        for i in range(len(out)):
+            left = out[i - bpp] if i >= bpp else 0
+            out[i] = (out[i] + ((left + above[i]) >> 1)) & 255
+        return bytes(out)
+    if kind == 4:  # Paeth
+        for i in range(len(out)):
+            if i >= bpp:
+                a, c = out[i - bpp], above[i - bpp]
+            else:
+                a = c = 0
+            b = above[i]
+            pa, pb, pc = abs(b - c), abs(a - c), abs(a + b - 2 * c)
+            out[i] = (out[i] + (a if pa <= pb and pa <= pc else b if pb <= pc else c)) & 255
+        return bytes(out)
+    raise ValueError(f"PNG filter type {kind}")
+
+
+def png_region(data, x, y, w, h):
+    """The RGB bytes, row after row, of the w x h region at x, y of a PNG
+    (8-bit RGB or RGBA, not interlaced: what 86Box writes). Only what the
+    region depends on is unfiltered: the rows from the nearest one at or
+    above it whose filter does not use the row above, and in each row the
+    pixels up to the region's right edge."""
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        raise ValueError("not a PNG file")
+    pos, header, chunks = 8, None, []
+    while pos + 8 <= len(data):
+        length, kind = struct.unpack(">I4s", data[pos:pos + 8])
+        if kind == b"IHDR":
+            header = struct.unpack(">IIBBBBB", data[pos + 8:pos + 21])
+        elif kind == b"IDAT":
+            chunks.append(data[pos + 8:pos + 8 + length])
+        elif kind == b"IEND":
+            break
+        pos += 12 + length
+    if header is None:
+        raise ValueError("PNG without a header")
+    width, height, depth, colour, _, _, interlace = header
+    if depth != 8 or colour not in (2, 6) or interlace:
+        raise ValueError("only 8-bit RGB or RGBA PNGs, not interlaced")
+    if w <= 0 or h <= 0 or x < 0 or y < 0 or x + w > width or y + h > height:
+        raise ValueError(f"region {w}x{h} at {x},{y} is not inside the {width}x{height} image")
+    bpp = 3 if colour == 2 else 4
+    stride = width * bpp + 1
+    raw = zlib.decompress(b"".join(chunks))
+    first = y
+    while first > 0 and raw[first * stride] > 1:
+        first -= 1
+    end = (x + w) * bpp
+    line = bytes(end)
+    rows = []
+    for row in range(first, y + h):
+        start = row * stride
+        line = unfilter_row(raw[start], raw[start + 1:start + 1 + end], line, bpp)
+        if row >= y:
+            part = line[x * bpp:]
+            if bpp == 4:
+                rgb = bytearray(w * 3)
+                for channel in range(3):
+                    rgb[channel::3] = part[channel::4]
+                part = bytes(rgb)
+            rows.append(part)
+    return b"".join(rows)
+
+
+def region_digest(data, region):
+    """What `wait screen` compares: the first 16 hex digits of the SHA-256 of
+    the region's RGB bytes. None when the region is not inside the image."""
+    try:
+        return hashlib.sha256(png_region(data, *region)).hexdigest()[:16]
+    except ValueError:
+        return None
+
 
 def key_codes(word):
     """A key name, a scancode, or keys held together joined by '+'."""
@@ -56,13 +157,19 @@ def key_codes(word):
 
 
 def parse_script(text):
-    """Script lines: wait text <timeout_ms> <text> | key <key>... | pause <ms> |
-    screenshot <name> | dump <addr> <len> <name> [<view>] | cd load <drive> <path> |
-    mark <label>. '#' starts a comment line. dump saves <len> bytes of
-    memory at <addr> (physical, or through a memr view such as linear) as
-    <name>.bin, with the registers at that
-    moment in <name>.regs.json. cd load inserts the image at <path> (the
-    rest of the line) in CD-ROM drive <drive> as the machine runs."""
+    """Script lines: wait text <timeout_ms> <text> |
+    wait screen <timeout_ms> <x> <y> <w> <h> <digest> | key <key>... |
+    pause <ms> | screenshot <name> | dump <addr> <len> <name> [<view>] |
+    cd load <drive> <path> | cd eject <drive> | mark <label>. '#' starts a
+    comment line. wait screen runs until the w x h region at x, y of the
+    displayed frame has the digest (see region_digest; screen_digest.py
+    prints it for a screenshot), looking every SCREEN_POLL_MS, and after
+    SCREEN_POLL_SLOW_AFTER_MS every SCREEN_POLL_SLOW_MS: for graphical
+    screens, which wait text cannot read. dump saves <len> bytes of memory
+    at <addr> (physical, or through a memr view such as linear) as
+    <name>.bin, with the registers at that moment in <name>.regs.json. cd
+    load inserts the image at <path> (the rest of the line) in CD-ROM drive
+    <drive> as the machine runs, and cd eject empties the drive."""
     commands = []
     for number, line in enumerate(text.splitlines(), 1):
         line = line.strip()
@@ -72,6 +179,15 @@ def parse_script(text):
         try:
             if word == "wait":
                 kind, _, rest = rest.partition(" ")
+                if kind == "screen":
+                    parts = rest.split()
+                    if len(parts) != 6 or not re.fullmatch(r"[0-9a-f]{16}", parts[5]):
+                        raise ValueError("use: wait screen <timeout_ms> <x> <y> <w> <h> <digest of 16 hex digits>")
+                    timeout, x, y, w, h = (int(p, 0) for p in parts[:5])
+                    if x < 0 or y < 0 or w <= 0 or h <= 0:
+                        raise ValueError("a wait screen region needs x, y >= 0 and w, h > 0")
+                    commands.append(("screen", timeout, (x, y, w, h), parts[5]))
+                    continue
                 timeout, _, wanted = rest.partition(" ")
                 if kind != "text" or not wanted:
                     raise ValueError("use: wait text <timeout_ms> <text>")
@@ -99,9 +215,12 @@ def parse_script(text):
             elif word == "cd":
                 verb, _, rest = rest.partition(" ")
                 drive, _, path = rest.partition(" ")
-                if verb != "load" or not drive.isdigit() or not path:
-                    raise ValueError("use: cd load <drive> <path>")
-                commands.append(("cd", int(drive), path))
+                if verb == "load" and drive.isdigit() and path:
+                    commands.append(("cd", int(drive), path))
+                elif verb == "eject" and drive.isdigit() and not path:
+                    commands.append(("cd", int(drive), None))
+                else:
+                    raise ValueError("use: cd load <drive> <path> or cd eject <drive>")
             elif word == "mark":
                 commands.append(("mark", rest))
             else:
@@ -192,6 +311,27 @@ def run_session(api, commands, out, after_ms, slice_ms=1000, clock=time.monotoni
                         break
                 if status != "done":
                     break
+            elif command[0] == "screen":
+                _, timeout, region, digest = command
+                shot = out / "wait-screen.png"
+                waited = unsampled = 0
+                while True:
+                    reply = api.request(f"screenshot {shot}", allow_failure=True)
+                    if reply.get("ok") and region_digest(shot.read_bytes(), region) == digest:
+                        break
+                    if waited >= timeout:
+                        status = f"timed out waiting for screen {digest} at {region}"
+                        break
+                    poll = SCREEN_POLL_MS if waited < SCREEN_POLL_SLOW_AFTER_MS else SCREEN_POLL_SLOW_MS
+                    api.request(f"step {poll}")
+                    waited += poll
+                    unsampled += poll
+                    if unsampled >= slice_ms:
+                        sample()
+                        unsampled = 0
+                shot.unlink(missing_ok=True)
+                if status != "done":
+                    break
             elif command[0] == "key":
                 for codes in command[1]:
                     api.request("key down " + " ".join(hex(c) for c in codes))
@@ -211,7 +351,10 @@ def run_session(api, commands, out, after_ms, slice_ms=1000, clock=time.monotoni
                 (out / (name + ".bin")).write_bytes(bytes.fromhex(memory["data"]))
                 (out / (name + ".regs.json")).write_text(json.dumps(api.request("regs"), indent=1) + "\n")
             elif command[0] == "cd":
-                api.request(f"cd load {command[1]} {command[2]}")
+                if command[2] is None:
+                    api.request(f"cd eject {command[1]}")
+                else:
+                    api.request(f"cd load {command[1]} {command[2]}")
             elif command[0] == "mark":
                 mark = command[1]
         if status == "done":
@@ -242,6 +385,9 @@ def arguments():
     parser.add_argument("--rompath", type=Path)
     parser.add_argument("--held", action="store_true",
                         help="run unpaced (as fast as the host allows), for functional checks")
+    parser.add_argument("--ff", action="store_true",
+                        help="run released in fast forward, unpaced: each second's speed is what 86Box "
+                             "can do there, so dips show undamped by pacing")
     parser.add_argument("--record-ms", type=int, default=10000,
                         help="save a frame every this many emulated ms (default 10000, 0 for none)")
     parser.add_argument("--bios-f1", action="store_true",
@@ -319,7 +465,9 @@ def main():
         if len(os.fsencode(sock)) >= 108:
             raise RuntimeError("output path is too long for a UNIX automation socket")
         refuse_running(source)
-        result = {"vm": str(source), "emulator": str(emulator), "held": args.held}
+        if args.held and args.ff:
+            raise ValueError("--held and --ff are two ways of running unpaced: pick one")
+        result = {"vm": str(source), "emulator": str(emulator), "held": args.held, "ff": args.ff}
         with edited_config(source, config_edits(args)) as (_, source_hash):
             result["source_config_sha256"] = source_hash
             if args.wipe_hdd:
@@ -356,6 +504,8 @@ def main():
                         api.request(f"record start {args.record_ms} {out / 'frames'}")
                     if not args.held:
                         api.request("release")
+                        if args.ff:
+                            api.request("ff on")
                     result["status"] = run_session(api, commands, out, args.after_ms, bios_f1=args.bios_f1)
                     if args.record_ms:
                         result["frames"] = api.request("record stop").get("frames")
