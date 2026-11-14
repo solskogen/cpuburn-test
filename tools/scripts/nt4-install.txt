@@ -1,0 +1,187 @@
+# Windows NT 4.0 Workstation (the SP1 CD) onto an empty NT4.vhd, then
+# Service Pack 6 from its CD, up to the desktop with SP6. For
+# session_86box.py on TestVM as configured: vpc2007 (AMI BIOS 8), Pentium II
+# 333, 128 MB, S3 Vision964 (Stealth 64 Video), the CD before the hard disk
+# in its boot order. Before each run, a fresh disk in the VM directory:
+# rm NT4.vhd && truncate -s 4G NT4.vhd
+#
+# Setup's choices: Custom, every component and sub-component, name and
+# computer name TestVM, no Administrator password, no Emergency Repair Disk,
+# not on a network, time zone (GMT) without daylight saving (UTC), the
+# display as detected (640x480, 256 colours) after its test.
+#
+# Each step goes on as soon as its screen shows: text screens are waited for
+# by their words, graphical ones by a region only that screen has (wait
+# screen x y w h digest). The regions were picked from a run's frames, one
+# every 500 ms: steady while the screen showed, and nowhere else in the run
+# (screen_digest.py prints a region's digest for screenshots). The boot
+# menu's 30 s countdown is cut short with Enter.
+cd load 0 /mnt/iso/os/Windows NT/Microsoft Windows NT 4.0 Workstation (4.00.1381.1.sp1)/winnt40wks_sp1_en.iso
+mark textmode
+wait text 120000 To set up Windows NT now, press ENTER
+key enter
+wait text 60000 Setup has recognized the following mass storage devices
+key enter
+# The disk is empty: "new or has been erased"
+wait text 60000 To continue Setup, press C
+key c
+# The licence, paged to its end
+wait text 60000 PAGE DOWN=Next Page
+key pgdn pgdn pgdn pgdn pgdn pgdn pgdn pgdn pgdn pgdn pgdn pgdn pgdn pgdn pgdn pgdn pgdn pgdn pgdn pgdn
+wait text 30000 F8=I agree
+key f8
+wait text 60000 The above list matches my computer
+key enter
+# The whole disk (4095 MB), NTFS (formatted FAT now, converted at the next
+# boot), \WINNT
+wait text 60000 Unpartitioned space
+key enter
+wait text 60000 Format the partition using the NTFS file system
+key down enter
+wait text 600000 Setup installs Windows NT files onto your hard disk
+key enter
+# The exhaustive examination too, then the copy
+wait text 60000 Setup will now examine your hard disk(s) for corruption
+key enter
+wait text 1800000 This portion of Setup has completed successfully
+# Restart, the CD out first, as it boots before the hard disk. The first
+# boot converts the partition to NTFS and restarts; the CD goes back in at
+# the second boot's menu, when the BIOS has gone past it
+mark restart
+cd eject 0
+key enter
+wait text 180000 Converting file system
+wait text 120000 Seconds until highlighted choice
+cd load 0 /mnt/iso/os/Windows NT/Microsoft Windows NT 4.0 Workstation (4.00.1381.1.sp1)/winnt40wks_sp1_en.iso
+# Welcome to the Setup Wizard
+wait screen 300000 144 160 96 16 9d9ac7a2efe03bc7
+mark wizard
+screenshot wizard
+key enter
+# Setup Options: Custom
+wait screen 60000 224 160 96 16 428b363244e17273
+key down down down
+wait screen 30000 272 160 64 16 4a1817adfc2e0ab7
+screenshot setup-options
+key enter
+# Name and Organization
+wait screen 60000 368 240 96 16 f71f5c60c5204de3
+key shift+t e s t shift+v shift+m enter
+# Computer Name
+wait screen 60000 368 240 96 16 7677f70db3ef0449
+key shift+t e s t shift+v shift+m enter
+# Administrator Account: no password
+wait screen 60000 336 288 96 16 4d174cbad965cc36
+key enter
+# Emergency Repair Disk: No
+wait screen 60000 224 288 96 16 5d0addaaef38a9b5
+key down
+wait screen 30000 224 288 96 16 775e35f624994328
+key enter
+# Select Components: everything. A shaded box (some of a component's parts)
+# goes to empty, then to all of them: Accessories, Multimedia; Games and
+# Windows Messaging start empty; Accessibility Options and Communications
+# start with all of theirs. Then the list with every box ticked
+wait screen 60000 80 208 96 16 97e48944643668cc
+mark components
+key down space space down down space down space space down space
+wait screen 30000 96 272 96 16 e256f5c4c4e1f27f
+screenshot components
+key enter
+# Part 2, Installing Windows NT Networking: not on a network
+wait screen 60000 144 256 96 16 10273d78d426e832
+key enter
+wait screen 60000 192 224 96 16 5b07e8c5c2e22258
+key alt+d
+wait screen 30000 272 288 96 16 bbe4fbdb9d42fa34
+screenshot network
+key enter
+# Part 3, Finishing Setup: Finish
+wait screen 60000 144 272 96 16 dee0a05acf59a564
+key enter
+# Date/Time Properties, Time Zone: (GMT) Greenwich Mean Time is the
+# default; daylight saving off makes it UTC
+wait screen 60000 16 48 96 16 1d22631c3f64cfd7
+key alt+d
+wait screen 30000 16 48 96 16 b9e2821285fa96df
+screenshot timezone
+key enter
+# Detected Display (the Vision964 as an "S3 compatible display adapter")
+wait screen 60000 144 96 96 16 c3d16948457dca11
+key enter
+# Display Properties: OK needs a test first. Test, OK, the 5 s test bitmap,
+# Yes, it showed properly; "To save the settings... press the OK button":
+# OK, then Display Properties' OK
+wait screen 60000 80 304 96 16 22fc120b8caea5db
+key alt+e
+wait screen 30000 144 192 96 16 f9683614f306bee0
+key enter
+wait screen 60000 112 320 96 16 47990142a195f350
+key alt+y
+wait screen 30000 128 304 96 16 89d40ee9c6661c99
+key enter
+wait screen 30000 128 304 96 16 7d8307a77270743f
+screenshot display
+key enter
+# Copying files, then "has been installed successfully"
+mark copy
+wait screen 600000 416 128 96 16 ba85fd2d6f8e7049
+screenshot installed
+# Restart Computer, the CD out first; Enter at the boot menu
+mark restart-2
+cd eject 0
+key enter
+wait text 120000 Seconds until highlighted choice
+key enter
+# Begin Logon: Ctrl+Alt+Del, then Logon Information, no password. The SP6
+# CD goes in now, the BIOS long past, for NT to find by the desktop
+wait screen 300000 208 240 96 16 0435544962ea4e30
+mark logon
+cd load 0 /mnt/iso/os/Windows NT/Windows NT SP6 High Encryption.iso
+key ctrl+alt+del
+wait screen 60000 112 80 96 16 66376d9c89cd0042
+key enter
+# Welcome to Windows NT (it comes at every logon): Close, then the desktop
+wait screen 300000 16 240 96 16 41edc5952eb9fa3b
+screenshot desktop
+key enter
+wait screen 60000 0 48 96 16 743c04d98a7882ff
+# Service Pack 6: Start > Run > d:\msnt128.exe, which unpacks itself into
+# the Service Pack Setup. Accept the License Agreement, Install (backup for
+# uninstalling, as it comes), then Restart
+mark sp6
+key ctrl+esc
+wait screen 30000 0 384 96 16 f3d15e554c8cc23d
+key r
+wait screen 30000 96 416 96 16 dde5445fa3603987
+key d shift+; \ m s n t 1 2 8 . e x e enter
+wait screen 300000 240 368 96 16 03f5715843149ad3
+key alt+a
+wait screen 30000 304 352 32 16 db3c6e5f5bfcc735
+screenshot sp6-setup
+key alt+i
+wait screen 600000 464 128 96 16 320510810f18467f
+screenshot sp6-done
+mark restart-3
+key enter
+wait text 120000 Seconds until highlighted choice
+key enter
+# Log on again (the SP6 CD does not boot), close Welcome, and winver
+wait screen 300000 208 240 96 16 0435544962ea4e30
+mark logon-2
+key ctrl+alt+del
+wait screen 60000 112 80 96 16 66376d9c89cd0042
+key enter
+wait screen 300000 16 80 96 16 042561417f86091c
+screenshot desktop-sp6
+key enter
+wait screen 60000 0 48 96 16 743c04d98a7882ff
+key ctrl+esc
+wait screen 30000 0 384 96 16 f3d15e554c8cc23d
+key r
+wait screen 30000 32 352 96 16 443a7ec3515d9c44
+key w i n v e r enter
+wait screen 60000 16 80 96 16 d7e21eb55ea93d05
+screenshot winver
+key enter
+wait screen 60000 0 48 96 16 743c04d98a7882ff
