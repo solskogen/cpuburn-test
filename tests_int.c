@@ -468,6 +468,11 @@ static u32 code_footprint(u32 nfn,u32 passes,u32 seed0,int chain) {
 static u32 int_code_footprint_128k(void) { return code_footprint(2048,256,0xc0de128u,1); }
 static u32 int_code_footprint_512k(void) { return code_footprint(8192,64,0xc0de512u,1); }
 static u32 int_code_footprint_calls(void) { return code_footprint(2048,256,0xc0dec11u,0); }
+/* Past what a recompiler can keep at once (131072 blocks, 8 MiB), run round
+   and round a few times each: as the first boot of an operating system runs
+   more distinct code than any of it runs often, so none of it stays compiled. */
+static u32 int_code_footprint_8m(void) { return code_footprint(131072,16,0xc0de8c0u,1); }
+static u32 int_code_footprint_8m_calls(void) { return code_footprint(131072,16,0xc0de8c1u,0); }
 static u32 int_alu(void) {
     u32 seed=0x12345678,sum=0;
     static const u32 edge[]={0,1,0xffffffffu,0x80000000u,0x7fffffffu,0xffffu,0xffu,0x80u};
@@ -1644,6 +1649,8 @@ const test_t tests_int[]={
     {"int_code_footprint_128k",int_code_footprint_128k,REQ_486},
     {"int_code_footprint_512k",int_code_footprint_512k,REQ_486},
     {"int_code_footprint_calls",int_code_footprint_calls,REQ_486},
+    {"int_code_footprint_8m",int_code_footprint_8m,REQ_486},
+    {"int_code_footprint_8m_calls",int_code_footprint_8m_calls,REQ_486},
     {"int_flags_exhaustive",int_flags_exhaustive,REQ_486},
     {"int_muldiv",int_muldiv,REQ_486, T_CHECK},
     {"int_shift_rot",int_shift_rot,REQ_486},

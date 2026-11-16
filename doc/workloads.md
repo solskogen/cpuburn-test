@@ -336,6 +336,8 @@ coverage unless explicitly qualified.
 | `int_code_footprint_128k` | 486 | 2,048 distinct 64-byte functions (loads and stores over 64 KiB, moves, ALU, LEA, MOVZX, PUSH/POP, SHL, INC and a skipped INC) chained by direct JMPs in a shuffled order, run 256 times; the first pass against a model. A large compiled working set, as Windows 98's first boot. |
 | `int_code_footprint_512k` | 486 | The same with 8,192 functions, run 64 times: 512 KiB of guest code, whose blocks share hash slots 128 KiB apart in physical memory. |
 | `int_code_footprint_calls` | 486 | 2,048 such functions each reached by its own CALL through a table and returning, as through a dispatch table; 256 passes. |
+| `int_code_footprint_8m` | 486 | The same with 131,072 functions, run 16 times: 8 MiB of guest code, more blocks than a recompiler keeps at once, so each is run few times before it is dropped and made again. Code run once or a few times, as an operating system's first boot, rather than code run often. |
+| `int_code_footprint_8m_calls` | 486 | The same, each function reached by its own CALL through a table. |
 | `int_flags_exhaustive` | 486 | Exhausts all 256×256 byte operand pairs for ADD/ADC/SUB/SBB/CMP flag forms; other widths/operations are samples. Reports a synthetic 500,000 operations, not the exact number of cases. |
 | `int_muldiv` | 486 | 8,192 seeded multiply/divide vectors across byte/word/dword forms and three division faults; reports 188,416 operations. |
 | `int_shift_rot` | 486 | Shift/rotate results and defined flags over widths, counts and sampled values; counted instruction-form work, not exhaustive operands. |
