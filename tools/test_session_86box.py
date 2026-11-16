@@ -72,13 +72,13 @@ class FakeApi:
 class ScriptTest(unittest.TestCase):
     def test_parse(self):
         commands = parse_script("""# comment
-wait text 30000 ENTER to start QuickInstall
+wait text 30000 ENTER to start setup
 key enter down y+e ctrl+alt+del 0x148
 pause 2000
 mark copy
 screenshot menu-1
 """)
-        self.assertEqual(commands[0], ("wait", 30000, "ENTER to start QuickInstall"))
+        self.assertEqual(commands[0], ("wait", 30000, "ENTER to start setup"))
         self.assertEqual(commands[1], ("key", [[0x1c], [0x150], [0x15, 0x12], [0x1d, 0x38, 0x153], [0x148]]))
         self.assertEqual(commands[2:], [("pause", 2000), ("mark", "copy"), ("screenshot", "menu-1")])
 

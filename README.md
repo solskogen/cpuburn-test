@@ -255,7 +255,7 @@ keep up, and for checking that it gets through:
 
 ```sh
 python3 tools/session_86box.py --vm "/path/to/My VM" --output-dir /tmp/qi-run \
-  --script tools/scripts/quickinstall-98se.txt --wipe-hdd 01
+  --script /path/to/my-session.txt --wipe-hdd 01
 ```
 
 - **Script:** one command per line: `wait text <timeout_ms> <text>` (run
@@ -275,7 +275,7 @@ python3 tools/session_86box.py --vm "/path/to/My VM" --output-dir /tmp/qi-run \
   words on a text screen (`Exception`, `STOP: 0x`, `Fatal`, `Error`) and CPU
   resets go into `alerts.jsonl` with a screenshot, as they happen.
   `text` reads the VGA text buffer: a framebuffer console that only looks
-  like text (Linux's, as QuickInstall's menus use) can't be read or waited
+  like text (Linux's, for example) can't be read or waited
   for, so the script uses `pause` there.
 - **Configuration:** `--set "SECTION/KEY=VALUE"` and `--unset "SECTION/KEY"`
   change it for the run only; it is restored byte for byte afterwards.
