@@ -7,7 +7,7 @@ import tempfile
 import unittest
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 
 
 @unittest.skipUnless(platform.system() == "Linux" and
@@ -53,7 +53,7 @@ void _start(void) {
                             "-msoft-float", "-fno-strict-aliasing",
                             "-ffunction-sections", "-fdata-sections",
                             "-DHEAVY_SCALE=8", "-DTEST_SEED=0x86b04a21u",
-                            "-I", str(ROOT), str(fixture), "-Wl,--gc-sections",
+                            "-I", str(ROOT / "src"), str(fixture), "-Wl,--gc-sections",
                             "-o", str(binary),
                         ], capture_output=True, text=True)
                         self.assertEqual(build.returncode, 0, build.stdout + build.stderr)

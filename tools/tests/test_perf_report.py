@@ -10,7 +10,7 @@ import unittest
 
 from perf_report import (compare, compare_host, distribution, load_runs, measurement_notes,
                          summarize, validate_run)
-from qemu_smoke import parse_log
+from qemu_smoke import fpu_backend, host_fpu_note, parse_log
 from run_86box import write_config
 
 
@@ -109,6 +109,18 @@ class PerfTests(unittest.TestCase):
         self.assertEqual(measurement_notes(test), ["correctness_fail"])
         report = summarize([example()], 0)
         self.assertEqual(report["measurement_notes"], [])
+
+    def test_host_fpu_note_counts_only_failed_x87_tests(self):
+        tests = [{"name": "fdiv", "status": "FAIL", "req": "00000004"},
+                 {"name": "fpu_p6", "status": "FAIL", "req": "00000014"},
+                 {"name": "fpu_ok", "status": "PASS", "req": "00000004"},
+                 {"name": "pm_debug_regs", "status": "FAIL", "req": "00001000"}]
+        self.assertIn("2 failing x87 tests", host_fpu_note(tests, "host"))
+        self.assertIsNone(host_fpu_note(tests, "softfloat"))
+        self.assertIsNone(host_fpu_note(tests[2:], "host"))
+        self.assertEqual(fpu_backend({}), "host")
+        self.assertEqual(fpu_backend({"fpu_softfloat": "1"}), "softfloat")
+        self.assertEqual(fpu_backend({"fpu_type": "none", "fpu_softfloat": "1"}), "none")
 
     def test_distribution(self):
         self.assertEqual(distribution([4, 1, 3, 2]),
@@ -232,7 +244,7 @@ class PerfTests(unittest.TestCase):
             source, report = Path(directory) / "input.json", Path(directory) / "report.json"
             source.write_text(json.dumps([example()]))
             self.assertEqual(len(load_runs(source)), 1)
-            command = [sys.executable, str(Path(__file__).with_name("perf_report.py")),
+            command = [sys.executable, str(Path(__file__).resolve().parents[1] / "perf_report.py"),
                        str(source), "--output", str(report), "--discard-rounds", "1"]
             result = subprocess.run(command, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)

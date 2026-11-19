@@ -7,7 +7,7 @@ import math
 from pathlib import Path
 import statistics
 
-from qemu_smoke import parse_log
+from qemu_smoke import fpu_backend, host_fpu_note, parse_log
 
 
 def distribution(values):
@@ -34,7 +34,8 @@ def load_runs(path):
 
 def environment(run):
     result = {key: run.get(key) for key in
-              ("cpu", "machine", "accel", "memory_mib", "cpu_info", "step_ms")}
+              ("cpu", "machine", "fpu_backend", "accel", "memory_mib", "cpu_info",
+               "step_ms")}
     if run.get("conformance"):
         result["conformance"] = run["conformance"]
     if "host" in run:
@@ -343,6 +344,12 @@ def main():
         for change in comparison["changes"]:
             print(f"Correctness observations changed: r={change['r']} {change['name']} "
                   f"before={change['before']} after={change['after']}")
+    for index, run in enumerate(runs):
+        backend = run.get("fpu_backend")
+        if backend is None and isinstance(run.get("machine"), dict):
+            backend = fpu_backend(run["machine"])  # results from before fpu_backend
+        if note := host_fpu_note(run["tests"], backend):
+            print(f"Run {index + 1}: {note}")
     print("name samples min median p95 counter/op timer_unit op_unit timing_scope comparison")
     comparisons = {c["name"]: c for c in report.get("comparison", [])}
     for name, entry in report["workloads"].items():

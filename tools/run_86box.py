@@ -18,7 +18,7 @@ import subprocess
 import sys
 import time
 import uuid
-from qemu_smoke import parse_log
+from qemu_smoke import fpu_backend, host_fpu_note, parse_log
 from workload_capture import WorkloadCapture, PerfRecorder, host_metadata, process_cpu_seconds
 
 
@@ -512,7 +512,8 @@ def execute(args, run_dir, command, machine):
     signature = getattr(args, "expected_signature", None)
     control_frame = cpu_control_frame(machine, accuracy, signature)
     result = {"status": "error", "expected": args.expect, "matched": [],
-              "machine": machine, "label": args.label, "step_ms": args.step_ms,
+              "machine": machine, "fpu_backend": fpu_backend(machine),
+              "label": args.label, "step_ms": args.step_ms,
               "emulated_ms": 0, "directory": str(run_dir), "host": host_metadata(),
               "emulator_executable": command[0],
               "mode": "accuracy" if accuracy else "benchmark",
@@ -657,6 +658,8 @@ def execute(args, run_dir, command, machine):
                            not any(t.get("status") in ("FAIL", "FAULT") for t in result["tests"])),
                 "note": "Observed guest failures are retained; status observed is not correctness PASS.",
             }
+            if note := host_fpu_note(result["tests"], result["fpu_backend"]):
+                result["correctness"]["fpu_note"] = note
             result["conformance_coverage"] = {
                 "scope": "sampled",
                 "identity_verified": any(t.get("name") == "cpu_model_contract"
@@ -801,6 +804,8 @@ def run_existing_vm(args, emulator, image, roms):
                       ("status", "directory", "emulated_ms", "matched")}))
     if "error" in result:
         print(result["error"], file=sys.stderr)
+    if note := result.get("correctness", {}).get("fpu_note"):
+        print(note, file=sys.stderr)
     return exit_status(result)
 
 
@@ -854,6 +859,8 @@ def main():
                           ("status", "directory", "emulated_ms", "matched")}))
         if "error" in result:
             print(result["error"], file=sys.stderr)
+        if note := result.get("correctness", {}).get("fpu_note"):
+            print(note, file=sys.stderr)
         return exit_status(result)
     except (OSError, RuntimeError, ValueError, configparser.Error) as error:
         print(f"86Box smoke: {error}", file=sys.stderr)

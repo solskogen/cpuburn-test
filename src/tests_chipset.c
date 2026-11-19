@@ -97,13 +97,15 @@ static u32 cs_pit(void) {
     }
     outb(0x61, saved&~2u);
     t_note("port61 saved=%02x restored=%02x speaker forced off; ch2 mode not owned by core",saved,inb(0x61));
-    return csum_mix(changes, a<<16|b);
+    /* Counts and edge totals depend on timing; they stay in the notes. */
+    return status & 0x3f;
 }
 
 static u32 rtc_number(u8 n,u8 b) { return (b&4)?n:(n>>4)*10+(n&15); }
 static u32 cs_cmos_rtc(void) {
     u8 c[64]; u32 sum=0, hash=0;
-    for (u32 i=0;i<64;i++) { c[i]=cmos_read(i); hash=csum_mix(hash,c[i]); }
+    /* Registers 0x00-0x0d are the clock and its status; keep them out of the hash. */
+    for (u32 i=0;i<64;i++) { c[i]=cmos_read(i); if (i>=0x0e) hash=csum_mix(hash,c[i]); }
     if (c[0x0a]==0xff && c[0x0b]==0xff) SKIP("CMOS unreadable");
     for (u32 i=0;i<64;i+=8)
         t_note("CMOS %02x: %02x %02x %02x %02x %02x %02x %02x %02x",i,c[i],c[i+1],c[i+2],c[i+3],c[i+4],c[i+5],c[i+6],c[i+7]);
@@ -254,7 +256,8 @@ static u32 cs_misc_ports(void) {
     /* LPT data drives external pins. Restoring does not undo a peripheral's action. */
     if(lpt==0x378) t_note("LPT data=%02x loopback not written: external-device safety",inb(0x378));
     else t_note("LPT skipped: BDA=%04x",lpt);
-    return p|((u32)a<<8);
+    /* Port 0x61 bits 4-5 (refresh toggle, timer 2 output) change with time. */
+    return (p&~0x30u)|((u32)a<<8);
 }
 
 const test_t tests_chipset[] = {

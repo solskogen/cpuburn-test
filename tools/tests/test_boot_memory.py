@@ -10,7 +10,7 @@ import time
 import unittest
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 
 
 @unittest.skipUnless(platform.system() == "Linux" and
@@ -97,7 +97,7 @@ void _start(void) {
             path = Path(directory)
             (path / "probe.asm").write_text(assembly)
             (path / "probe.c").write_text(source)
-            subprocess.run(["nasm", "-f", "elf32", "-I", str(ROOT) + "/",
+            subprocess.run(["nasm", "-f", "elf32", "-I", str(ROOT / "src") + "/",
                             str(path / "probe.asm"), "-o", str(path / "probe.o")],
                            check=True, capture_output=True)
             subprocess.run([
@@ -129,7 +129,7 @@ class BootLayoutTests(unittest.TestCase):
                 "section .note.GNU-stack noalloc noexec nowrite progbits\n")
             subprocess.run([nasm, "-f", "elf32", str(source), "-o", str(path / "probe.o")],
                            check=True, capture_output=True)
-            subprocess.run([linker, "-m", "elf_i386", "-T", str(ROOT / "link.ld"),
+            subprocess.run([linker, "-m", "elf_i386", "-T", str(ROOT / "src/link.ld"),
                             str(path / "probe.o"), "-o", str(path / "probe.elf")],
                            check=True, capture_output=True)
             self.assertEqual(struct.unpack_from("<I", (path / "probe.elf").read_bytes(), 24)[0],
@@ -145,7 +145,7 @@ class BootLayoutTests(unittest.TestCase):
             subprocess.run([nasm, "-f", "elf32", str(source), "-o", str(path / "probe.o")],
                            check=True, capture_output=True)
             result = subprocess.run(
-                [linker, "-m", "elf_i386", "-T", str(ROOT / "link.ld"),
+                [linker, "-m", "elf_i386", "-T", str(ROOT / "src/link.ld"),
                  str(path / "probe.o"), "-o", str(path / "probe.elf")],
                 capture_output=True, text=True)
             self.assertNotEqual(result.returncode, 0)

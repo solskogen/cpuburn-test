@@ -30,7 +30,7 @@ static u32 sys_tsc(void) {
             CHECK_EQ(rc, GUARD_EXC(13));
         }
     }
-    t_ops(4096); return (u32)delta;
+    t_ops(4096); return 0; /* TSC readings are timing; they stay in the notes */
 }
 
 static volatile u32 msr_index;
@@ -51,8 +51,10 @@ static int get_msr(u32 index, u64 *value, int report) {
 static u32 sys_msr_probe(void) {
     u64 value, caps = 0; u32 sum = 0;
     if (cpu.family == 5) {
+        /* 0x12/0x13 are the event counters: noted, not summed. */
         const u32 p5[] = {0, 1, 0x11, 0x12, 0x13};
-        for (u32 i = 0; i < sizeof(p5) / sizeof(p5[0]); i++) if (!get_msr(p5[i], &value, 1)) sum = csum_mix(sum, value);
+        for (u32 i = 0; i < sizeof(p5) / sizeof(p5[0]); i++)
+            if (!get_msr(p5[i], &value, 1) && p5[i] < 0x12) sum = csum_mix(sum, value);
     }
     if (cpu_test_feature(REQ_TSC)) {
         u64 before = stamp(); int rc = get_msr(0x10, &value, 0); u64 after = stamp();
@@ -65,7 +67,9 @@ static u32 sys_msr_probe(void) {
     if (cpu_test_feature(REQ_APIC)) get_msr(0x1B, &value, 1);
     if (cpu.family >= 6) {
         const u32 p6[] = {0x2A, 0x3A, 0x8B, 0xC1, 0xC2, 0x186, 0x187, 0x1D9};
-        for (u32 i = 0; i < sizeof(p6) / sizeof(p6[0]); i++) if (!get_msr(p6[i], &value, 1)) sum = csum_mix(sum, value);
+        /* 0xC1/0xC2 are the performance counters: noted, not summed. */
+        for (u32 i = 0; i < sizeof(p6) / sizeof(p6[0]); i++)
+            if (!get_msr(p6[i], &value, 1) && p6[i] != 0xC1 && p6[i] != 0xC2) sum = csum_mix(sum, value);
     }
     if (cpu_test_feature(REQ_SEP)) for (u32 i = 0x174; i <= 0x176; i++) get_msr(i, &value, 1);
     if (cpu_test_feature(REQ_MCE) && cpu.family >= 6) for (u32 i = 0x179; i <= 0x17B; i++) get_msr(i, &value, 1);
@@ -96,7 +100,7 @@ static u32 sys_msr_tsc(void) {
     CHECK_EQ(rc, 0);
     if (!rc) CHECK(value >= before && value <= after);
     t_ops(1);
-    return (u32)value;
+    return 0; /* the TSC value is timing, not a result */
 }
 
 static int memory_type(u32 type) {
@@ -400,7 +404,7 @@ static u32 sys_irq_timer(void) {
         while (pit_ticks - t < 4) { __asm__ volatile("sti; hlt" ::: "memory"); }
         t_note("STI/HLT cycles/tick=%llu", (rdtsc() - begin) / (pit_ticks - t));
     }
-    t_ops(ticks); return ticks;
+    t_ops(ticks); return 0; /* the tick count is timing; it stays in the note */
 }
 
 /* A checked integer workload while IRQ0 runs at kHz rates, as PC-speaker

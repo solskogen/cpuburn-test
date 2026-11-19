@@ -231,12 +231,14 @@ static u32 mmx_exc(void) {
     int rc=guard_call(mmx_fault_instr);
     wr_cr0(cr0);
     CHECK_EQ(rc,GUARD_EXC(6)); CHECK_EQ(g_exc.vec,6); CHECK_EQ(g_exc.count,n+1);
+    u32 sum=csum_mix(rc,g_exc.vec);
     n=g_exc.count; wr_cr0((cr0|8)&~4u);
     rc=guard_call(mmx_fault_instr);
     wr_cr0(cr0);
     CHECK_EQ(rc,GUARD_EXC(7)); CHECK_EQ(g_exc.vec,7); CHECK_EQ(g_exc.count,n+1);
     __asm__ volatile("emms");
-    t_ops(2); return g_exc.count;
+    /* Not g_exc.count: that total depends on every earlier test. */
+    t_ops(2); return csum_mix(sum,csum_mix(rc,g_exc.vec));
 }
 static u32 mmx_burn(void) {
     u32 seed=0xf00dcafe, sum=0;

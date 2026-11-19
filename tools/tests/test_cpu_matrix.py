@@ -11,7 +11,7 @@ from cpu_matrix import eligible, fields, make_matrix, number, preprocess, run_ma
 from qemu_smoke import parse_log
 from run_86box import cpu_control_accepted, cpu_control_frame
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 
 
 class CpuMatrixTests(unittest.TestCase):
@@ -228,13 +228,13 @@ class CpuMatrixTests(unittest.TestCase):
         self.assertEqual(run["probes"][0]["available"], "1")
 
     def test_catalogue_and_behavioural_witnesses_are_unique_and_registered(self):
-        names = re.findall(r'^CPU_MODEL\("([^"]+)"', (ROOT / "cpu_models.h").read_text(), re.M)
+        names = re.findall(r'^CPU_MODEL\("([^"]+)"', (ROOT / "src/cpu_models.h").read_text(), re.M)
         self.assertEqual(len(names), len(set(names)))
         features = re.findall(r'CPU_FEATURE\((REQ_\w+), "([^"]+)", "([^"]*)"\)',
-                              (ROOT / "cpu_features.h").read_text())
+                              (ROOT / "src/cpu_features.h").read_text())
         self.assertEqual(len(features), len(set(f[0] for f in features)))
-        registry = "\n".join(p.read_text() for p in ROOT.glob("tests_*.c"))
-        identity = (ROOT / "cpu_contract.c").read_text().split("static u32 cpu_identity(void) {")[1]
+        registry = "\n".join(p.read_text() for p in ROOT.glob("src/tests_*.c"))
+        identity = (ROOT / "src/cpu_contract.c").read_text().split("static u32 cpu_identity(void) {")[1]
         identity = identity.split("const test_t tests_cpu_contract[]")[0]
         for requirement, name, witness in features:
             if requirement != "REQ_486":
@@ -242,7 +242,7 @@ class CpuMatrixTests(unittest.TestCase):
             if witness:
                 self.assertRegex(registry, r'\{\s*"' + re.escape(witness) + r'"', name)
         claims = re.findall(r'CPU_CLAIM\((\d+), (\d+), "([^"]+)", "([^"]+)"\)',
-                            (ROOT / "cpu_features.h").read_text())
+                            (ROOT / "src/cpu_features.h").read_text())
         for _, _, name, witness in claims:
             self.assertRegex(registry, r'\{\s*"' + re.escape(witness) + r'"', name)
 

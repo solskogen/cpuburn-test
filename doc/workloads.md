@@ -7,17 +7,17 @@ the following sections describe their checked behavior and limits.
 
 | Area | Source modules | Evidence and limits |
 |---|---|---|
-| Integer execution and translation | `tests_int.c`, `tests_corpus.c`, `tests_sweeps.c` | Arithmetic/defined flags, decoding, branches, SMC and code footprints; exhaustive only where explicitly stated, otherwise deterministic samples. |
-| x87 and MMX | `tests_fpu.c`, `tests_fp_edges.c`, `tests_mmx.c` | Results, formats, rounding, status/environment and scalar/exact references; not full x87 transcendental precision certification. |
-| AMD/Cyrix extensions | `tests_vendor.c` | Feature-gated baseline/enhanced 3DNow! and all twelve Cyrix EMMI opcodes; integer-only references, finite dyadic floating-point cases and documented reciprocal precision bounds. Not exhaustive floating-point range/rounding certification. |
-| Cyrix CPU controls | `tests_cyrix.c` | Model-qualified CCR4 CPUID/ID-flag controls and disabled-SMM opcode faults; saved configuration restored. GXm uses the `mediagxm` contract on ECS P5GX-M. Not full CCR/ARR or SMM entry/exit coverage. |
-| Privilege, exceptions and restart | `tests_pmode.c`, `tests_heavy_pmode.c`, `tests_priority.c`, `tests_restart_complex.c` | Protected-mode architectural transitions and selected fault precedence/restart cases; not every combination of instructions, exceptions or pending interrupts. |
-| Paging and translated memory | `tests_paging.c`, `tests_heavy_paging.c`, `tests_mem.c` | Permissions, aliases, TLB invalidation and checked accesses; selected memory sizes/alignments, not a proof over all physical mappings. |
-| CPU/system state and sustained interactions | `tests_sys.c`, `tests_heavy_state.c`, `tests_burn.c` | Feature-gated control state, interrupts and mixed repetition; safe probes do not establish complete model-specific MSR behavior. |
-| Supporting platform | `tests_chipset.c` | Legacy PIC/PIT/RTC, A20 and limited DMA/ROM/PCI checks; not comprehensive motherboard/chipset validation. Network, IDE and other peripheral throughput are outside the primary scope. |
+| Integer execution and translation | `src/tests_int.c`, `src/tests_corpus.c`, `src/tests_sweeps.c` | Arithmetic/defined flags, decoding, branches, SMC and code footprints; exhaustive only where explicitly stated, otherwise deterministic samples. |
+| x87 and MMX | `src/tests_fpu.c`, `src/tests_fp_edges.c`, `src/tests_mmx.c` | Results, formats, rounding, status/environment and scalar/exact references; not full x87 transcendental precision certification. |
+| AMD/Cyrix extensions | `src/tests_vendor.c` | Feature-gated baseline/enhanced 3DNow! and all twelve Cyrix EMMI opcodes; integer-only references, finite dyadic floating-point cases and documented reciprocal precision bounds. Not exhaustive floating-point range/rounding certification. |
+| Cyrix CPU controls | `src/tests_cyrix.c` | Model-qualified CCR4 CPUID/ID-flag controls and disabled-SMM opcode faults; saved configuration restored. GXm uses the `mediagxm` contract on ECS P5GX-M. Not full CCR/ARR or SMM entry/exit coverage. |
+| Privilege, exceptions and restart | `src/tests_pmode.c`, `src/tests_heavy_pmode.c`, `src/tests_priority.c`, `src/tests_restart_complex.c` | Protected-mode architectural transitions and selected fault precedence/restart cases; not every combination of instructions, exceptions or pending interrupts. |
+| Paging and translated memory | `src/tests_paging.c`, `src/tests_heavy_paging.c`, `src/tests_mem.c` | Permissions, aliases, TLB invalidation and checked accesses; selected memory sizes/alignments, not a proof over all physical mappings. |
+| CPU/system state and sustained interactions | `src/tests_sys.c`, `src/tests_heavy_state.c`, `src/tests_burn.c` | Feature-gated control state, interrupts and mixed repetition; safe probes do not establish complete model-specific MSR behavior. |
+| Supporting platform | `src/tests_chipset.c` | Legacy PIC/PIT/RTC, A20 and limited DMA/ROM/PCI checks; not comprehensive motherboard/chipset validation. Network, IDE and other peripheral throughput are outside the primary scope. |
 
 `req` in each `TEST` record is the hexadecimal requirement bitmask defined
-in `kernel.h`. It explains eligibility, not everything a test exercises.
+in `src/kernel.h`. It explains eligibility, not everything a test exercises.
 `SKIP` retains the missing feature or runtime precondition; it is not coverage
 or a pass. Inspect the selected machine, feature gates and actual result
 inventory rather than assuming every CPU runs the same cases. 808x/286 are
@@ -33,7 +33,7 @@ This subsection describes additional instruction sets, not the CPU support
 list. Intel and other supported vendors use the common integer, x87, MMX,
 protected-mode, paging and system workloads above, according to their model
 and available facilities. P6 and other optional common instructions are
-feature/model gated too. See [model coverage and matrices](../README.md#model-coverage-and-matrices)
+feature/model gated too. See [model coverage and matrices](coverage.md#model-coverage-and-matrices)
 for the CPU catalogue and its remaining coverage gaps.
 
 The same i486-built image contains these optional workloads. Standard MMX
@@ -237,10 +237,10 @@ tested and so found nothing: a span rasteriser and a copy-on-write fork.
 
 ## Inventory and reading the tables
 
-This inventory contains **342 registered records** in the default source
-registries, including `cpu_model_contract` and the core recovery test; 163 of
-them are benchmark-sampled. It is an
-inventory, not a promise that all 342 execute on a particular machine. `ONLY`
+The tables list every record in the default source registries, including
+`cpu_model_contract` and the core recovery test, and mark which ones are
+benchmark-sampled. This is an inventory, not a promise that every record
+executes on a particular machine; `SUMMARY` reports how many ran. `ONLY`
 filters names (the contract is always selected), feature requirements and
 runtime preconditions can skip records, and `burn_mixed` runs only in the final
 round.
@@ -292,7 +292,7 @@ Requirements are registry masks, not complete lists of exercised instructions.
 `PAGING` means paging was enabled, `NOHV` excludes a detected hypervisor,
 `MEM8M` requires owned RAM at 4–8 MiB, and `PCI` requires configuration
 mechanism 1. Other capitalized names are the corresponding `REQ_` bits in
-`kernel.h`. FXSR, PSE, PAE and PGE additionally need usable CR4; the runtime
+`src/kernel.h`. FXSR, PSE, PAE and PGE additionally need usable CR4; the runtime
 also probes some advertised instructions. `AC` is gated by the i486 detection.
 A dash means no registry bit, **not** absence of runtime checks or a guarantee
 of execution. Arena size, model qualification, guard failures, APIC state and
@@ -424,7 +424,7 @@ the count is not necessarily the number of assertions or lanes.
 The FDIV rows each require FPU. The four names on each row independently
 repeat that vector 2,048 times at default scale; `rn`, `rd`, `ru`, `rz` mean
 round-to-nearest, down, up and toward zero. `ops` counts divisions. The exact
-raw 80-bit operands and independent rounded results are in `tests_fp_edges.c`;
+raw 80-bit operands and independent rounded results are in `src/tests_fp_edges.c`;
 these are selected vectors, not all x87 division inputs.
 
 | Vector | Record names | Input distinction |

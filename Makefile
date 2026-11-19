@@ -80,11 +80,13 @@ CFLAGS  = $(TARGET_FLAGS) -march=i486 -mtune=i486 $(STACK_FLAGS) \
           -DBENCHMARKS=$(BENCHMARKS) -DSUITE_BENCHMARK=$(if $(filter benchmark,$(SUITE)),1,0) \
           -DCPUBURN_VERSION='"$(VERSION)"'
 # Per-file overrides: FPU/MMX test files need the FPU/MMX instruction sets enabled (inline asm only, no compiler FP code on 486 path).
-SRCS    = core.c arith.c cpu_contract.c $(sort $(wildcard tests_*.c))
+SRC     = src
+SRCS    = core.c arith.c cpu_contract.c $(sort $(notdir $(wildcard $(SRC)/tests_*.c)))
 OBJS    = $(SRCS:%.c=$(BUILD)/%.o) $(BUILD)/start.o
 DIST    = dist/cpuburn-test-$(VERSION)
 SOURCES = $(sort .gitignore LICENSE VERSION README.md RELEASE_NOTES.md Makefile \
-          $(wildcard *.c *.h *.asm *.ld tools/*.py doc/*.md .github/workflows/*))
+          $(wildcard $(SRC)/*.c $(SRC)/*.h $(SRC)/*.asm $(SRC)/*.ld tools/*.py tools/tests/*.py \
+                     doc/*.md .github/workflows/*))
 
 all: $(IMAGE)
 
@@ -100,16 +102,16 @@ $(BUILD)/config.stamp: FORCE | $(BUILD)
 	if cmp -s $@.new $@; then rm -f $@.new; else mv -f $@.new $@; fi
 
 $(BUILD)/core.o: VERSION
-$(BUILD)/cpu_contract.o: cpu_models.h cpu_features.h
+$(BUILD)/cpu_contract.o: $(SRC)/cpu_models.h $(SRC)/cpu_features.h
 
-$(BUILD)/%.o: %.c kernel.h Makefile $(BUILD)/config.stamp | $(BUILD)
+$(BUILD)/%.o: $(SRC)/%.c $(SRC)/kernel.h Makefile $(BUILD)/config.stamp | $(BUILD)
 	$(CC) $(CFLAGS) $(CFLAGS_$*) -c $< -o $@
 
-$(BUILD)/start.o: start.asm Makefile $(BUILD)/config.stamp | $(BUILD)
+$(BUILD)/start.o: $(SRC)/start.asm Makefile $(BUILD)/config.stamp | $(BUILD)
 	$(NASM) -f elf32 $< -o $@
 
-$(BUILD)/kernel.elf: link.ld $(OBJS)
-	$(LD) -m elf_i386 -T link.ld -Map $(BUILD)/kernel.map -o $@ $(OBJS)
+$(BUILD)/kernel.elf: $(SRC)/link.ld $(OBJS)
+	$(LD) -m elf_i386 -T $(SRC)/link.ld -Map $(BUILD)/kernel.map -o $@ $(OBJS)
 
 comma := ,
 # Every name in ONLY must be a test: each test's name is a whole string in the
@@ -120,16 +122,16 @@ $(BUILD)/kernel.bin: $(BUILD)/kernel.elf
 	    tr '\0' '\n' < $@ | grep -qxF -- "$$t" || { echo "ONLY: no test named '$$t'" >&2; bad=1; }; \
 	done; test -z "$$bad")
 
-$(BUILD)/rm.bin: rm.asm boot_memory.asm $(BUILD)/kernel.elf $(BUILD)/kernel.bin Makefile | $(BUILD)
-	$(NASM) -f bin -DKERNEL_BYTES=$$(stat -c %s $(BUILD)/kernel.bin) \
+$(BUILD)/rm.bin: $(SRC)/rm.asm $(SRC)/boot_memory.asm $(BUILD)/kernel.elf $(BUILD)/kernel.bin Makefile | $(BUILD)
+	$(NASM) -f bin -I$(SRC)/ -DKERNEL_BYTES=$$(stat -c %s $(BUILD)/kernel.bin) \
 	    -DKERNEL_END=0x$$($(NM) -n $(BUILD)/kernel.elf | awk '$$3 == "_end" { print $$1 }') $< -o $@
 
-$(IMAGE): boot.asm $(BUILD)/rm.bin $(BUILD)/kernel.bin
+$(IMAGE): $(SRC)/boot.asm $(BUILD)/rm.bin $(BUILD)/kernel.bin
 	@set -eu; bytes=$$(( $$(stat -c %s $(BUILD)/rm.bin) + $$(stat -c %s $(BUILD)/kernel.bin) )); \
 	secs=$$(( (bytes + 511) / 512 )); \
 	echo "stage2: $$bytes bytes, $$secs sectors"; \
 	test $$secs -le 768 || { echo "kernel too large for low-memory loader staging"; exit 1; }; \
-	$(NASM) -f bin -DSTAGE2_SECTORS=$$secs boot.asm -o $(BUILD)/boot.bin; \
+	$(NASM) -f bin -I$(SRC)/ -DSTAGE2_SECTORS=$$secs $(SRC)/boot.asm -o $(BUILD)/boot.bin; \
 	cat $(BUILD)/boot.bin $(BUILD)/rm.bin $(BUILD)/kernel.bin > $(BUILD)/floppy.tmp; \
 	truncate -s 1474560 $(BUILD)/floppy.tmp; \
 	mv $(BUILD)/floppy.tmp $@
@@ -138,10 +140,13 @@ $(IMAGE): boot.asm $(BUILD)/rm.bin $(BUILD)/kernel.bin
 run-qemu: $(IMAGE)
 	qemu-system-i386 -cpu $(or $(CPU),pentium2) -m 32 -drive file=$(IMAGE),format=raw,if=floppy,readonly=on -boot a -display none -serial stdio -debugcon file:$(BUILD)/e9.log -no-reboot
 
-test:
-	$(PYTHON) -m unittest discover -s tools -p 'test_*.py' -v
+# The host tests import the tools as top-level modules.
+UNITTEST = PYTHONPATH=tools $(PYTHON) -m unittest discover -s tools/tests -p 'test_*.py' -v
 
-# Builds the three focused images the guest tests in tools/ document, in their
+test:
+	$(UNITTEST)
+
+# Builds the three focused images the guest tests in tools/tests/ document, in their
 # own build directories, and runs the whole suite under QEMU with them set.
 GUEST = $(BUILD)/guest
 guest-test:
@@ -154,7 +159,7 @@ guest-test:
 	CPUBURN_CONTRACT_IMAGE=$(abspath $(GUEST)/contract.img) \
 	CPUBURN_EXTENSION_IMAGE=$(abspath $(GUEST)/extension.img) \
 	CPUBURN_BOOT_IMAGE=$(abspath $(GUEST)/boot.img) \
-	    $(PYTHON) -m unittest discover -s tools -p 'test_*.py' -v
+	    $(UNITTEST)
 
 release: $(IMAGE)
 	rm -rf $(DIST)

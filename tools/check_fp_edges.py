@@ -6,7 +6,7 @@ from pathlib import Path
 import re
 
 
-SOURCE = Path(__file__).resolve().parents[1] / "tests_fp_edges.c"
+SOURCE = Path(__file__).resolve().parents[1] / "src" / "tests_fp_edges.c"
 E_RE = re.compile(
     r"E\(\s*(0x[0-9a-fA-F]+)\s*,\s*(0x[0-9a-fA-F]+)\s*,\s*(0x[0-9a-fA-F]+)\s*\)"
 )
@@ -177,7 +177,7 @@ def main():
     source = SOURCE.read_text()
     check_divisions(source)
     check_remainders(source)
-    print(f"Independent exact-rational table check passed: {SOURCE.relative_to(SOURCE.parents[1])}")
+    print(f"Independent exact-rational table check passed: {SOURCE.relative_to(SOURCE.parents[2])}")
 
 
 if __name__ == "__main__":

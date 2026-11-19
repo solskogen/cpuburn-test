@@ -126,7 +126,7 @@ def string(text):
 
 
 def contracts():
-    return set(re.findall(r'^CPU_MODEL\("([^"]+)"', (ROOT / "cpu_models.h").read_text(), re.M))
+    return set(re.findall(r'^CPU_MODEL\("([^"]+)"', (ROOT / "src/cpu_models.h").read_text(), re.M))
 
 
 def read_inventory(source, defines=()):

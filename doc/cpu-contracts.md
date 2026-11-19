@@ -1,6 +1,6 @@
 # CPU expectations, discovery and coverage
 
-The configured CPU is the expectation, not the oracle. `cpu_models.h` contains
+The configured CPU is the expectation, not the oracle. `src/cpu_models.h` contains
 architectural minimum requirements; `tools/cpu_matrix.py` reads 86Box's source
 tables only to discover selectable CPU identities and compatible machines.
 Emulator feature implementations and observed test results never supply
@@ -90,7 +90,7 @@ not only to their top-level registry gates.
 
 ## Feature verdicts and selection
 
-`cpu_features.h` explicitly associates features with behavioural witnesses.
+`src/cpu_features.h` explicitly associates features with behavioural witnesses.
 CPUID dumps alone do not count as verification. Additive serial records survive
 both raw-log parsing and JSON capture:
 

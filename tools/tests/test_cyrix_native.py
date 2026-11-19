@@ -7,7 +7,7 @@ import tempfile
 import unittest
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 
 
 @unittest.skipUnless(platform.system() == "Linux" and
@@ -77,7 +77,7 @@ void _start(void) {
                             "-march=i486", "-ffreestanding", "-fno-builtin",
                             "-fno-pie", "-fno-stack-protector", "-nostdlib", "-static",
                             "-Wno-unused-function", "-ffunction-sections", "-fdata-sections",
-                            "-I", str(ROOT), str(fixture), "-Wl,--gc-sections",
+                            "-I", str(ROOT / "src"), str(fixture), "-Wl,--gc-sections",
                             "-o", str(binary),
                         ], capture_output=True, text=True)
                         self.assertEqual(build.returncode, 0, build.stdout + build.stderr)

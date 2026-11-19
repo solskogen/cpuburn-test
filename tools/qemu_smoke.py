@@ -9,6 +9,35 @@ import subprocess
 import time
 
 
+REQ_FPU = 1 << 2  # kernel.h
+
+
+def x87_failures(tests):
+    """Names of failed tests that need an x87 FPU (REQ_FPU in their req mask)."""
+    return [t["name"] for t in tests if t.get("status") == "FAIL"
+            and int(t.get("req", "0"), 16) & REQ_FPU]
+
+
+def fpu_backend(machine):
+    """FPU backend the configuration selects. Boards flagged SoftFloat-only in
+    86Box use SoftFloat even when the configuration does not ask for it."""
+    if machine.get("fpu_type") == "none":
+        return "none"
+    return "softfloat" if machine.get("fpu_softfloat", "0") == "1" else "host"
+
+
+def host_fpu_note(tests, backend):
+    """Explain x87 failures from 86Box's host FPU backend, which is not bit-exact."""
+    if backend != "host":
+        return None
+    failed = x87_failures(tests)
+    if not failed:
+        return None
+    return (f"{len(failed)} failing x87 tests ran on 86Box's host FPU backend, which "
+            "does not round and flag like a real x87. Rerun with --fpu-backend softfloat "
+            "to check x87 conformance.")
+
+
 def parse_log(text):
     tests = []
     details = []

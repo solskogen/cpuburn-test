@@ -14,7 +14,7 @@ from perf_report import summarize
 from qemu_smoke import parse_log
 from test_perf_report import example
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 class BuildTests(unittest.TestCase):
@@ -22,11 +22,12 @@ class BuildTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
-        for name in ("LICENSE", "README.md", "RELEASE_NOTES.md", ".gitignore",
-                     "core.c", "arith.c", "cpu_contract.c", "cpu_models.h", "cpu_features.h",
-                     "kernel.h", "link.ld",
-                     "start.asm", "rm.asm", "boot.asm", "boot_memory.asm"):
+        for name in ("LICENSE", "README.md", "RELEASE_NOTES.md", ".gitignore"):
             (self.root / name).write_text(name + "\n")
+        (self.root / "src").mkdir()
+        for name in ("core.c", "arith.c", "cpu_contract.c", "cpu_models.h", "cpu_features.h",
+                     "kernel.h", "link.ld", "start.asm", "rm.asm", "boot.asm", "boot_memory.asm"):
+            (self.root / "src" / name).write_text(name + "\n")
         (self.root / "VERSION").write_text("0.1.0\n")
         shutil.copy2(PROJECT_ROOT / "Makefile", self.root / "Makefile")
         (self.root / "tools").mkdir()
@@ -68,10 +69,10 @@ class BuildTests(unittest.TestCase):
         self.assertIn("-DBENCHMARKS=0", commands)
         self.assertNotIn("-DBENCHMARKS=1", commands)
         for module in ("tests_int.c", "tests_fpu.c", "tests_mmx.c", "tests_burn.c"):
-            (self.root / module).write_text(module + "\n")
+            (self.root / "src" / module).write_text(module + "\n")
         commands = self.make("-n", "-B", "BENCHMARKS=0")
         for module in ("tests_int.c", "tests_fpu.c", "tests_mmx.c", "tests_burn.c"):
-            self.assertIn("-c " + module, commands)
+            self.assertIn("-c src/" + module, commands)
 
     def test_invalid_benchmark_setting_is_rejected(self):
         for value in ("2", "yes", ""):
@@ -138,7 +139,7 @@ class BuildTests(unittest.TestCase):
         self.make("clean")
         for name in ("build", "floppy.img", "dist"):
             self.assertFalse((self.root / name).exists())
-        self.assertTrue((self.root / "core.c").exists())
+        self.assertTrue((self.root / "src/core.c").exists())
 
     def test_package_checksums_and_source_archive(self):
         (self.root / "floppy.img").write_bytes(b"fixture image")
@@ -160,6 +161,7 @@ class BuildTests(unittest.TestCase):
             self.assertIn("cpuburn-test-0.1.0/tools/test.py", names)
             self.assertIn("cpuburn-test-0.1.0/.github/workflows/build.yml", names)
             self.assertIn("cpuburn-test-0.1.0/doc/cpu-contracts.md", names)
+            self.assertIn("cpuburn-test-0.1.0/src/core.c", names)
             self.assertNotIn("cpuburn-test-0.1.0/build/secret.log", names)
         self.make(*args)
         self.assertEqual(contents, archive_path.read_bytes())

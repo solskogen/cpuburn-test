@@ -387,7 +387,7 @@ static u32 pm_irq_nesting(void) {
     t_ops(200000);
     CHECK(pit_ticks > ticks);
     t_note("software_ints=%u pit_ticks=%u", pm_int_count, pit_ticks - ticks);
-    return csum_mix(pm_int_count, pit_ticks - ticks);
+    return pm_int_count; /* the tick count is timing; it stays in the note */
 }
 
 extern void pm_bp_target(void);
