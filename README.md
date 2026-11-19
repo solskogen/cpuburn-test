@@ -97,10 +97,22 @@ configuration, stores it as `fpu_backend` in `result.json`, and prints a
 note when x87 tests failed on the host backend. `perf_report.py` repeats
 that note.
 
-The five failures left with softfloat are not FPU-related:
-`cpu_model_contract`, `pg_pse36_permissions`, `pm_alignment_check`,
-`pm_debug_regs` and `priority_alignment_page`. They are emulation
-differences that the tests deliberately keep as `FAIL`; see
+With softfloat, current 86Box releases leave five failures that are not
+FPU-related:
+
+- `cpu_model_contract` (CPUID DE bit) and `pm_debug_regs` fail because
+  86Box turns off debug registers on 486 and later CPUs by default. Both
+  pass with the "Debug registers on 486 and later processors" machine
+  setting (`cpu_debug_regs_486 = 1` in `[Machine]`).
+- `pg_pse36_permissions`: 86Box does not fault on the reserved bits
+  21:17 of a 4 MiB page directory entry on PSE-36 CPUs.
+- `pm_alignment_check` and `priority_alignment_page`: 86Box does not
+  raise the alignment-check exception (#AC).
+
+Builds that include the PSE-36 and #AC fixes pass the last three, which
+leaves only the two debug-register failures.
+
+The tests deliberately keep these as `FAIL`; see
 [interpreting emulator differences](doc/results.md#interpreting-emulator-differences).
 
 Counts depend on the CPU model, machine, 86Box version and image. Record
