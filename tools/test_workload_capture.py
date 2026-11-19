@@ -9,7 +9,8 @@ from unittest.mock import Mock, patch
 
 from qemu_smoke import parse_log
 from run_86box import arguments, complete_counts, display_environment, execute, write_config
-from workload_capture import WorkloadCapture, PerfRecorder, parse_perf_script, process_cpu_seconds
+from workload_capture import (WorkloadCapture, PerfRecorder, parse_perf_script,
+                              process_cpu_seconds, settle_state)
 
 
 def marker(phase="sample", identifier=1, round_number=1, name="heavy"):
@@ -22,10 +23,11 @@ class CaptureTests(unittest.TestCase):
         return capture.feed(data, after[2], after[0])
 
     def test_interior_cpu_wall_and_capacity(self):
-        capture = WorkloadCapture(2, 250)
+        capture = WorkloadCapture(250)
         self.assertEqual(self.step(capture, (10, 1, 0), (11, 1.2, 250), marker()),
                          ["+00000001\n"])
-        self.assertEqual(self.step(capture, (20, 1.3, 250), (20.5, 1.8, 500)), [])
+        self.assertEqual(self.step(capture, (20, 1.3, 250), (20.5, 1.8, 500)),
+                         ["+00000001\n"])
         self.step(capture, (30, 2, 500), (31, 2.5, 750), marker("end"))
         report = capture.report()
         workload = report["workloads"][0]
@@ -39,17 +41,48 @@ class CaptureTests(unittest.TestCase):
         self.assertIn("under_sampled:1", report["warnings"])
         self.assertEqual(workload["end_boundary"]["step_monotonic_start"], 30)
 
-    def test_lease_heartbeat_and_release(self):
-        capture = WorkloadCapture(2)
+    def test_lease_heartbeat_and_release_when_settled(self):
+        capture = WorkloadCapture(min_seconds=2, block_seconds=.5, min_blocks=2)
         self.assertEqual(capture.feed(marker(identifier=255), 0, 1), ["+000000ff\n"])
-        self.assertEqual(self.step(capture, (1, 0, 0), (2, .5, 1000)), ["+000000ff\n"])
-        self.assertEqual(self.step(capture, (2, .5, 1000), (4, 2.5, 2000)), ["-000000ff\n"])
-        self.assertEqual(self.step(capture, (4, 2.5, 2000), (5, 3, 3000)), ["-000000ff\n"])
-        self.assertEqual(capture.feed(marker("end", 255), 3000, 5), [])
-        self.assertFalse(capture.report()["workloads"][0]["under_sampled"])
+        self.assertEqual(self.step(capture, (1, 0, 0), (2, 1, 1000)), ["+000000ff\n"])
+        self.assertEqual(self.step(capture, (2, 1, 1000), (3, 2, 2000)), ["+000000ff\n"])
+        self.assertEqual(self.step(capture, (3, 2, 2000), (4, 3, 3000)), ["-000000ff\n"])
+        self.assertEqual(self.step(capture, (4, 3, 3000), (5, 4, 3100)), [])
+        self.assertEqual(self.step(capture, (5, 4, 3100), (6, 5, 3250)), ["-000000ff\n"])
+        self.assertEqual(capture.feed(marker("end", 255), 3250, 6), [])
+        workload = capture.report()["workloads"][0]
+        self.assertEqual(workload["sample_stop"], "settled")
+        self.assertFalse(workload["under_sampled"])
+        self.assertEqual(workload["settle"]["discarded_blocks"], 1)
+
+    def test_unsettled_sample_is_capped(self):
+        capture = WorkloadCapture(min_seconds=1, max_seconds=4, block_seconds=.5, min_blocks=2)
+        capture.feed(marker(), 0, 0)
+        speeds = (250, 1000, 250, 1000)
+        commands = [self.step(capture, (i, i, i * 1000), (i + 1, i + 1, i * 1000 + guest))
+                    for i, guest in enumerate(speeds)]
+        self.assertEqual(commands[-1], ["-00000001\n"])
+        self.assertFalse(any("-00000001\n" in c for c in commands[:-1]))
+        report = capture.report()
+        workload = report["workloads"][0]
+        self.assertEqual(workload["sample_stop"], "capped")
+        self.assertFalse(workload["under_sampled"])
+        self.assertIn("capped:1", report["warnings"])
+        self.assertEqual(report["aggregates"]["heavy"]["capped"], 1)
+        self.assertEqual(workload["block_speed_percent"], [25, 100, 25, 100])
+
+    def test_short_steps_accumulate_into_blocks(self):
+        capture = WorkloadCapture(block_seconds=.5)
+        capture.feed(marker(), 0, 0)
+        for i in range(5):
+            self.step(capture, (i * .2, 0, i * 100), ((i + 1) * .2, 0, (i + 1) * 100))
+        [(wall, guest)] = capture.active["_blocks"]
+        self.assertAlmostEqual(wall, .6)
+        self.assertEqual(guest, 300)
+        self.assertAlmostEqual(capture.active["_block"][0], .4)
 
     def test_stale_end_and_new_round_ids(self):
-        capture = WorkloadCapture(.1)
+        capture = WorkloadCapture()
         capture.feed(marker(identifier=1), 0)
         capture.feed(marker("end", 0), 100)
         self.assertEqual(capture.active["id"], 1)
@@ -64,7 +97,7 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual(len(capture.report()["workloads"]), 2)
 
     def test_fragmented_boundaries_discard_partial_steps(self):
-        capture = WorkloadCapture(1)
+        capture = WorkloadCapture()
         start = marker()
         self.assertEqual(self.step(capture, (1, 0, 0), (2, .1, 250), start[:20]), [])
         self.assertEqual(self.step(capture, (2, .1, 250), (3, .2, 500), start[20:]),
@@ -91,10 +124,10 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual(report["phases"][0]["process_cpu_seconds"], .5)
 
     def test_multiple_markers_in_step_never_attribute_or_extend_ended_work(self):
-        capture = WorkloadCapture(.1)
+        capture = WorkloadCapture()
         commands = self.step(capture, (1, 0, 0), (2, 1, 250),
                              marker() + marker("end") + marker(identifier=2))
-        self.assertEqual(commands, ["+00000001\n", "+00000002\n"])
+        self.assertEqual(commands, ["+00000002\n"])
         self.assertEqual(capture.windows, [])
         self.assertEqual(capture.report()["workloads"][0]["steps"], 0)
 
@@ -107,10 +140,15 @@ class CaptureTests(unittest.TestCase):
                 self.assertEqual(capture.windows, [])
                 self.assertEqual(capture.report()["workloads"][0]["invalid_steps"], 1)
 
-    def test_invalid_protocol_and_target(self):
-        for target in (0, -1, float("nan"), float("inf")):
-            with self.assertRaises(ValueError):
-                WorkloadCapture(target)
+    def test_invalid_protocol_and_settings(self):
+        for name in ("min_seconds", "max_seconds", "tolerance", "block_seconds"):
+            for value in (0, -1, float("nan"), float("inf")):
+                with self.subTest(name=name, value=value), self.assertRaises(ValueError):
+                    WorkloadCapture(**{name: value})
+        for options in ({"min_seconds": 3, "max_seconds": 2}, {"min_blocks": 1},
+                        {"min_blocks": 2.5}):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                WorkloadCapture(**options)
         capture = WorkloadCapture()
         self.assertEqual(capture.feed(marker(identifier=0x100000000), 0), [])
         self.assertEqual(capture.feed("WORK phase=sample r=1 id=ff name=heavy\n", 0), [])
@@ -118,7 +156,7 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual(capture.report()["availability"], "unavailable_no_sample_markers")
 
     def test_fail_diagnostics_do_not_end_sample(self):
-        capture = WorkloadCapture(.1)
+        capture = WorkloadCapture(min_seconds=.5, max_seconds=1)
         capture.feed(marker(), 0)
         self.assertEqual(self.step(capture, (1, 0, 0), (2, .2, 250),
                                    "FAILDETAIL mismatch\nNOTE profiling continues\n"),
@@ -133,6 +171,28 @@ class CaptureTests(unittest.TestCase):
         report = capture.report()["workloads"][0]
         self.assertTrue(report["under_sampled"])
         self.assertEqual(report["end_reason"], "capture_stopped")
+
+    def test_settle_state(self):
+        steady = [(.25, 250)] * 8
+        state = settle_state(steady, .01, 5)
+        self.assertTrue(state["settled"])
+        self.assertEqual((state["discarded_blocks"], state["window_blocks"]), (2, 6))
+        self.assertEqual(state["window_speed_percent"], 100)
+        self.assertTrue(settle_state(steady[:6], .01, 5)["settled"])
+        self.assertFalse(settle_state(steady[:5], .01, 5)["settled"])
+        slow_start = [(.25, 50)] + steady
+        self.assertTrue(settle_state(slow_start, .01, 5)["settled"])
+        noisy = [(.25, 250 + (25 if i % 2 else -25)) for i in range(12)]
+        state = settle_state(noisy, .01, 5)
+        self.assertFalse(state["settled"])
+        self.assertGreater(state["relative_interval"], .01)
+        drifting = [(.25, 240 + 2 * i) for i in range(40)]
+        state = settle_state(drifting, .05, 5)
+        self.assertLess(state["relative_interval"], .05)
+        self.assertGreater(state["relative_drift"], .05)
+        self.assertFalse(state["settled"])
+        empty = settle_state([], .01, 5)
+        self.assertEqual((empty["window_blocks"], empty["settled"]), (0, False))
 
     def test_proc_stat_includes_process_utime_and_stime(self):
         fields = ["S"] + ["0"] * 10 + ["123", "77"] + ["0"] * 10
@@ -275,7 +335,7 @@ class RunnerTests(unittest.TestCase):
             self.assertTrue(result["correctness"]["complete"])
             self.assertFalse(result["correctness"]["passed"])
             self.assertEqual(result["workload_capture"]["workloads"][0]["steps"], 1)
-            self.assertEqual(sum(c.startswith("serial write ") for c in commands), 1)
+            self.assertEqual(sum(c.startswith("serial write ") for c in commands), 2)
             self.assertTrue((run_dir / "result.json").is_file())
 
     def fake_run(self, args, chunks, process):
@@ -333,8 +393,9 @@ class RunnerTests(unittest.TestCase):
     def test_defaults_and_mmx_233_and_pii(self):
         with patch("sys.argv", ["run_86box.py", "--profile", "mmx"]):
             args = arguments()
-        self.assertEqual((args.profile, args.sample_cpu_seconds, args.emulated_ms,
-                          args.wall_seconds), ("mmx", 30, 86400000, 28800))
+        self.assertEqual((args.profile, args.min_sample_seconds, args.max_sample_seconds,
+                          args.settle_tolerance, args.emulated_ms, args.wall_seconds),
+                         ("mmx", 1, 20, .01, 86400000, 28800))
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
             options = SimpleNamespace(profile="mmx", config=None, memory_mb=16, dynarec=None)
             machine = write_config(options, Path(directory))

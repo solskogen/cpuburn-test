@@ -157,10 +157,10 @@ class PerfTests(unittest.TestCase):
         a, b = example(), example()
         for run in (a, b):
             run["host"] = {"architecture": "aarch64", "cpu": "Pi 5"}
-            run["workload_capture"] = {"sample_cpu_seconds_target": 30}
+            run["workload_capture"] = {"sampling": {"settle_tolerance": .01}}
             run["perf"] = {"status": "disabled"}
         for key, value in (("host", {"architecture": "x86_64"}),
-                           ("workload_capture", {"sample_cpu_seconds_target": .05}),
+                           ("workload_capture", {"sampling": {"settle_tolerance": .05}}),
                            ("perf", {"status": "captured"})):
             other = copy.deepcopy(b)
             other[key] = value

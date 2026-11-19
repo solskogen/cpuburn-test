@@ -15,7 +15,7 @@ ROUNDS  ?= 1
 BURN_SECONDS ?= 10
 WATCHDOG_SECONDS ?= 90
 HEAVY_SCALE ?= 8
-TEST_SECONDS ?= 5
+TEST_SECONDS ?= 1
 # SUITE selects what the image runs: full (default), benchmark (the sampled
 # workloads only, skipping check-only records) or accuracy (every record,
 # checked once; the same as BENCHMARKS=0).

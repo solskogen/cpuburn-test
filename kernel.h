@@ -282,7 +282,7 @@ u32 pci_read32(u8 bus, u8 dev, u8 fn, u8 reg);
 #define TEST_SEED 0x86B04A21u
 #endif
 #ifndef TEST_SECONDS
-#define TEST_SECONDS 30
+#define TEST_SECONDS 1
 #endif
 #if TEST_SECONDS < 1 || TEST_SECONDS > 3600
 #error TEST_SECONDS must be between 1 and 3600

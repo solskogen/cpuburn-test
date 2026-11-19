@@ -50,6 +50,13 @@ def positive_int(value):
     return number
 
 
+def sampling_options(args):
+    return {"min_seconds": getattr(args, "min_sample_seconds", 1.0),
+            "max_seconds": getattr(args, "max_sample_seconds", 20.0),
+            "tolerance": getattr(args, "settle_tolerance", 0.01),
+            "block_seconds": getattr(args, "block_seconds", 0.2)}
+
+
 def boot_key(value):
     try:
         when, code = value.split(":")
@@ -110,8 +117,14 @@ def arguments():
     parser.add_argument("--wall-seconds", type=positive, default=28800)
     parser.add_argument("--step-ms", type=positive_int, default=250,
                         help="capture interval in emulated milliseconds (default: 250)")
-    parser.add_argument("--sample-cpu-seconds", type=positive, default=30.0,
-                        help="minimum interior-step process CPU seconds per workload (default: 30)")
+    parser.add_argument("--min-sample-seconds", type=positive, default=1.0,
+                        help="host wall seconds a sample must run before it may settle (default: 1)")
+    parser.add_argument("--max-sample-seconds", type=positive, default=20.0,
+                        help="host wall seconds after which an unsettled sample stops (default: 20)")
+    parser.add_argument("--settle-tolerance", type=positive, default=0.01,
+                        help="relative interval and drift that count as settled (default: 0.01)")
+    parser.add_argument("--block-seconds", type=positive, default=0.2,
+                        help="host wall seconds per speed block in the settle test (default: 0.2)")
     parser.add_argument("--perf", action="store_true",
                         help="attach perf record once; require working perf permissions, save hotpaths")
     parser.add_argument("--expect", action="append", default=[],
@@ -125,7 +138,10 @@ def arguments():
                         help="press/release set-1 key at EMULATED_MS:SCANCODE; repeatable")
     parser.add_argument("--prepare-only", action="store_true",
                         help="write isolated inputs and launch.json without starting 86Box")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.min_sample_seconds > args.max_sample_seconds:
+        parser.error("--min-sample-seconds must not exceed --max-sample-seconds")
+    return args
 
 
 def rom_directory(explicit):
@@ -488,7 +504,7 @@ def execute(args, run_dir, command, machine):
     started = time.monotonic()
     deadline = started + args.wall_seconds
     emulator = connection = api = None
-    capture = WorkloadCapture(getattr(args, "sample_cpu_seconds", 30.0), args.step_ms)
+    capture = WorkloadCapture(args.step_ms, **sampling_options(args))
     recorder = PerfRecorder(run_dir) if getattr(args, "perf", False) else None
     perf_stopped = False
     accuracy = getattr(args, "accuracy", False)
@@ -822,7 +838,7 @@ def main():
                                 "step_ms": args.step_ms, "keys": args.key,
                                 "bios_f1": args.bios_f1, "expect": args.expect,
                                 "reject": args.reject,
-                                "sample_cpu_seconds": getattr(args, "sample_cpu_seconds", 30.0),
+                                "sampling": sampling_options(args),
                                 "accuracy": getattr(args, "accuracy", False),
                                 "perf": getattr(args, "perf", False)},
                     "host": host_metadata()}

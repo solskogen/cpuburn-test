@@ -22,9 +22,9 @@ Version **0.1.0 preview**. Licensed under [MIT](LICENSE).
   configuration and host conditions consistent when comparing builds.
   `python tools/perf_report.py serial.log --output report.json` summarizes
   a complete log; users decide how to assess regressions.
-- **Shorter runs:** `make BURN_SECONDS=1 TEST_SECONDS=1` keeps the selected
-  test cases but reduces repetition/stress and timing confidence. Defaults
-  are 10 and 5 guest seconds; invocations are never cut short.
+- **Shorter runs:** `make BURN_SECONDS=1` keeps the selected test cases but
+  shortens the mixed burn. Defaults are `BURN_SECONDS=10` and
+  `TEST_SECONDS=1` guest seconds; invocations are never cut short.
 - **Benchmarks only:** `make SUITE=benchmark` builds just the sampled
   workloads, leaving out check-only correctness records.
 - **Correctness only:** `make BENCHMARKS=0` removes timed harness repetition,
@@ -139,8 +139,17 @@ In `result.json`, **each sampled test** has an entry under
   host step time, multiplied by 100. Sustained values below approximately
   **100%** indicate that test could not maintain the configured guest speed
   on this host.
-- `under_sampled`: true when the test did not reach the requested host
-  CPU-time minimum; do not treat a short sample as a firm performance result.
+- `sample_stop`: `settled` when the host-measured speed settled and the
+  sample was released, `capped` when it had not settled after the maximum
+  sample time (the result is still usable but noisier; it is also listed as
+  `capped:<id>` in `warnings`).
+- `settle.window_speed_percent`: the same capacity measured over the settled
+  window only, without its leading warm-in blocks; `settle` also reports the
+  relative interval and drift that decided the stop, and
+  `block_speed_percent` lists each block's speed.
+- `under_sampled`: true when the sample ended before it settled or reached
+  the cap (for example, the capture stopped); do not treat it as a firm
+  performance result.
 
 This is measured capacity, not the GUI speed reading or an automatic
 slowdown verdict. Correctness remains separate: check FAIL/FAULT records,
@@ -165,15 +174,16 @@ A run with enough capacity to maintain real time might contain:
 ```json
 {
   "name": "int_alu",
-  "emulated_ms": 40000,
-  "step_wall_seconds": 30.0,
-  "process_cpu_seconds": 30.0,
+  "emulated_ms": 4000,
+  "step_wall_seconds": 3.0,
+  "process_cpu_seconds": 3.0,
   "full_speed_capacity_percent": 133.33333333333334,
+  "sample_stop": "settled",
   "under_sampled": false
 }
 ```
 
-It advanced 40 guest seconds in 30 host seconds: **133% capacity**, with
+It advanced 4 guest seconds in 3 host seconds: **133% capacity**, with
 headroom above the configured speed. Together with PASS, this is the desired
 result for the checked workload, not proof of perfect emulation.
 
@@ -182,15 +192,16 @@ A slower run could instead contain:
 ```json
 {
   "name": "int_alu",
-  "emulated_ms": 22500,
-  "step_wall_seconds": 30.0,
-  "process_cpu_seconds": 30.0,
+  "emulated_ms": 2250,
+  "step_wall_seconds": 3.0,
+  "process_cpu_seconds": 3.0,
   "full_speed_capacity_percent": 75.0,
+  "sample_stop": "settled",
   "under_sampled": false
 }
 ```
 
-It advanced only 22.5 guest seconds in 30 host seconds: **75% capacity**.
+It advanced only 2.25 guest seconds in 3 host seconds: **75% capacity**.
 The checked results are still correct, but this host cannot sustain the
 configured CPU speed during that workload. A FAIL at 133% would mean the
 opposite problem: sufficient speed, incorrect results. Capacity near 100%
@@ -527,8 +538,12 @@ are assumed; this is not a UEFI, ARM, or SMP test.
 
 In the default **benchmark-enabled** run, each supported workload gets a
 checked warm-up invocation, followed by repeated
-checked invocations in a window lasting **at least `TEST_SECONDS` (default 5)
-guest seconds**.
+checked invocations in a window lasting **at least `TEST_SECONDS` (default 1)
+guest second**. The guest timer ticks every 10 ms, so a 1-second window has
+about 1% timing resolution on its own; raise `TEST_SECONDS` for more precise
+standalone guest timing. Under the host runner the window is held open until
+the host-measured speed settles (see
+[sustained host profiling](#sustained-host-profiling)).
 Assertions remain active throughout. Warm-up failures remain FAIL even when
 later invocations pass, preserving cold dynarec/cache bugs. Assertion failures
 do not terminate the sustained window; unexpected faults or unavailable safe
@@ -551,8 +566,8 @@ Clean-rebuild when changing settings, for example:
 ```sh
 make ROUNDS=1 BURN_SECONDS=5 WATCHDOG_SECONDS=90
 make ROUNDS=4 HEAVY_SCALE=8 BURN_SECONDS=20
-# Shorter validation build; identical algorithm and checks, less sampling time:
-make ROUNDS=1 BURN_SECONDS=1 TEST_SECONDS=1
+# Shorter validation build; identical algorithm and checks, shorter burn:
+make ROUNDS=1 BURN_SECONDS=1
 # Only the named tests (comma-separated, exact names); ids match a full run:
 make ONLY=corpus_integer_sequences,int_smc
 ```
@@ -566,8 +581,9 @@ a `FAULT`, not a successful shortened benchmark. The watchdog applies to each
 invocation, not the whole sustained window. A timeout inside a nested probe
 first returns to that probe's caller so the test can clean up; the test is
 then given two more seconds before it is abandoned, and either way it is
-reported as `FAULT`. `TEST_SECONDS` accepts 1–3600;
-use the default 5 or more for profiling, not the shortened validation build.
+reported as `FAULT`. `TEST_SECONDS` accepts 1–3600. The host runner does
+not need a longer window, since it extends sampling itself; raise it only for
+more precise standalone guest timing.
 `ONLY` runs just the listed tests and logs them as `CFG only=`; `SUMMARY`
 counts only those. A name that is no test fails the build. A clean default
 rebuild selects the full suite.
@@ -727,9 +743,9 @@ records cannot establish a passing performance comparison.
 Host median comparisons are also reported; `--gate-host-time` additionally
 enforces the threshold on host time and requires the minimum number of
 independent boots on both sides (multiple rounds are not independent boots).
-Host metadata, CPU-time targets and perf enablement must match when pooling
-86Box captures. With host-controlled sampling, faster emulation can simply do
-more invocations within the same CPU budget: prefer per-phase capacity and
+Host metadata, sampling settings and perf enablement must match when pooling
+86Box captures. With host-controlled sampling, sample length depends on how
+quickly the speed settles: prefer per-phase capacity and
 counter/operation data, not boot-to-DONE time, as the optimization signal.
 
 Host durations include boot and logging; 86Box durations also include
@@ -745,27 +761,50 @@ inspect `serial.log` and `SUMMARY`.
 
 ### Sustained host profiling
 
-The runner uses your VM's CPU settings, 250 guest-ms automation steps,
-and **30 actual process CPU seconds per sampled workload**, with 24 guest-hour
-and eight host-hour overall deadlines. `--sample-cpu-seconds` changes that
-minimum; `--step-ms` controls boundary uncertainty. Linux `/proc/PID/stat`
-accounts for **all emulator threads**, not just the CPU core thread. Runs
-require the local automation-enabled 86Box build; standalone floppy boot does
-not require this interface.
+The runner uses your VM's CPU settings and 250 guest-ms automation steps,
+with 24 guest-hour and eight host-hour overall deadlines; `--step-ms`
+controls boundary uncertainty. Each sampled workload runs **until its
+host-measured speed settles**:
 
-The runner renews a 30-guest-second serial lease while more host CPU time is
-needed, then releases it. A release never shortens the guest minimum. If the
+- Interior steps are grouped into blocks of at least `--block-seconds`
+  (default 0.2) host wall seconds, and each block's speed is guest time per
+  host wall time.
+- The leading quarter of the blocks (at least one) is left out as warm-in.
+- The sample settles once it has run `--min-sample-seconds` (default 1) host
+  seconds, at least five blocks remain, twice the standard error of their
+  mean speed is within `--settle-tolerance` (default 0.01, i.e. 1%) of the
+  mean, and the means of the first and second halves of those blocks differ
+  by no more than that tolerance.
+- A sample that has not settled after `--max-sample-seconds` (default 20)
+  host seconds stops anyway and is marked `capped`.
+
+Steady workloads therefore stop after a couple of host seconds, while noisy
+or drifting ones get more time. Settling uses host wall time, which works on
+any host. Linux `/proc/PID/stat` process CPU time, which accounts for **all
+emulator threads**, is still reported but is too coarse (10 ms ticks) to
+decide when to stop. Blocks are not independent when a workload repeats a
+long iteration, so treat `settled` as "stable enough to stop", not as a
+statistical guarantee; compare repeated runs when the difference is small.
+Runs require the local automation-enabled 86Box build; standalone floppy boot
+does not require this interface.
+
+The runner renews a 30-guest-second serial lease until the sample settles
+or is capped, then releases it. A release never shortens the guest minimum
+(`TEST_SECONDS`). If the
 controller disappears, the last lease expires, so the guest does not wait
 forever. The timer interrupt drains serial control frames to avoid overrunning
-the UART during long invocations; releases are retransmitted until the phase
-ends. Interrupt-disabled intervals can defer receipt, and complete invocations
+the UART during long invocations. The runner sends at most one frame per
+step, only for the sample still active after that step, and repeats renewals
+and releases every 250 emulated ms until the phase ends; a short sample that
+starts and ends within one step gets no frame. Interrupt-disabled intervals can defer receipt, and complete invocations
 can overshoot the requested minimum. Frames are `+IIIIIIII\n` / `-IIIIIIII\n`, using eight
 hexadecimal digits for the current workload ID. Malformed and stale frames
 cannot extend a different workload.
 
 `result.json` includes `workload_capture`: separate warm-up/sample phases,
 interior-step host wall time, process CPU time, guest milliseconds, aggregated
-workloads, and explicit undersampling warnings. Steps containing a phase
+workloads, the sampling settings, per-sample settle state and block speeds,
+and explicit undersampling and capped-sample warnings. Steps containing a phase
 boundary or partial serial line are excluded, not assigned speculatively.
 `full_speed_capacity_percent` is guest time / unthrottled step wall time × 100:
 below 100 identifies a path unable to keep up on that host under these

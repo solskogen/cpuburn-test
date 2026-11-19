@@ -14,12 +14,17 @@ import platform
 import re
 import shutil
 import signal
+import statistics
 import subprocess
 import time
 
 
 WORK = re.compile(r"WORK phase=(warmup|sample|end) r=([1-9][0-9]*) "
                   r"id=([0-9]+) name=(\S+)")
+# Lease frames go out at most once per feed, only for the sample still active
+# then, and are repeated well inside the guest's 1 s minimum: a stale frame
+# queued with the current one can overrun the 16-byte UART FIFO.
+LEASE_RENEW_MS = 250
 
 
 def process_cpu_seconds(pid):
@@ -44,11 +49,59 @@ def host_metadata():
             "clock": "CLOCK_MONOTONIC", "clock_ticks_per_second": os.sysconf("SC_CLK_TCK")}
 
 
+def settle_state(blocks, tolerance, min_blocks):
+    """Judge whether per-block speeds (wall seconds, guest ms) have settled.
+
+    The leading quarter of the blocks (at least one) is left out, so a slow
+    first block cannot hold a sample open. The remaining window has settled
+    when it holds at least min_blocks blocks, twice the standard error of the
+    mean block speed (an approximate 95% interval) is within tolerance of the
+    mean, and the means of its first and second halves differ by at most
+    tolerance (no drift). All ratios are relative to the window mean.
+    """
+    discard = min(len(blocks), max(1, len(blocks) // 4))
+    window = blocks[discard:]
+    speeds = [guest / 1000 / wall for wall, guest in window]
+    state = {"blocks": len(blocks), "discarded_blocks": discard,
+             "window_blocks": len(speeds), "window_speed_percent": None,
+             "relative_interval": None, "relative_drift": None, "settled": False}
+    if speeds:
+        state["window_speed_percent"] = (
+            sum(guest for _, guest in window) / 10 / sum(wall for wall, _ in window))
+    if len(speeds) >= 2:
+        mean = statistics.fmean(speeds)
+        half = len(speeds) // 2
+        state["relative_interval"] = (
+            2 * statistics.stdev(speeds) / math.sqrt(len(speeds)) / mean)
+        state["relative_drift"] = (
+            statistics.fmean(speeds[-half:]) - statistics.fmean(speeds[:half])) / mean
+        state["settled"] = (len(speeds) >= min_blocks
+                            and state["relative_interval"] <= tolerance
+                            and abs(state["relative_drift"]) <= tolerance)
+    return state
+
+
 class WorkloadCapture:
-    def __init__(self, sample_cpu_seconds=30.0, step_ms=250):
-        if not math.isfinite(sample_cpu_seconds) or sample_cpu_seconds <= 0:
-            raise ValueError("sample CPU seconds must be finite and positive")
-        self.target = sample_cpu_seconds
+    """Hold each sample open until its speed settles, or until max_seconds.
+
+    Speed is guest time per host wall time of interior steps. Steps are grouped
+    into blocks of at least block_seconds; see settle_state for the rule. The
+    guest's own TEST_SECONDS window is a floor that a release cannot shorten.
+    """
+
+    def __init__(self, step_ms=250, *, min_seconds=1.0, max_seconds=20.0,
+                 tolerance=0.01, block_seconds=0.2, min_blocks=5):
+        for name, value in (("min_seconds", min_seconds), ("max_seconds", max_seconds),
+                            ("tolerance", tolerance), ("block_seconds", block_seconds)):
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+        if min_seconds > max_seconds:
+            raise ValueError("min_seconds must not exceed max_seconds")
+        if int(min_blocks) != min_blocks or min_blocks < 2:
+            raise ValueError("min_blocks must be an integer of at least 2")
+        self.settings = {"min_sample_seconds": min_seconds, "max_sample_seconds": max_seconds,
+                         "settle_tolerance": tolerance, "block_seconds": block_seconds,
+                         "min_window_blocks": int(min_blocks)}
         self.step_ms = step_ms
         self.records = []
         self.active = None
@@ -60,6 +113,10 @@ class WorkloadCapture:
         self.unattributed = {"steps": 0, "step_wall_seconds": 0.0,
                              "process_cpu_seconds": 0.0, "emulated_ms": 0}
         self.windows = []
+
+    def _settle(self, entry):
+        return settle_state(entry["_blocks"], self.settings["settle_tolerance"],
+                            self.settings["min_window_blocks"])
 
     def observe_step(self, before, after):
         """Snapshots are (monotonic seconds, process CPU seconds, guest ms)."""
@@ -113,12 +170,10 @@ class WorkloadCapture:
                         "start_boundary": boundary, "end_boundary": None,
                         "end_reason": None, "steps": 0, "step_wall_seconds": 0.0,
                         "process_cpu_seconds": 0.0, "emulated_ms": 0,
-                        "lease_released": False, "invalid_steps": 0,
+                        "lease_released": False, "sample_stop": None, "invalid_steps": 0,
+                        "_blocks": [], "_block": [0.0, 0],
                     }
                     self.records.append(self.active)
-                    if phase == "sample":
-                        self.last_lease_ms = emulated_ms
-                        commands.append(f"+{identifier:08x}\n")
                 elif (self.active is not None and identifier == self.active["id"]
                       and round_number == self.active["r"] and name == self.active["name"]):
                     changed = True
@@ -157,15 +212,29 @@ class WorkloadCapture:
                 entry["emulated_ms"] += guest
                 if attributable and original["phase"] == "sample":
                     self.windows.append((before[0], after[0], original["id"]))
+                    block = original["_block"]
+                    block[0] += wall
+                    block[1] += guest
+                    if block[0] >= self.settings["block_seconds"]:
+                        original["_blocks"].append(tuple(block))
+                        original["_block"] = [0.0, 0]
         if self.active is not None and self.active["phase"] == "sample":
             identifier = self.active["id"]
-            if self.active["process_cpu_seconds"] >= self.target:
+            if not self.active["lease_released"]:
+                sampled = self.active["step_wall_seconds"]
+                if sampled >= self.settings["max_sample_seconds"]:
+                    self.active["sample_stop"] = "capped"
+                elif (sampled >= self.settings["min_sample_seconds"]
+                      and self._settle(self.active)["settled"]):
+                    self.active["sample_stop"] = "settled"
+            if self.active["sample_stop"] is not None:
                 if (not self.active["lease_released"] or self.last_lease_ms is None
-                        or emulated_ms - self.last_lease_ms >= 1000):
+                        or emulated_ms - self.last_lease_ms >= LEASE_RENEW_MS):
                     commands.append(f"-{identifier:08x}\n")
                     self.last_lease_ms = emulated_ms
                 self.active["lease_released"] = True
-            elif self.last_lease_ms is None or emulated_ms - self.last_lease_ms >= 1000:
+            elif (self.last_lease_ms is None
+                  or emulated_ms - self.last_lease_ms >= LEASE_RENEW_MS):
                 commands.append(f"+{identifier:08x}\n")
                 self.last_lease_ms = emulated_ms
         return commands
@@ -178,7 +247,8 @@ class WorkloadCapture:
         records = []
         aggregates = {}
         for entry in self.records:
-            entry = dict(entry)
+            blocks = entry["_blocks"]
+            entry = {key: value for key, value in entry.items() if not key.startswith("_")}
             guest_seconds = entry["emulated_ms"] / 1000
             entry["guest_seconds_per_step_wall_second"] = (
                 guest_seconds / entry["step_wall_seconds"] if entry["step_wall_seconds"] else None)
@@ -190,15 +260,22 @@ class WorkloadCapture:
             entry["cpu_full_speed_capacity_percent"] = (
                 entry["guest_seconds_per_process_cpu_second"] * 100
                 if entry["process_cpu_seconds"] else None)
-            entry["under_sampled"] = (entry["process_cpu_seconds"] < self.target
-                                      if entry["phase"] == "sample" else None)
+            if entry["phase"] == "sample":
+                entry["settle"] = settle_state(blocks, self.settings["settle_tolerance"],
+                                               self.settings["min_window_blocks"])
+                entry["block_speed_percent"] = [round(guest / 10 / wall, 2)
+                                                for wall, guest in blocks]
+                entry["under_sampled"] = entry["sample_stop"] is None
+            else:
+                entry["under_sampled"] = None
             records.append(entry)
             if entry["phase"] == "sample":
                 group = aggregates.setdefault(entry["name"], {
-                    "samples": 0, "under_sampled": 0, "step_wall_seconds": 0.0,
+                    "samples": 0, "under_sampled": 0, "capped": 0, "step_wall_seconds": 0.0,
                     "process_cpu_seconds": 0.0, "emulated_ms": 0})
                 group["samples"] += 1
                 group["under_sampled"] += int(entry["under_sampled"])
+                group["capped"] += int(entry["sample_stop"] == "capped")
                 for key in ("step_wall_seconds", "process_cpu_seconds", "emulated_ms"):
                     group[key] += entry[key]
         for group in aggregates.values():
@@ -209,7 +286,7 @@ class WorkloadCapture:
                 group["emulated_ms"] / 1000 / group["process_cpu_seconds"]
                 if group["process_cpu_seconds"] else None)
         return {
-            "sample_cpu_seconds_target": self.target,
+            "sampling": dict(self.settings),
             "cpu_scope": "total_process_all_threads",
             "measurement": "unthrottled_step_only_speed_capacity_not_actual_speed",
             "boundary_policy": "exclude_mixed_and_partial_line_steps",
@@ -218,7 +295,9 @@ class WorkloadCapture:
             "phases": records, "aggregates": aggregates,
             "unattributed": dict(self.unattributed),
             "warnings": list(self.warnings) + [
-                f"under_sampled:{entry['id']}" for entry in records if entry["under_sampled"]],
+                f"under_sampled:{entry['id']}" for entry in records if entry["under_sampled"]] + [
+                f"capped:{entry['id']}" for entry in records
+                if entry.get("sample_stop") == "capped"],
             "availability": ("captured" if any(e["phase"] == "sample" for e in records)
                              else "unavailable_no_sample_markers"),
         }

@@ -40,8 +40,7 @@ def environment(run):
     if "host" in run:
         result["host"] = run["host"]
     if "workload_capture" in run:
-        result["sample_cpu_seconds_target"] = run["workload_capture"].get(
-            "sample_cpu_seconds_target")
+        result["sampling"] = run["workload_capture"].get("sampling")
     if "perf" in run:
         result["perf_requested"] = run["perf"].get("status") != "disabled"
     return result
