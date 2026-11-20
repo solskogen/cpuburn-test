@@ -93,6 +93,7 @@ typedef struct test {
  * Integer/corpus/FPU/protected-mode/chipset modules run with paging OFF.
  * Paging/memory/sweeps/system/state/burn run with paging ON (identity 0..16MiB, U/S=1). */
 extern const test_t tests_int[], tests_fpu[], tests_mmx[], tests_pmode[], tests_chipset[];
+extern const test_t tests_int_ext[];
 extern const test_t tests_paging[], tests_mem[], tests_sys[], tests_burn[];
 extern const test_t tests_heavy_paging[], tests_heavy_pmode[], tests_heavy_state[];
 extern const test_t tests_corpus[];

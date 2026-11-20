@@ -1442,6 +1442,7 @@ void kmain(void) {
         run_tests(tests_cpu_contract, 0);
         run_tests(tests_core, T_TAG_EXC);
         run_tests(tests_int, 0);
+        run_tests(tests_int_ext, 0);
         run_checks(tests_int_check, 0);
         run_tests(tests_corpus, 0);
         run_tests(tests_realworld, T_TAG_SMC);
