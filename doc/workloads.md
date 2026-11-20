@@ -120,16 +120,23 @@ Use `ONLY` with these exact names for an isolated diagnostic image.
 
 `corpus_integer_sequences` generates deterministic 32-instruction programs
 mixing 8/16/32-bit ADD/ADC/SUB/SBB/CMP, AND/OR/XOR, ROL/ROR, NOT and INC/DEC
-across four registers. At default scale it regenerates 16,384 blocks at
-64 instruction alignments and executes each eight times: **4,194,304 corpus
-instructions**, with four register/flag checkpoints per block execution.
-These counts describe one invocation; the sustained harness repeats it.
-Every opcode-group/width combination must occur. Arithmetic results and
-carry/borrow use an independent bit-serial reference; only architecturally
-defined flags are compared. A failure logs the global seed, vector seed,
-block/reuse/checkpoint, initial registers and the full instruction prefix
-needed to reproduce it. This is a constrained, safe instruction corpus,
-not unconstrained random privileged/invalid-opcode fuzzing.
+across four registers. At default scale it generates 2,048 blocks, each in
+its own 512-byte slot of a 128 KiB ring at one of 64 instruction alignments,
+and runs each 64 times, enough for a recompiler to pay for compiling it:
+**4,194,304 corpus instructions**, with four register/flag checkpoints per
+run. `corpus_integer_regen` keeps the old shape: 16,384 blocks generated in
+the same 8 KiB page and run 8 times each (86Box's `SMC_THRASH_MIN_RUNS`), so
+it measures code regenerated faster than it can be compiled, again 4,194,304
+instructions. These counts describe one invocation; the sustained harness
+repeats it. Every opcode-group/width combination must occur. Each block's
+reference is computed once, as it is generated, with carries from a 64-bit
+sum rather than from instructions of the width under test; only
+architecturally defined flags are compared. Code is made visible with a
+JMP (as a 486 needs after writing code), not CPUID, which is not compiled.
+A failure logs the global seed, vector seed, block/run/checkpoint, slot,
+initial registers and the full instruction prefix needed to reproduce it.
+This is a constrained, safe instruction corpus, not unconstrained random
+privileged/invalid-opcode fuzzing.
 
 The `fdiv_v*_rn/rd/ru/rz` records add the notorious 4,195,835 / 3,145,727 Pentium FDIV case,
 nearby mantissas and scaled/signed ratios with exact raw x87 reference values
@@ -153,18 +160,21 @@ encoding is ambiguous in the reference wording; exact signed remainders and
 nonnegative quotient bits are still asserted.
 
 `heavy_decode_align` sweeps offsets 0–63 and 4093–4095 with prefixed,
-variable-length i486 code and both branch paths (1,852,416 instructions at
-default scale). `heavy_decode_worksets` covers executable footprints from
-4 KiB to 4 MiB, contrasting code rewrite/taken-branch invalidation with
-unchanged reuse (1,245,168 instructions with full-size owned RAM).
-`heavy_mem_align` covers 13 footprints from 1 KiB to 4 MiB, the same 67
-offsets, and 1/2/4/8-byte accesses with bytewise reference checks
-(1,363,584 operations). Eight-byte accesses use integer halves, not optional
-MMX/SSE. Available owned RAM caps the largest footprint and is logged.
-Timing notes give per-size results and the worst alignment; memory timings
-include the checked loop's initialization/reference overhead, not pure
-load/store latency. The sweep is substantial on slow hardware (about
-62 seconds for the memory record on the tested 33 MHz 86Box 486).
+variable-length i486 code and both branch paths. Each path is one call: the
+generated code loops on itself with DEC ECX/JNZ and checks its result
+against ESI every pass, so call overhead does not dilute the decode work.
+`heavy_decode_worksets_cold` covers executable footprints from 4 KiB to
+4 MiB, rewriting each 11-byte function before calling it (code write, taken
+jump, call: a recompile every time). `heavy_decode_worksets_warm` writes
+the same footprints once, checks every function, then calls them all in turn
+at least 16 times each, checking each result against the value kept from
+that check. `heavy_mem_align` covers 13 footprints from 1 KiB to 4 MiB, the
+same 67 offsets, and 1/2/4/8-byte accesses with bytewise reference checks.
+Each width's store/load-back is one asm loop over the samples, run 8 times;
+setup and checks are outside its timing stamps. Eight-byte accesses use
+integer halves, not optional MMX/SSE. Available owned RAM caps the largest
+footprint and is logged. Timing notes give per-size results and the worst
+alignment. The sweeps are substantial on slow hardware.
 
 The paged-code/restart additions include six separate records: code modified
 through physical aliases and remapped execution pages; linked direct/indirect
@@ -225,11 +235,11 @@ against a C reference that never runs the generated code. They require 486.
 | Record | What it does | `ops` (unit) per invocation |
 |---|---|---:|
 | `rw_jit_tiering` | A tiering JIT for a small stack bytecode: calls are interpreted first, hot functions are translated to x86 with inline caches for globals, unstable globals deoptimise, and the code cache is flushed and refilled. | 16,384 (`jit_call`) |
-| `rw_exe_loader` | Decompresses a packed program image, applies its relocations at a changing load address, and runs it (a main calling eight functions). | 1,024 (`image_load`) |
+| `rw_exe_loader` | Decompresses a packed program image (REP MOVSB for literal runs and matches, as real unpackers), applies its relocations at a changing load address, and runs it (a main calling eight functions). The images and their references are made once. | 1,024 (`image_load`) |
 | `rw_overlay` | An overlay manager swapping relocated images into one region, with runs of calls between swaps. | 8,192 (`overlay_call`) |
-| `rw_decrypt_run` | A decryptor stub decodes the body behind it on its own page and falls into it; the body is encrypted again with a new key before each pass. | 2,048 (`decrypt_pass`) |
+| `rw_decrypt_run` | A decryptor stub decodes the body behind it on its own page and falls into it; the body is put back encrypted under another key before each pass (one of 16 per body, encrypted once). | 2,048 (`decrypt_pass`) |
 | `rw_thunks` | Per-object call thunks (`mov ecx,this; jmp method`), like window-procedure and callback thunks, created and freed while others on the same pages keep being called. | 65,536 (`thunk_call`) |
-| `rw_threaded_vm` | A register bytecode run by a computed-goto interpreter (one indirect jump per instruction), checked against a switch interpreter. | executed bytecode instructions (`vm_instruction`) |
+| `rw_threaded_vm` | A register bytecode run by a computed-goto interpreter (one indirect jump per instruction; GCC is told not to merge the handlers' jumps), every pass checked against a switch interpreter run once. | executed bytecode instructions (`vm_instruction`) |
 
 Two drafts were dropped because they ran far above full speed on every CPU
 tested and so found nothing: a span rasteriser and a copy-on-write fork.
@@ -267,7 +277,6 @@ A record is check-only when timing it says nothing about emulator speed:
   - `int_flags_boundaries`, `int_partial_boundaries`, `int_divide_state`,
     `int_muldiv`, `int_bcd`, `int_cmov`, `int_cx8`, `int_cpuid_cr`,
     `core_fault_watchdog_recovery`.
-  - The immediate-only n=256 SMC rates, `int_smc_rate_k*_n256`.
   - `mem_bandwidth`, `mem_cache_ctl`, `mem_lock`, `mem_text_print`,
     `mem_walk`, `pg_pae`, `pg_tlb_stress`.
   - `pm_alignment_check`, `pm_debug_regs`, `pm_gates_rings`, `pm_syscall`,
@@ -324,39 +333,41 @@ coverage unless explicitly qualified.
 | `int_flags_boundaries` | 486 | 4,096 ADD/SUB producer/consumer cases across branches/calls and SETcc/ADC/SBB. |
 | `int_partial_boundaries` | 486 | 8,192 partial AL/AH/AX writes and preserved-register checks across control flow. |
 | `int_divide_state` | 486 | 3,072 #DE cases for zero divisor and quotient overflow, checking fault EIP and registers, not undefined flags. |
-| `int_alu` | 486 | Deterministic 8/16/32-bit ALU results, conversions and carry chains against references; `ops` is an aggregate count. Separate records check flags. |
+| `int_alu` | 486 | Deterministic 8/16/32-bit ALU results, conversions and carry chains against references; `ops` is an aggregate count. Separate records check flags. The reference runs in the first (unsampled) call, which keeps a hash of each case's results for later calls to compare against; a mismatch reruns it to name the case. |
 | `int_adc_shift_loop` | 486 | DX:AX and EDX:EAX shifted left 1-15 bits at a time by ADD/ADC loops, as Windows 98's 16-bit bit-stream reader does; 8,192 rounds of 32 shifts against a 64-bit reference. |
 | `int_adc_carry_incdec` | 486 | ADC and SBB at 8, 16 and 32 bits with the carry in set or clear, each followed by DEC or INC (which keep CF) and SETC; edge operands mixed in, against a 64-bit reference. |
 | `int_cf_consumers` | 486 | Check-only. CF read by SETC, JC and ADC right after logic ops, INC/DEC, rotates and shifts by constant counts (some past the width) and 8/16-bit ADC/SBB with the carry in set or clear, each against PUSHF after the same instruction. |
-| `int_far_ptr_copy` | 486 | Byte copies through far pointers: per byte LES of both pointers and ES reloaded from memory, six segment loads a byte, as Windows 98's 16-bit decompressor; 256 copies of 1-4 KiB checked. |
-| `int_sha1` | 486 | SHA-1 with Windows 98's own message-schedule loops (byte swap, expansion two words a pass); the "abc" digest and a 256 KiB buffer against a C schedule. |
-| `int_bn_muladd` | 486 | Bignum multiply-accumulate and multiply-subtract rows (MUL, ADD, ADC $0, four words a pass) as RSA signature checks run them; 512 1024-bit products against a 64-bit reference. |
+| `int_far_ptr_copy` | 486 | Byte copies through far pointers: per byte LES of both pointers and ES reloaded from memory, six segment loads a byte, as Windows 98's 16-bit decompressor; 256 copies of 1-4 KiB checked with 4-byte compares, the source filled once per call and each copied span cleared after its check. |
+| `int_sha1` | 486 | SHA-1 with Windows 98's own message-schedule loops (byte swap, expansion two words a pass); the "abc" digest, and the digest of the buffer's first sixteenth against a C schedule (computed once, in the first call). |
+| `int_bn_muladd` | 486 | Bignum multiply-accumulate and multiply-subtract rows (MUL, ADD, ADC $0, four words a pass) as RSA signature checks run them; 512 1024-bit products against a 64-bit reference (run in the first call, which keeps a hash per product; a mismatch reruns it). |
 | `int_sha1_xdown` | 486 | `int_sha1` with DS, ES and SS expand-down from 4 KiB, base 0, big, as Windows 98 gives a Win32 program: every access has a lower bound. |
 | `int_bn_muladd_xdown` | 486 | `int_bn_muladd` with the same expand-down DS, ES and SS. |
-| `int_code_footprint_128k` | 486 | 2,048 distinct 64-byte functions (loads and stores over 64 KiB, moves, ALU, LEA, MOVZX, PUSH/POP, SHL, INC and a skipped INC) chained by direct JMPs in a shuffled order, run 256 times; the first pass against a model. A large compiled working set, as Windows 98's first boot. |
+| `int_code_footprint_128k` | 486 | 2,048 distinct 64-byte functions (loads and stores over 64 KiB, moves, ALU, LEA, MOVZX, PUSH/POP, SHL, INC and a skipped INC) chained by direct JMPs in a shuffled order, run 256 times; the first pass against a model. The model's result and the code's hash are kept from the first call: later calls find the code in place and do not build it again, and their first pass is compared with the kept result (a mismatch reruns the model). A large compiled working set, as Windows 98's first boot. |
 | `int_code_footprint_512k` | 486 | The same with 8,192 functions, run 64 times: 512 KiB of guest code, whose blocks share hash slots 128 KiB apart in physical memory. |
 | `int_code_footprint_calls` | 486 | 2,048 such functions each reached by its own CALL through a table and returning, as through a dispatch table; 256 passes. |
 | `int_code_footprint_8m` | 486 | The same with 131,072 functions, run 16 times: 8 MiB of guest code, more blocks than a recompiler keeps at once, so each is run few times before it is dropped and made again. Code run once or a few times, as an operating system's first boot, rather than code run often. |
 | `int_code_footprint_8m_calls` | 486 | The same, each function reached by its own CALL through a table. |
 | `int_flags_exhaustive` | 486 | Exhausts all 256×256 byte operand pairs for ADD/ADC/SUB/SBB/CMP flag forms; other widths/operations are samples. Reports a synthetic 500,000 operations, not the exact number of cases. |
 | `int_muldiv` | 486 | 8,192 seeded multiply/divide vectors across byte/word/dword forms and three division faults; reports 188,416 operations. |
-| `int_shift_rot` | 486 | Shift/rotate results and defined flags over widths, counts and sampled values; counted instruction-form work, not exhaustive operands. |
+| `int_shift_rot` | 486 | Shift/rotate results and defined flags over widths, counts and sampled values; counted instruction-form work, not exhaustive operands. The reference runs in the first call, which keeps a hash per input and operation of the result and checked flags. |
 | `int_bits_misc` | 486 | Bit scan/test/set/reset, byte swap, atomics, SETcc, conversions and selected traps; aggregate operation count. |
 | `int_cx8` | CX8 | Two CMPXCHG8B success/failure cases. |
 | `int_cmov` | CMOV | Conditional moves against flag combinations; 512 counted operations. |
 | `int_bcd` | 486 | BCD/ASCII-adjust operations and flag/result references over byte inputs; aggregate count. |
-| `int_string` | 486 | REP string moves, stores, compares and scans including direction and counts; aggregate element work. |
-| `int_prefix_addr` | 486 | Prefix decoding, address/operand sizes and addressing forms with checked results; aggregate operations. |
+| `int_string` | 486 | REP MOVS (both directions), STOS and LODS at each count 32 times, overlapping MOVSB, and REPE CMPS / REPNE SCAS over buffers built once; registers checked each run, guards and windows checked between cases. `ops` is the number of string elements processed (`string_element`). |
+| `int_switch_dispatch` | 486 | A bytecode VM dispatched through a C `switch` jump table (131,072 steps), against a reference kept from the first call. |
+| `int_call_ret_recursive` | 486 | Recursive fib(24) in asm, 8 times (CALL/RET depth 24), plus RET imm16, LOOP/LOOPE/LOOPNE/JECXZ and indirect JMP/CALL checks. |
+| `int_prefix_only` | 486 | A 21-instruction asm loop, 16 of them prefixed (FS segment override, 66h operand size, 67h address size, combinations), over an 8 KiB FS segment, 65,536 passes against a C model run once; then the one-off prefix, ModRM/SIB and REP 67h MOVSB checks. |
 | `int_smc` | 486 | Self-modified immediate/opcode and executing-loop cases at six offsets including page crossings; `ops` is a synthetic mixed instruction/case count. |
 | `int_smc_split_w_chunk`, `int_smc_split_d_chunk`, `int_smc_split_w_page`, `int_smc_split_d_page` | 486 | Misaligned word (`w`) or dword (`d`) stores starting 1-3 bytes before a 64-byte boundary (`chunk`) or a page end (`page`) that change only the opcode and immediate of a snippet starting past it, in pages holding generated code; 1,024 checked patches per offset. Catches dirty tracking that marks only where the store starts. |
 | `int_smc_rep_stos` | 486 | REP STOSB, STOSW and STOSD, forwards and backwards, rewrite the INC, DEC or NOP body of a snippet that has already run, some of them across a page end; 256 rewrites, each run 256 times. Catches string stores that fill code pages without marking every byte they replace. |
 | `int_smc_alu_family_exit` | 486 | Patches flip a snippet's opcodes between ADD, OR, AND, SUB and XOR EAX,imm32, each version run 32 times; every eighth puts ADC, SBB or CMP in, and the next puts the family back. Catches a recompiler that reads such opcodes as it runs and does not leave the code when one is no longer of the family. |
 | `int_smc_alu_family_flags` | 486 | Check-only. CLC, MOV EAX, eight ALU EAX,imm32 instructions, then PUSHFD: patches alternately change one opcode (any of ADD, OR, ADC, SBB, AND, SUB, XOR, CMP, anywhere in the snippet) or one or two immediates (with carry/overflow edge values), and each version runs 12 times. EAX and CF, PF, AF, ZF, SF, OF are compared with an integer reference (AF after OR/AND/XOR is undefined and not checked). Catches a recompiler that reads such opcodes or immediates as it runs but leaves wrong results or flags. |
-| `int_smc_alu_ops_k1_n8`, `int_smc_alu_ops_k4_n16`, `int_smc_alu_ops_k16_n8`, `int_smc_alu_ops_k16_n32` | 486 | As `int_smc_rate_op`, picking from ADD, OR, AND, SUB, XOR, ADC, SBB and CMP EAX,imm32 (never in the first slot, where ADC and SBB would take the caller's carry); `k` calls per patch, `n` instructions. |
 | `int_smc_ram_top` | 486 | Generated-code rewrites near the RAM top; counts 32,768 operations. Probes by writing just above firmware-reported RAM when below the 15 MiB hole, and may execute there if readback succeeds; this is not limited to firmware-reported owned RAM. |
 | `int_cpuid_cr` | 486 | CPUID where present, EFLAGS and control-register state checks; 100 generic operations, not exhaustive register semantics. |
 | `int_alu_burn` | 486 | Repeated integer arithmetic, flags and branch-intensive checks; aggregate counted work, not duration-based. |
-| `corpus_integer_sequences` | 486 | Deterministic generated ALU instruction blocks with independent bit-serial references; 4,194,304 generated instructions at default scale, with checkpoint checks. |
+| `corpus_integer_sequences` | 486 | Deterministic generated ALU instruction blocks, each in a fresh slot and run 64 times, against references computed once per block; 4,194,304 generated instructions at default scale, with checkpoint checks. |
+| `corpus_integer_regen` | 486 | The same blocks regenerated in one page and run 8 times each, as code rewritten faster than it is compiled; 4,194,304 instructions. |
 | `rw_jit_tiering`, `rw_exe_loader`, `rw_overlay`, `rw_decrypt_run`, `rw_thunks`, `rw_threaded_vm` | 486 | Real-world-style generated, loaded, patched and dispatched code; see [real-world-style code workloads](#real-world-style-code-workloads). |
 
 The following four records share a 4 KiB page between a patched snippet and a
@@ -371,27 +382,37 @@ host translation or linking decision.
 - `int_smc_mixed_k8_h1` — 8 snippet calls and 1 hot-loop calls per patch.
 - `int_smc_mixed_k8_h16` — 8 snippet calls and 16 hot-loop calls per patch.
 
-The rate records below require 486 and owned arena RAM. `k` is calls per
-patch and `n` is the number of arithmetic instructions in the snippet. Each
-invocation targets 16,384 calls, rounding up to a multiple of `k`; reported
-operations are `ceil(16384/k) * k * (n+2)`. The unqualified records change a
-MOV immediate; `op` also changes one ADD/SUB/XOR opcode per patch and computes
-a reference from the modified code. They check results; neither count nor
-timing isolates cache invalidation or proves a dynarec strategy.
+The rate records below require 486 and owned arena RAM. A snippet is
+`MOV EAX,imm32`, `n` `ALU EAX,imm32` instructions and RET; `k` is calls per
+patch. Each invocation makes `ceil(16384/k)` patches; reported operations
+are `patches * k * (n+2)`. The expected results are computed (with an
+integer model of the snippet) only when the record changes, before the
+first call's patches, so the timed patch/run loop holds only the patch
+writes, the calls and the compares. Each patch XORs a nonzero value into
+every byte of the immediate of instruction 0, 50, 100, ... (the first of each
+50-instruction block 86Box makes), so every block of a long snippet is
+dirtied, not just the first.
 
-**Immediate, n=16:** `int_smc_rate_k1_n16`, `int_smc_rate_k2_n16`, `int_smc_rate_k4_n16`, `int_smc_rate_k8_n16`, `int_smc_rate_k12_n16`, `int_smc_rate_k15_n16`, `int_smc_rate_k16_n16`, `int_smc_rate_k17_n16`, `int_smc_rate_k20_n16`, `int_smc_rate_k24_n16`, `int_smc_rate_k32_n16`, `int_smc_rate_k64_n16`.
+- Immediate (4 bytes per block): `int_smc_rate_k1_n16`, `int_smc_rate_k7_n16`, `int_smc_rate_k8_n16`, `int_smc_rate_k9_n16`, `int_smc_rate_k16_n16`, `int_smc_rate_k64_n16`. `k` 7/8/9 bracket 86Box's `SMC_THRASH_MIN_RUNS` (8).
+- Block length: `int_smc_rate_k16_n47`, `int_smc_rate_k16_n48`, `int_smc_rate_k16_n49`, `int_smc_rate_k16_n50`: snippets of 49 to 52 instructions, either side of the 50-instruction block cap.
+- Long snippets: `int_smc_rate_k1_n256`, `int_smc_rate_k16_n256` (six blocks, each patched).
+- Patch size: `int_smc_patch4_k16_n32` changes 4 bytes per patch, `int_smc_patch5_k16_n32` 5 (the MOV immediate and a byte of the next immediate), either side of `SMC_PATCH_MAX_BYTES` (4).
+- Opcode and immediate: `int_smc_rate_op_k1_n16`, `int_smc_rate_op_k7_n16`, `int_smc_rate_op_k8_n16`, `int_smc_rate_op_k9_n16`, `int_smc_rate_op_k16_n16`, `int_smc_rate_op_k16_n256`: also sets one ADD/SUB/XOR opcode per patch.
+- Opcode only: `int_smc_rate_opc_k16_n16`, `int_smc_rate_opc_k63_n16`, `int_smc_rate_opc_k65_n16`, `int_smc_rate_opc_k127_n16`, `int_smc_rate_opc_k129_n16`: each patch changes one opcode to another of ADD/SUB/XOR and nothing else, the only rewrite 86Box's opcode-family path takes; `k` brackets `SMC_FAMILY_MIN_RUNS` (64) and `SMC_FAMILY_CAND_MIN_RUNS` (128).
+- Outside the family: `int_smc_rate_nonfam_k1_n16`, `int_smc_rate_nonfam_k16_n16`: immediates differ per instruction and each patch puts ADC, SBB or CMP in (never in the first slot, where ADC and SBB would take the caller's carry). These replace `int_smc_alu_ops_*`.
 
-**Immediate, n=256:** `int_smc_rate_k1_n256`, `int_smc_rate_k2_n256`, `int_smc_rate_k4_n256`, `int_smc_rate_k8_n256`, `int_smc_rate_k12_n256`, `int_smc_rate_k15_n256`, `int_smc_rate_k16_n256`, `int_smc_rate_k17_n256`, `int_smc_rate_k20_n256`, `int_smc_rate_k24_n256`, `int_smc_rate_k32_n256`, `int_smc_rate_k64_n256`.
-
-**Opcode and immediate, n=16:** `int_smc_rate_op_k1_n16`, `int_smc_rate_op_k2_n16`, `int_smc_rate_op_k4_n16`, `int_smc_rate_op_k8_n16`, `int_smc_rate_op_k12_n16`, `int_smc_rate_op_k15_n16`, `int_smc_rate_op_k16_n16`, `int_smc_rate_op_k17_n16`, `int_smc_rate_op_k20_n16`, `int_smc_rate_op_k24_n16`, `int_smc_rate_op_k32_n16`, `int_smc_rate_op_k64_n16`.
-
-**Opcode and immediate, n=256:** `int_smc_rate_op_k1_n256`, `int_smc_rate_op_k2_n256`, `int_smc_rate_op_k4_n256`, `int_smc_rate_op_k8_n256`, `int_smc_rate_op_k12_n256`, `int_smc_rate_op_k15_n256`, `int_smc_rate_op_k16_n256`, `int_smc_rate_op_k17_n256`, `int_smc_rate_op_k20_n256`, `int_smc_rate_op_k24_n256`, `int_smc_rate_op_k32_n256`, `int_smc_rate_op_k64_n256`.
-
-**Opcode and immediate, n=8:** `int_smc_rate_op_k2_n8`, `int_smc_rate_op_k4_n8`, `int_smc_rate_op_k6_n8`, `int_smc_rate_op_k8_n8`, `int_smc_rate_op_k10_n8`, `int_smc_rate_op_k12_n8`, `int_smc_rate_op_k14_n8`, `int_smc_rate_op_k16_n8`.
-
-**Opcode and immediate, n=32:** `int_smc_rate_op_k2_n32`, `int_smc_rate_op_k4_n32`, `int_smc_rate_op_k6_n32`, `int_smc_rate_op_k8_n32`, `int_smc_rate_op_k10_n32`, `int_smc_rate_op_k12_n32`, `int_smc_rate_op_k14_n32`, `int_smc_rate_op_k16_n32`.
-
-**Opcode and immediate, n=48:** `int_smc_rate_op_k2_n48`, `int_smc_rate_op_k4_n48`, `int_smc_rate_op_k6_n48`, `int_smc_rate_op_k8_n48`, `int_smc_rate_op_k10_n48`, `int_smc_rate_op_k12_n48`, `int_smc_rate_op_k14_n48`, `int_smc_rate_op_k16_n48`.
+Removed in the audit (near-duplicate sweep points, or folded into the
+points above): `int_smc_rate_k{2,4,12,15,17,20,24,32}_n16`,
+`int_smc_rate_k{2,4,8,12,15,17,20,24,32,64}_n256`,
+`int_smc_rate_op_k{2,4,12,15,17,20,24,32,64}_n16`,
+`int_smc_rate_op_k{1,2,4,8,12,15,17,20,24,32,64}_n256`,
+`int_smc_rate_op_k{2,4,6,8,10,12,14,16}_n{8,32,48}`,
+`int_smc_alu_ops_k1_n8`, `int_smc_alu_ops_k4_n16`, `int_smc_alu_ops_k16_n8`,
+`int_smc_alu_ops_k16_n32`. `int_prefix_addr` was split into
+`int_switch_dispatch`, `int_call_ret_recursive` and `int_prefix_only`;
+`heavy_decode_worksets` into `heavy_decode_worksets_cold` and
+`heavy_decode_worksets_warm`. `int_smc_rate_k*_n256` are no longer
+check-only.
 
 ### x87, MMX and vendor instruction records
 
@@ -587,9 +608,10 @@ fault-time registers.
 | `mem_unaligned` | PAGING | Checked 1/2/4-byte accesses near ordinary and page boundaries; 2,304 aggregate operations. |
 | `mem_lock` | PAGING + 486 | Locked arithmetic, XCHG/CMPXCHG, optional CX8 and INVLPG; 5,120 aggregate operations, not a multiprocessor test. |
 | `mem_cache_ctl` | PAGING + 486 + NOHV | Guarded WBINVD and bounded CR0.CD/NW windows with data and restoration checks; no explicit `t_ops` count. |
-| `heavy_decode_align` | PAGING + 486 | Prefixed variable-length code at 67 offsets and both branch paths; 1,852,416 counted instructions. |
-| `heavy_decode_worksets` | PAGING + 486 | Rewrite versus reuse of generated code over 4 KiB–4 MiB footprints; up to 1,245,168 counted instructions with sufficient owned RAM. |
-| `heavy_mem_align` | PAGING + 486 | 1/2/4/8-byte access checks across 67 offsets and up to 13 footprints; up to 1,363,584 counted operations; arena limits sizes. |
+| `heavy_decode_align` | PAGING + 486 | Prefixed variable-length code at 67 offsets and both branch paths, each path one call that loops in the generated code. |
+| `heavy_decode_worksets_cold` | PAGING + 486 | Each generated function rewritten before its call, over 4 KiB–4 MiB footprints (`rewrite_and_call`). |
+| `heavy_decode_worksets_warm` | PAGING + 486 | The same footprints written once and called at least 16 times each (`call`). |
+| `heavy_mem_align` | PAGING + 486 | 1/2/4/8-byte access checks across 67 offsets and up to 13 footprints, 8 timed passes of an asm loop; arena limits sizes. |
 
 ### System, platform and sustained interactions
 
