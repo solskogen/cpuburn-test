@@ -396,10 +396,83 @@ static u32 mmx_extended(void) {
     return sum;
 }
 
+/* Register-resident MMX kernels: the eight registers stay live across an
+ * unrolled body of 64 ops (blocks A B A B), EMMS runs once per call, and the
+ * only reference is the final checksum constant, which tools/check_fp_edges.py
+ * recomputes by simulating these exact block strings. No x87 instruction
+ * runs, so the MMX code path (dynarec or interpreter) is what is timed. */
+#define MMX_KERNEL_ITERS 4096
+static const u64 mmx_kernel_init[8] = {
+    0x0123456789abcdefull, 0xfedcba9876543210ull, 0x0f1e2d3c4b5a6978ull, 0x8796a5b4c3d2e1f0ull,
+    0, 0, 0x0001000300050007ull, 0x7f3b2c1d0e9f8a65ull
+};
+#define MMX_ALU_A \
+    "movq %%mm0,%%mm4; psllq $13,%%mm4; pxor %%mm4,%%mm0; movq %%mm0,%%mm4\n\t" \
+    "psrlq $7,%%mm4; pxor %%mm4,%%mm0; paddb %%mm0,%%mm1; psubw %%mm7,%%mm1\n\t" \
+    "paddsw %%mm1,%%mm2; pxor %%mm0,%%mm2; paddusb %%mm6,%%mm3; psubd %%mm2,%%mm3\n\t" \
+    "movq %%mm3,%%mm5; pcmpgtb %%mm1,%%mm5; pandn %%mm6,%%mm5; paddd %%mm5,%%mm0\n\t"
+#define MMX_ALU_B \
+    "movq %%mm1,%%mm4; psraw $3,%%mm4; pxor %%mm4,%%mm2; movq %%mm2,%%mm5\n\t" \
+    "psubusw %%mm7,%%mm5; paddw %%mm5,%%mm1; movq %%mm3,%%mm4; pslld $9,%%mm4\n\t" \
+    "pxor %%mm4,%%mm3; psubsb %%mm1,%%mm3; movq %%mm0,%%mm5; pcmpeqw %%mm2,%%mm5\n\t" \
+    "por %%mm6,%%mm5; paddd %%mm5,%%mm2; psrlw $1,%%mm4; pand %%mm4,%%mm1\n\t"
+#define MMX_MUL_A \
+    "pmullw %%mm6,%%mm0; paddw %%mm7,%%mm0; movq %%mm0,%%mm4; pmulhw %%mm1,%%mm4\n\t" \
+    "pxor %%mm4,%%mm1; movq %%mm1,%%mm5; pmaddwd %%mm2,%%mm5; paddd %%mm5,%%mm2\n\t" \
+    "pmullw %%mm6,%%mm3; pxor %%mm2,%%mm3; movq %%mm3,%%mm4; pmulhw %%mm0,%%mm4\n\t" \
+    "paddw %%mm4,%%mm2; movq %%mm2,%%mm5; pmaddwd %%mm7,%%mm5; pxor %%mm5,%%mm1\n\t"
+#define MMX_MUL_B \
+    "pmullw %%mm7,%%mm1; psubw %%mm6,%%mm1; movq %%mm1,%%mm4; pmaddwd %%mm3,%%mm4\n\t" \
+    "paddd %%mm4,%%mm0; movq %%mm2,%%mm5; pmulhw %%mm6,%%mm5; pxor %%mm5,%%mm3\n\t" \
+    "pmullw %%mm6,%%mm2; paddw %%mm0,%%mm2; movq %%mm3,%%mm4; pmullw %%mm1,%%mm4\n\t" \
+    "psubw %%mm4,%%mm0; movq %%mm0,%%mm5; pmulhw %%mm2,%%mm5; paddw %%mm5,%%mm3\n\t"
+#define MMX_PACK_A \
+    "movq %%mm0,%%mm4; punpcklbw %%mm1,%%mm4; movq %%mm0,%%mm5; punpckhbw %%mm1,%%mm5\n\t" \
+    "packsswb %%mm5,%%mm4; pxor %%mm4,%%mm2; movq %%mm2,%%mm4; punpcklwd %%mm3,%%mm4\n\t" \
+    "movq %%mm2,%%mm5; punpckhwd %%mm3,%%mm5; packssdw %%mm5,%%mm4; paddw %%mm4,%%mm3\n\t" \
+    "movq %%mm3,%%mm5; punpckldq %%mm0,%%mm5; punpckhdq %%mm1,%%mm0; pxor %%mm5,%%mm1\n\t"
+#define MMX_PACK_B \
+    "movq %%mm1,%%mm4; psrlw $8,%%mm4; movq %%mm2,%%mm5; psrlw $8,%%mm5\n\t" \
+    "packuswb %%mm5,%%mm4; paddb %%mm7,%%mm4; pxor %%mm4,%%mm0; movq %%mm3,%%mm4\n\t" \
+    "punpckhbw %%mm2,%%mm4; movq %%mm1,%%mm5; punpcklbw %%mm0,%%mm5; packsswb %%mm4,%%mm5\n\t" \
+    "paddb %%mm5,%%mm2; movq %%mm0,%%mm4; psllq $11,%%mm4; pxor %%mm4,%%mm3\n\t"
+#define MMX_KERNEL(fn, A, B) \
+    static void fn(u64 *r) { \
+        u32 n = MMX_KERNEL_ITERS; \
+        __asm__ volatile( \
+            "movq 0(%1),%%mm0; movq 8(%1),%%mm1; movq 16(%1),%%mm2; movq 24(%1),%%mm3\n\t" \
+            "movq 32(%1),%%mm4; movq 40(%1),%%mm5; movq 48(%1),%%mm6; movq 56(%1),%%mm7\n\t" \
+            "1:\n\t" A B A B "decl %0; jnz 1b\n\t" \
+            "movq %%mm0,0(%1); movq %%mm1,8(%1); movq %%mm2,16(%1); movq %%mm3,24(%1)\n\t" \
+            "movq %%mm4,32(%1); movq %%mm5,40(%1); movq %%mm6,48(%1); movq %%mm7,56(%1)\n\t" \
+            "emms" : "+r"(n) : "r"(r) : "memory", "cc"); \
+    }
+MMX_KERNEL(mmx_alu_body, MMX_ALU_A, MMX_ALU_B)
+MMX_KERNEL(mmx_mul_body, MMX_MUL_A, MMX_MUL_B)
+MMX_KERNEL(mmx_pack_body, MMX_PACK_A, MMX_PACK_B)
+static u32 mmx_kernel_run(void (*body)(u64 *), u32 want) {
+    u64 r[8]; u32 sum = 0;
+    for (unsigned i = 0; i < 8; ++i) r[i] = mmx_kernel_init[i];
+    body(r);
+    for (unsigned i = 0; i < 8; ++i) sum = csum_mix(csum_mix(sum, (u32)r[i]), (u32)(r[i] >> 32));
+    CHECK_EQ(sum, want);
+    t_ops(64 * MMX_KERNEL_ITERS);
+    return sum;
+}
+static u32 mmx_kernel_alu(void) { return mmx_kernel_run(mmx_alu_body, 0x8a5ba826u); }
+static u32 mmx_kernel_mul(void) { return mmx_kernel_run(mmx_mul_body, 0x20ace29fu); }
+static u32 mmx_kernel_pack(void) { return mmx_kernel_run(mmx_pack_body, 0x55823a65u); }
+
+/* mmx_alu, mmx_shifts, mmx_extended and mmx_burn load operands, run one
+ * operation, store, EMMS and then run a C reference per vector, so a timing
+ * of them measures the reference: they are conformance checks. The timed
+ * MMX records are the register-resident mmx_kernel_* ones. */
 const test_t tests_mmx[] = {
-    {"mmx_extended",mmx_extended,REQ_MMX|REQ_MMXEXT, 0},
+    {"mmx_extended",mmx_extended,REQ_MMX|REQ_MMXEXT, T_CHECK},
     {"mmx_x87_transitions",mmx_x87_transitions,REQ_MMX|REQ_FPU, T_CHECK},
-    {"mmx_alu",mmx_alu,REQ_MMX, 0}, {"mmx_shifts",mmx_shifts,REQ_MMX, 0},
+    {"mmx_alu",mmx_alu,REQ_MMX, T_CHECK}, {"mmx_shifts",mmx_shifts,REQ_MMX, T_CHECK},
     {"mmx_state",mmx_state,REQ_MMX, T_CHECK}, {"mmx_alias",mmx_alias,REQ_MMX, T_CHECK}, {"mmx_exc",mmx_exc,REQ_MMX, T_CHECK},
-    {"mmx_burn",mmx_burn,REQ_MMX, 0}, {0,0,0,0}
+    {"mmx_burn",mmx_burn,REQ_MMX, T_CHECK},
+    {"mmx_kernel_alu",mmx_kernel_alu,REQ_MMX, 0}, {"mmx_kernel_mul",mmx_kernel_mul,REQ_MMX, 0},
+    {"mmx_kernel_pack",mmx_kernel_pack,REQ_MMX, 0}, {0,0,0,0}
 };

@@ -474,16 +474,55 @@ static u32 emmi_moves(void) { return emmi_run(emmi_pmvzb, emmi_end); }
 EMMI_OPS(SINGLE)
 #undef SINGLE
 
+/* Register-resident 3DNow! kernel: block A four times per iteration (64
+ * ops), state in mm0-mm7, FEMMS once per call, one final checksum. The
+ * block maps (x,y) to (-y,x+y) (period six) with power-of-two scaling, so
+ * every lane stays an exact float32 and the result does not depend on the
+ * PFADD/PFMUL rounding. tools/check_fp_edges.py recomputes the checksum
+ * from this block text with exact rationals. Init lanes (lo,hi): (1.5,
+ * -2.25) (4.125,4.0625) (-4.03125,7) (1.25,-2.125) (1,1) (0,0) (2,0.5)
+ * (0.5,2). */
+#define NOW_KERNEL_ITERS 4096
+static const u64 now_kernel_init[8] = {
+    0xc01000003fc00000ull, 0x4082000040840000ull,
+    0x40e00000c0810000ull, 0xc00800003fa00000ull,
+    0x3f8000003f800000ull, 0x0000000000000000ull,
+    0x3f00000040000000ull, 0x400000003f000000ull
+};
+#define NOW_KERNEL_A \
+    "movq %%mm1,%%mm4; pfadd %%mm0,%%mm1; movq %%mm4,%%mm0; pfsubr %%mm5,%%mm0\n\t" \
+    "pfmul %%mm6,%%mm0; pfmul %%mm6,%%mm1; movq %%mm3,%%mm4; pfadd %%mm2,%%mm3\n\t" \
+    "movq %%mm4,%%mm2; pfsubr %%mm5,%%mm2; pfmul %%mm7,%%mm0; pfmul %%mm7,%%mm1\n\t" \
+    "pfadd %%mm0,%%mm2; pfmul %%mm6,%%mm3; pfsub %%mm0,%%mm2; pfmul %%mm7,%%mm3\n\t"
+static u32 now_kernel(void) {
+    u64 r[8]; u32 sum = 0, n = NOW_KERNEL_ITERS;
+    for (unsigned i = 0; i < 8; ++i) r[i] = now_kernel_init[i];
+    __asm__ volatile(
+        "movq 0(%1),%%mm0; movq 8(%1),%%mm1; movq 16(%1),%%mm2; movq 24(%1),%%mm3\n\t"
+        "movq 32(%1),%%mm4; movq 40(%1),%%mm5; movq 48(%1),%%mm6; movq 56(%1),%%mm7\n\t"
+        "1:\n\t" NOW_KERNEL_A NOW_KERNEL_A NOW_KERNEL_A NOW_KERNEL_A "decl %0; jnz 1b\n\t"
+        "movq %%mm0,0(%1); movq %%mm1,8(%1); movq %%mm2,16(%1); movq %%mm3,24(%1)\n\t"
+        "movq %%mm4,32(%1); movq %%mm5,40(%1); movq %%mm6,48(%1); movq %%mm7,56(%1)\n\t"
+        "femms" : "+r"(n) : "r"(r) : "memory", "cc");
+    for (unsigned i = 0; i < 8; ++i) sum = csum_mix(csum_mix(sum, (u32)r[i]), (u32)(r[i] >> 32));
+    CHECK_EQ(sum, 0x1f37c0eeu);
+    t_ops(64 * NOW_KERNEL_ITERS);
+    return sum;
+}
+
+/* The one-op 3DNow! records time MOVQ/op/MOVQ/EMMS plus a C reference per
+ * vector, so they are conformance checks; 3dnow_kernel is the timed one. */
 #define NOW_REQ (REQ_MMX | REQ_FPU | REQ_3DNOW)
 const test_t tests_vendor[] = {
-    { "3dnow_float", now_float, NOW_REQ },
-    { "3dnow_convert", now_convert, NOW_REQ },
-    { "3dnow_integer", now_integer, NOW_REQ },
+    { "3dnow_float", now_float, NOW_REQ, T_CHECK },
+    { "3dnow_convert", now_convert, NOW_REQ, T_CHECK },
+    { "3dnow_integer", now_integer, NOW_REQ, T_CHECK },
     { "3dnow_reciprocal", now_reciprocal, NOW_REQ, T_CHECK },
     { "3dnow_state", now_state, NOW_REQ, T_CHECK },
-    { "3dnow_enhanced_float", now_enhanced_float, NOW_REQ | REQ_3DNOWEXT },
-    { "3dnow_word_convert", now_word_convert, NOW_REQ | REQ_3DNOWEXT },
+    { "3dnow_enhanced_float", now_enhanced_float, NOW_REQ | REQ_3DNOWEXT, T_CHECK },
+    { "3dnow_word_convert", now_word_convert, NOW_REQ | REQ_3DNOWEXT, T_CHECK },
     { "3dnow_swap", now_swap, NOW_REQ | REQ_3DNOWEXT, T_CHECK },
+    { "3dnow_kernel", now_kernel, NOW_REQ },
     { "cyrix_emmi_arithmetic", emmi_arithmetic, REQ_MMX | REQ_EMMI, T_CHECK },
     { "cyrix_emmi_moves", emmi_moves, REQ_MMX | REQ_EMMI, T_CHECK },
 #define SINGLE(n, code) { "cyrix_emmi_" #n, emmi_only_##n, REQ_MMX | REQ_EMMI, T_CHECK },
