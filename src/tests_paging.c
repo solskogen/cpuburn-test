@@ -156,6 +156,8 @@ static void tlb_body(void) {
     t_note("16MiB virtual / %u physical pages cycles/access=%llu", n, (stamp() - start) / 65536);
     t_ops(65536); sink = sum;
 }
+/* Correctness check (T_CHECK): each access carries an LCG step, CHECK and
+   checksum, so its cycles/access note is not a TLB-refill measurement. */
 static u32 pg_tlb_stress(void) { return run_page(tlb_body); }
 
 static void global_body(void) {

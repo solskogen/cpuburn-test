@@ -334,7 +334,20 @@ static u32 sys_cr_regs(void) {
 static void read_pmc(void) {
     u32 lo, hi; __asm__ volatile("rdpmc" : "=a"(lo), "=d"(hi) : "c"(arg)); sampled = ((u64)hi << 32) | lo;
 }
+/* RDPMC/CR4.PCE are architected from the Pentium MMX and Pentium Pro; AMD
+   from the K6-2 line on, Cyrix from the 6x86MX. Older models are skipped
+   without executing it; a trap on the others is still a SKIP. */
+static int rdpmc_model(void) {
+    int intel = !kmemcmp(cpu.vendor, "GenuineIntel", 12);
+    int amd = !kmemcmp(cpu.vendor, "AuthenticAMD", 12);
+    int cyrix = !kmemcmp(cpu.vendor, "CyrixInstead", 12);
+    if (intel) return cpu.family >= 6 || (cpu.family == 5 && cpu.has_mmx);
+    if (amd) return cpu.family >= 6 || (cpu.family == 5 && cpu.model >= 8);
+    if (cyrix) return cpu.family >= 6;
+    return 0;
+}
 static u32 sys_rdpmc(void) {
+    if (!rdpmc_model()) SKIP("RDPMC not architected on this CPU model");
     if (guard_call(probe_cr4)) SKIP("CR4 unavailable");
     u32 saved = arg; arg = saved | 0x100;
     int enable = guard_call(write_cr4), good = 0;

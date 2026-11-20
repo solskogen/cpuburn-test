@@ -102,6 +102,7 @@ extern const test_t tests_fp_edges[], tests_sweeps[];
  * with run_checks). Single records elsewhere use T_CHECK. */
 extern const test_t tests_fp_edges_check[];
 extern const test_t tests_int_check[];
+/* kmain runs the tables below with run_tests; check-only records carry T_CHECK. */
 extern const test_t tests_priority[];
 extern const test_t tests_restart_complex[];
 extern const test_t tests_vendor[];
