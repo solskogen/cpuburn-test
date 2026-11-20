@@ -97,6 +97,12 @@ In `result.json`, **each sampled test** has an entry under
 - `under_sampled`: true when the sample ended before it settled or reached
   the cap (for example, the capture stopped); do not treat it as a firm
   performance result.
+- `contended`: true when the emulation thread waited in the host run queue
+  for more than 2% of its CPU time during the sample (`run_delay_seconds`,
+  from `schedstat`), i.e. it shared its core with another task. Capacity is
+  still per CPU second, but caches and boost were shared too; such samples
+  are also listed as `contended:<id>` in `warnings`. `null` where the host
+  does not report run-queue delay.
 
 This is measured capacity, not the GUI speed reading or an automatic
 slowdown verdict. Correctness remains separate: check FAIL/FAULT records,
@@ -174,6 +180,33 @@ The checked results are still correct, but this host cannot sustain the
 configured CPU speed during that workload. A FAIL at 133% would mean the
 opposite problem: sufficient speed, incorrect results. Capacity near 100%
 needs repeated measurements before drawing conclusions.
+
+### Faster runs
+
+- **Parallel shards.** `tools/shard_86box.py` splits the suite into
+  contiguous slices, runs each with `run_86box.py --only ... --pin CORE` and
+  merges the results into one `result.json` and `summary.json`:
+
+  ```sh
+  python3 tools/shard_86box.py plan --history old/result.json --shards 2 > plan.json
+  python3 tools/shard_86box.py run --plan plan.json --cores 6,12 \
+    --output-dir build/shards -- --emulator ./86Box --image floppy.img --headless
+  ```
+
+  Use one worker per L3 cache (on a two-CCD Ryzen, one core on each CCD) and
+  keep SMT siblings idle: two workers sharing an L3 lowered cache-heavy
+  records by 24-29%. The tool warns about duplicate cores, SMT siblings and
+  shared caches. Use the same `plan.json` for both sides of an A/B
+  comparison. `--vm` is copied once per core (the runner's own VM is never
+  changed); without it the runner's generated profiles are used. Shards need
+  a guest with runtime selection, whose selection frame holds at most 4,096
+  bytes of record names.
+- **Quick build.** `make QUICK=1` checks the records in `QUICK_RECORDS`
+  once instead of sampling them (see
+  [building](building.md#build-and-boot)); they still report PASS/FAIL.
+- **A/B work.** Launch-to-launch noise is 1-2%, so use at least three
+  interleaved boots per side (`--repeat 3`, `--aa` for the noise floor) on a
+  quiet host, and compare medians.
 
 ## Boot and capture results
 
@@ -314,24 +347,38 @@ most every `--text-poll-ms` (default 2000) emulated ms, preferably while the
 serial port is idle (at the latest after five intervals). Each sampled workload runs **until its host-measured speed
 settles**:
 
+- Settling is judged on the **settle clock**: the emulation thread's CPU
+  time when it is known to the nanosecond (the clock capacity is reported
+  in), host wall time otherwise. `result.json` names it per sample
+  (`settle_clock`, `settle_clock_seconds`).
 - Interior steps are grouped into blocks of at least `--block-seconds`
-  (default 0.2) host wall seconds, and each block's speed is guest time per
-  host wall time.
+  (default 0.2) settle-clock seconds, and each block's speed is guest time
+  per settle-clock time. When the guest reports its invocation length
+  (`inv_ms` on the `WORK phase=sample` line), a block also spans at least one
+  whole invocation (capped at 2 guest seconds), so a workload whose
+  invocations alternate between fast and slow parts does not look noisy.
 - The leading quarter of the blocks (at least one) is left out as warm-in.
-- The sample settles once it has run `--min-sample-seconds` (default 1) host
-  seconds, at least five blocks remain, twice the standard error of their
-  mean speed is within `--settle-tolerance` (default 0.01, i.e. 1%) of the
-  mean, and the means of the first and second halves of those blocks differ
-  by no more than that tolerance.
-- A sample that has not settled after `--max-sample-seconds` (default 20)
-  host seconds stops anyway and is marked `capped`.
+- The sample settles once it has run `--min-sample-seconds` (default 1)
+  settle-clock seconds, at least five blocks remain, twice the standard error
+  of their mean speed is within `--settle-tolerance` (default 0.02, i.e. 2%)
+  of the mean, and the means of the first and second halves of those blocks
+  differ by no more than that tolerance.
+- Samples whose window speed is at least `--fast-speed-percent` (default 150)
+  use the wider `--fast-settle-tolerance` (default 0.05): they keep up with a
+  large margin, so the extra digits cost time without changing the verdict.
+  For fine A/B comparisons of fast records, set both tolerances equal.
+  `settle.tolerance` records the one applied.
+- A sample that has not settled after `--max-sample-seconds` (default 10)
+  settle-clock seconds stops anyway and is marked `capped`.
 
-Steady workloads therefore stop after a couple of host seconds, while noisy
-or drifting ones get more time. Settling uses host wall time, which works on
-any host; its interval uses batch means of neighbouring blocks, which keeps
-it honest when blocks are correlated. Treat `settled` as "stable enough to
-stop", not as a statistical guarantee; compare repeated runs (`--repeat`)
-when the difference is small.
+Steady workloads therefore stop after a couple of seconds, while noisy or
+drifting ones get more time. Its interval uses batch means of neighbouring
+blocks, which keeps it honest when blocks are correlated. Treat `settled` as
+"stable enough to stop", not as a statistical guarantee; compare repeated
+runs (`--repeat`) when the difference is small. In recorded full runs the
+2%/10 s defaults saved about 9 minutes against 1%/20 s, with a 90th
+percentile capacity difference under 1%; launch-to-launch noise (1-2%) is
+larger than that.
 
 Host CPU time is the **emulation thread's** own: on Linux the runner finds
 the thread 86Box names `main_thread` in `/proc/PID/task/*/comm` and reads its
@@ -348,14 +395,14 @@ giving an IPC per test.
 Runs require the local automation-enabled 86Box build; standalone floppy boot
 does not require this interface.
 
-The runner renews a 30-guest-second serial lease until the sample settles
-or is capped, then releases it. A release never shortens the guest minimum
+The runner renews a 30-guest-second serial lease every 5 emulated seconds
+until the sample settles or is capped, then releases it. A release never shortens the guest minimum
 (`TEST_SECONDS`). If the
 controller disappears, the last lease expires, so the guest does not wait
 forever. The timer interrupt drains serial control frames to avoid overrunning
 the UART during long invocations. The runner sends at most one frame per
-step, only for the sample still active after that step, and repeats renewals
-and releases every 250 emulated ms until the phase ends; a short sample that
+step, only for the sample still active after that step, and repeats releases
+every 250 emulated ms until the phase ends; a short sample that
 starts and ends within one step gets no frame. Interrupt-disabled intervals can defer receipt, and complete invocations
 can overshoot the requested minimum. Frames are `+IIIIIIII\n` / `-IIIIIIII\n`, using eight
 hexadecimal digits for the current workload ID. Malformed and stale frames

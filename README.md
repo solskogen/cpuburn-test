@@ -47,6 +47,7 @@ workload is emulated (benchmarks). It needs no guest OS or hard disk.
 make                         # default build: every record, benchmarks enabled
 make SUITE=benchmark         # only the benchmark workloads, sampled
 make SUITE=accuracy          # every record checked once (same as BENCHMARKS=0)
+make QUICK=1                 # check a list of redundant, costly records once
 ```
 
 `SUITE=benchmark` leaves out the check-only records (the `cs_*` platform
@@ -73,6 +74,7 @@ See [accuracy-only builds](doc/coverage.md#accuracy-only-builds) for details.
 |---|---|
 | Display and save serial results from your existing VM | [`capture_serial.py`](doc/running.md#boot-and-capture-results) |
 | Measure each test's ability to sustain the configured emulation speed | [`run_86box.py`](doc/running.md#measure-per-test-emulation-capacity) |
+| Split that run over several pinned cores and merge the results | [`shard_86box.py`](doc/running.md#faster-runs) |
 | Drive a VM through an OS install or boot, logging its real-time speed and watching its screen | [`session_86box.py`](doc/running.md#drive-a-vm-and-log-its-real-time-speed) |
 
 Serial capture and guest timing alone do **not** measure host emulation
