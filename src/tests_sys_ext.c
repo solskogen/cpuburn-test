@@ -202,7 +202,7 @@ static u32 pm_task_switch_loop_call(void) { return task_loop(1); }
 static u32 io_poll(u32 kind) {
     const u32 n = 8192;
     u16 crt = bda_read16(0x63) == 0x3B4 ? 0x3BA : 0x3DA;
-    u32 bad = 0;
+    u32 hi = 0; /* highest latched PIT count */
     for (u32 i = 0; i < n; i++) {
         switch (kind) {
         case 0: (void)inb(crt); break;
@@ -215,13 +215,14 @@ static u32 io_poll(u32 kind) {
             u32 c = inb(0x40);
             c |= (u32)inb(0x40) << 8;
             wr_eflags(f);
-            bad += c > 11932;
+            if (c > hi) hi = c;
             break;
         }
         default: outb(0x20, 0x0A); (void)inb(0x20); break; /* OCW3 read IRR */
         }
     }
-    CHECK_EQ(bad, 0);
+    /* Mode 2 counts l..1, never above the divisor. */
+    if (hi > 11932) t_failv("pit_count <= 11932", __LINE__, hi, 11932);
     xs_done(kind == 2 ? "port_write" : kind == 3 ? "pit_latch_read" : kind == 4 ? "pic_irr_read" : "port_read", n);
     return n;
 }
