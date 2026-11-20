@@ -4,7 +4,7 @@ First public-release candidate of the bare-metal i486-and-newer CPU/FPU
 correctness and benchmark-data suite for 86Box. This is a preview, not an
 exhaustive x86 conformance certification.
 
-The default image selects 344 workload records: one round, scale 8,
+The default image selects 423 workload records: one round, scale 8,
 TEST_SECONDS=1 and BURN_SECONDS=10. Optional features produce explicit SKIP
 records. The suite preserves failures during warm-up and measured execution,
 reports coarse guest runtime and first-failure context, and leaves comparison
@@ -39,6 +39,14 @@ are temporary; the original config is restored after exit. NVRAM, disks and
 host backends remain live, not rolled back. Logs default to the VM directory;
 `--output-dir` selects another location. Generated profiles and
 matrix configs remain available through explicit `--profile`/`--config`.
+
+Samples stop once the measured speed settles (a 95% interval and the
+first-half/second-half drift both within 2%, or 5% for records above 150%),
+timed on the emulation thread's CPU time; each record reports whether the
+host delayed 86Box (`contended`). `tools/shard_86box.py` splits a run across
+pinned cores and merges the results, and `make QUICK=1` checks costly,
+redundant records once instead of sampling them. See
+[Running](doc/running.md#faster-runs).
 
 ## Known results and limitations
 
