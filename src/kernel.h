@@ -97,6 +97,7 @@ extern const test_t tests_int_ext[];
 extern const test_t tests_paging[], tests_mem[], tests_sys[], tests_burn[];
 extern const test_t tests_heavy_paging[], tests_heavy_pmode[], tests_heavy_state[];
 extern const test_t tests_corpus[];
+extern const test_t tests_sys_ext[], tests_pmode_ext[];
 extern const test_t tests_fp_edges[], tests_sweeps[];
 /* Check-only tables: correctness records that are never benchmark-sampled and
  * are left out of SUITE=benchmark builds (kmain runs them, and tests_chipset,

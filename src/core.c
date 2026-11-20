@@ -1453,6 +1453,7 @@ void kmain(void) {
         run_tests(tests_vendor, T_TAG_MMX);
         run_tests(tests_cyrix, T_TAG_IO);
         run_tests(tests_pmode, T_TAG_SEGLOAD | T_TAG_EXC);
+        run_tests(tests_pmode_ext, T_TAG_SEGLOAD | T_TAG_MODESW | T_TAG_EXC);
         run_tests(tests_heavy_pmode, T_TAG_SEGLOAD | T_TAG_MODESW);
         /* Platform checks: mostly waiting on PIT/RTC edges, so never benchmarked. */
         run_checks(tests_chipset, T_TAG_IO);
@@ -1467,6 +1468,7 @@ void kmain(void) {
         run_tests(tests_mem, 0);
         run_tests(tests_sweeps, 0);
         run_tests(tests_sys, 0);
+        run_tests(tests_sys_ext, 0);
         run_tests(tests_heavy_state, T_TAG_IRQ);
         if (g_round == ROUNDS) run_tests(tests_burn, 0);
         if (sel_dry) { sel_check_names(); g_round = 0; }
