@@ -1245,7 +1245,9 @@ static void run_table(const test_t *t, int table_check_only, u32 table_tags) {
                 warmup_failed = g_nfail != 0;
                 if (rc || g_skip_reason) break;
                 lease_active_id = test_index;
-                kprintf("WORK phase=sample r=%u id=%u name=%s\n", g_round, test_index, t->name);
+                /* inv_ms lets the host size its speed blocks to whole invocations. */
+                kprintf("WORK phase=sample r=%u id=%u name=%s inv_ms=%u\n",
+                        g_round, test_index, t->name, warmup_ms);
                 sample_start = ms_now();
                 iterations = 1;
                 sample_ms = 0;

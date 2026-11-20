@@ -26,11 +26,24 @@ import time
 
 
 WORK = re.compile(r"WORK phase=(warmup|sample|end) r=([1-9][0-9]*) "
-                  r"id=([0-9]+) name=(\S+)")
+                  r"id=([0-9]+) name=(\S+)(?: inv_ms=([0-9]+))?")
+# A speed block also spans at least one guest invocation (the sample line's
+# inv_ms, the warm-up invocation's length) so that blocks do not alternate
+# between the phases of a long invocation; capped so slow records still fit
+# enough blocks inside max_sample_seconds.
+INVOCATION_BLOCK_MAX_MS = 2000
 # Lease frames go out at most once per feed, only for the sample still active
-# then, and are repeated well inside the guest's 1 s minimum: a stale frame
-# queued with the current one can overrun the 16-byte UART FIFO.
-LEASE_RENEW_MS = 250
+# then: a stale frame queued with the current one can overrun the 16-byte UART
+# FIFO. The first '+' goes out at once, well inside the guest's 1 s minimum; a
+# '+' holds the sample for 3000 guest PIT ticks (30 s, src/core.c poll_lease),
+# so renewals every 5 s keep a 6x margin, and each costs a held automation
+# request (about 1 ms of host wall time). Releases repeat every 250 ms.
+LEASE_RENEW_MS = 5000
+RELEASE_REPEAT_MS = 250
+# A sample whose emulation thread waited in the run queue for more than this
+# share of its CPU time shared its core with another task: its capacity is
+# still per CPU second, but caches and boost were shared too, so it is flagged.
+CONTENDED_DELAY_SHARE = 0.02
 # 86Box names its emulation thread (src/qt/qt_main.cpp, main_thread_fn).
 EMULATION_THREAD = "main_thread"
 
@@ -76,6 +89,15 @@ def parse_schedstat(text):
     if len(fields) < 3:
         raise ValueError(f"malformed schedstat: {text!r}")
     return int(fields[0]) / 1e9
+
+
+def parse_schedstat_delay(text):
+    """Run-queue wait seconds from /proc/.../schedstat (its second field): time the
+    thread was runnable but another task held its CPU."""
+    fields = text.split()
+    if len(fields) < 3:
+        raise ValueError(f"malformed schedstat: {text!r}")
+    return int(fields[1]) / 1e9
 
 
 def thread_cpu_seconds(pid, tid):
@@ -127,6 +149,16 @@ class EmulationClock:
         if self.tid is not None:
             return thread_cpu_seconds(self.pid, self.tid)[0]
         return self.fallback()
+
+    def sample(self):
+        """(CPU seconds, run-queue wait seconds or None) from one schedstat read."""
+        if self.scope == "emulation_thread_schedstat_ns":
+            try:
+                text = Path(f"/proc/{self.pid}/task/{self.tid}/schedstat").read_text()
+                return parse_schedstat(text), parse_schedstat_delay(text)
+            except (OSError, ValueError):
+                pass
+        return self.cpu_seconds(), None
 
 
 def _read(path):
@@ -266,8 +298,8 @@ def batch_means_interval(values):
     return mean, t975(batches - 1) * statistics.stdev(means) / math.sqrt(batches)
 
 
-def settle_state(blocks, tolerance, min_blocks):
-    """Judge whether per-block speeds (wall seconds, guest ms) have settled.
+def settle_state(blocks, tolerance, min_blocks, fast_tolerance=None, fast_percent=None):
+    """Judge whether per-block speeds (clock seconds, guest ms) have settled.
 
     The leading quarter of the blocks (at least one) is left out, so a slow
     first block cannot hold a sample open. The remaining window has settled
@@ -277,16 +309,25 @@ def settle_state(blocks, tolerance, min_blocks):
     tolerance (no drift). All ratios are relative to the window mean. The
     interval is a batch-means 95% interval (see batch_means_interval), which
     stays honest when consecutive blocks are correlated.
+
+    A window running at fast_percent or more of real time is judged against
+    fast_tolerance instead: far above 100% a few percent cannot change whether
+    the emulator keeps up, and such records are where long samples cost most.
     """
     discard = min(len(blocks), max(1, len(blocks) // 4))
     window = blocks[discard:]
     speeds = [guest / 1000 / wall for wall, guest in window]
     state = {"blocks": len(blocks), "discarded_blocks": discard,
              "window_blocks": len(speeds), "window_speed_percent": None,
-             "relative_interval": None, "relative_drift": None, "settled": False}
+             "relative_interval": None, "relative_drift": None, "tolerance": tolerance,
+             "settled": False}
     if speeds:
         state["window_speed_percent"] = (
             sum(guest for _, guest in window) / 10 / sum(wall for wall, _ in window))
+        if (fast_tolerance is not None and fast_percent is not None
+                and state["window_speed_percent"] >= fast_percent):
+            tolerance = max(tolerance, fast_tolerance)
+            state["tolerance"] = tolerance
     if len(speeds) >= 2:
         mean, interval = batch_means_interval(speeds)
         half = len(speeds) // 2
@@ -302,15 +343,18 @@ def settle_state(blocks, tolerance, min_blocks):
 class WorkloadCapture:
     """Hold each sample open until its speed settles, or until max_seconds.
 
-    Speed is guest time per host wall time of interior steps. Steps are grouped
-    into blocks of at least block_seconds; see settle_state for the rule. The
+    Speed is guest time per emulation-thread CPU second of interior steps (per
+    host wall second without ns thread CPU time). Steps are grouped into blocks
+    of at least block_seconds of that clock; see settle_state for the rule. The
     guest's own TEST_SECONDS window is a floor that a release cannot shorten.
     """
 
-    def __init__(self, step_ms=250, *, min_seconds=1.0, max_seconds=20.0,
-                 tolerance=0.01, block_seconds=0.2, min_blocks=5):
+    def __init__(self, step_ms=250, *, min_seconds=1.0, max_seconds=10.0,
+                 tolerance=0.02, block_seconds=0.2, min_blocks=5,
+                 fast_tolerance=0.05, fast_percent=150.0):
         for name, value in (("min_seconds", min_seconds), ("max_seconds", max_seconds),
-                            ("tolerance", tolerance), ("block_seconds", block_seconds)):
+                            ("tolerance", tolerance), ("block_seconds", block_seconds),
+                            ("fast_tolerance", fast_tolerance), ("fast_percent", fast_percent)):
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be finite and positive")
         if min_seconds > max_seconds:
@@ -319,7 +363,9 @@ class WorkloadCapture:
             raise ValueError("min_blocks must be an integer of at least 2")
         self.settings = {"min_sample_seconds": min_seconds, "max_sample_seconds": max_seconds,
                          "settle_tolerance": tolerance, "block_seconds": block_seconds,
-                         "min_window_blocks": int(min_blocks)}
+                         "min_window_blocks": int(min_blocks),
+                         "fast_settle_tolerance": fast_tolerance,
+                         "fast_speed_percent": fast_percent}
         self.step_ms = step_ms
         self.records = []
         self.active = None
@@ -333,9 +379,17 @@ class WorkloadCapture:
         self.windows = []
         self.cpu_scope = "total_process_all_threads"
 
+    @property
+    def settle_clock(self):
+        """Judge settling on the clock the capacity is reported in, the emulation
+        thread's CPU time, when it has ns resolution; host wall time otherwise."""
+        return "cpu" if self.cpu_scope == "emulation_thread_schedstat_ns" else "wall"
+
     def _settle(self, entry):
         return settle_state(entry["_blocks"], self.settings["settle_tolerance"],
-                            self.settings["min_window_blocks"])
+                            self.settings["min_window_blocks"],
+                            self.settings["fast_settle_tolerance"],
+                            self.settings["fast_speed_percent"])
 
     def observe_step(self, before, after):
         """Snapshots are (monotonic seconds, process CPU seconds, guest ms)."""
@@ -376,7 +430,7 @@ class WorkloadCapture:
             line = line.rstrip("\r")
             match = WORK.fullmatch(line)
             if match:
-                phase, round_number, identifier, name = match.groups()
+                phase, round_number, identifier, name, inv_ms = match.groups()
                 identifier, round_number = int(identifier), int(round_number)
                 if identifier > 0xFFFFFFFF:
                     self.warnings.append("invalid_workload_id")
@@ -400,8 +454,13 @@ class WorkloadCapture:
                         "end_reason": None, "steps": 0, "step_wall_seconds": 0.0,
                         "process_cpu_seconds": 0.0, "emulated_ms": 0,
                         "lease_released": False, "sample_stop": None, "invalid_steps": 0,
+                        "settle_clock_seconds": 0.0,
                         "_blocks": [], "_block": [0.0, 0],
                     }
+                    if phase == "sample" and inv_ms is not None:
+                        self.active["invocation_ms"] = int(inv_ms)
+                        self.active["block_min_emulated_ms"] = min(int(inv_ms),
+                                                                   INVOCATION_BLOCK_MAX_MS)
                     self.records.append(self.active)
                 elif (self.active is not None and identifier == self.active["id"]
                       and round_number == self.active["r"] and name == self.active["name"]):
@@ -425,8 +484,11 @@ class WorkloadCapture:
             before, after, original = self.pending
             self.pending = None
             wall, cpu, guest = (after[i] - before[i] for i in range(3))
-            valid = (all(math.isfinite(x) for x in (*before, *after))
+            valid = (all(math.isfinite(x) for x in (*before[:3], *after[:3]))
                      and wall > 0 and cpu >= 0 and guest > 0)
+            delay = (after[3] - before[3]
+                     if len(before) > 3 and len(after) > 3
+                     and before[3] is not None and after[3] is not None else None)
             if not valid:
                 self.warnings.append("invalid_step_clock")
                 if original is not None:
@@ -439,18 +501,25 @@ class WorkloadCapture:
                 entry["step_wall_seconds"] += wall
                 entry["process_cpu_seconds"] += cpu
                 entry["emulated_ms"] += guest
+                if attributable and delay is not None and delay >= 0:
+                    original["run_delay_seconds"] = original.get("run_delay_seconds", 0.0) + delay
                 if attributable and original["phase"] == "sample":
                     self.windows.append((before[0], after[0], original["id"]))
                     block = original["_block"]
-                    block[0] += wall
+                    clock = cpu if self.settle_clock == "cpu" else wall
+                    original["settle_clock_seconds"] += clock
+                    block[0] += clock
                     block[1] += guest
-                    if block[0] >= self.settings["block_seconds"]:
+                    if (block[0] >= self.settings["block_seconds"]
+                            and block[1] >= original.get("block_min_emulated_ms", 0)):
                         original["_blocks"].append(tuple(block))
                         original["_block"] = [0.0, 0]
         if self.active is not None and self.active["phase"] == "sample":
             identifier = self.active["id"]
             if not self.active["lease_released"]:
-                sampled = self.active["step_wall_seconds"]
+                # min/max count the settle clock too, so a busy host that stretches
+                # wall time neither caps a sample early nor ends it with less data.
+                sampled = self.active["settle_clock_seconds"]
                 if sampled >= self.settings["max_sample_seconds"]:
                     self.active["sample_stop"] = "capped"
                 elif (sampled >= self.settings["min_sample_seconds"]
@@ -458,7 +527,7 @@ class WorkloadCapture:
                     self.active["sample_stop"] = "settled"
             if self.active["sample_stop"] is not None:
                 if (not self.active["lease_released"] or self.last_lease_ms is None
-                        or emulated_ms - self.last_lease_ms >= LEASE_RENEW_MS):
+                        or emulated_ms - self.last_lease_ms >= RELEASE_REPEAT_MS):
                     commands.append(f"-{identifier:08x}\n")
                     self.last_lease_ms = emulated_ms
                 self.active["lease_released"] = True
@@ -491,10 +560,16 @@ class WorkloadCapture:
                 if entry["process_cpu_seconds"] else None)
             if entry["phase"] == "sample":
                 entry["settle"] = settle_state(blocks, self.settings["settle_tolerance"],
-                                               self.settings["min_window_blocks"])
+                                               self.settings["min_window_blocks"],
+                                               self.settings["fast_settle_tolerance"],
+                                               self.settings["fast_speed_percent"])
                 entry["block_speed_percent"] = [round(guest / 10 / wall, 2)
                                                 for wall, guest in blocks]
+                entry["settle_clock"] = self.settle_clock
                 entry["under_sampled"] = entry["sample_stop"] is None
+                delay = entry.get("run_delay_seconds")
+                entry["contended"] = (None if delay is None else
+                                      delay > CONTENDED_DELAY_SHARE * entry["process_cpu_seconds"])
             else:
                 entry["under_sampled"] = None
             records.append(entry)
@@ -526,7 +601,8 @@ class WorkloadCapture:
             "warnings": list(self.warnings) + [
                 f"under_sampled:{entry['id']}" for entry in records if entry["under_sampled"]] + [
                 f"capped:{entry['id']}" for entry in records
-                if entry.get("sample_stop") == "capped"],
+                if entry.get("sample_stop") == "capped"] + [
+                f"contended:{entry['id']}" for entry in records if entry.get("contended")],
             "availability": ("captured" if any(e["phase"] == "sample" for e in records)
                              else "unavailable_no_sample_markers"),
         }

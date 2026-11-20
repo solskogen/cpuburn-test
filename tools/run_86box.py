@@ -113,9 +113,11 @@ def flatten(lists):
 
 def sampling_options(args):
     return {"min_seconds": getattr(args, "min_sample_seconds", 1.0),
-            "max_seconds": getattr(args, "max_sample_seconds", 20.0),
-            "tolerance": getattr(args, "settle_tolerance", 0.01),
-            "block_seconds": getattr(args, "block_seconds", 0.2)}
+            "max_seconds": getattr(args, "max_sample_seconds", 10.0),
+            "tolerance": getattr(args, "settle_tolerance", 0.02),
+            "block_seconds": getattr(args, "block_seconds", 0.2),
+            "fast_tolerance": getattr(args, "fast_settle_tolerance", 0.05),
+            "fast_percent": getattr(args, "fast_speed_percent", 150.0)}
 
 
 def boot_key(value):
@@ -178,14 +180,22 @@ def arguments():
     parser.add_argument("--wall-seconds", type=positive, default=28800)
     parser.add_argument("--step-ms", type=positive_int, default=250,
                         help="capture interval in emulated milliseconds (default: 250)")
+    # Sample lengths are counted on the settle clock: the emulation thread's CPU
+    # time when /proc gives it in ns, host wall time otherwise.
     parser.add_argument("--min-sample-seconds", type=positive, default=1.0,
-                        help="host wall seconds a sample must run before it may settle (default: 1)")
-    parser.add_argument("--max-sample-seconds", type=positive, default=20.0,
-                        help="host wall seconds after which an unsettled sample stops (default: 20)")
-    parser.add_argument("--settle-tolerance", type=positive, default=0.01,
-                        help="relative interval and drift that count as settled (default: 0.01)")
+                        help="settle-clock seconds a sample must run before it may settle (default: 1)")
+    parser.add_argument("--max-sample-seconds", type=positive, default=10.0,
+                        help="settle-clock seconds after which an unsettled sample stops and is "
+                             "flagged capped (default: 10)")
+    parser.add_argument("--settle-tolerance", type=positive, default=0.02,
+                        help="relative interval and drift that count as settled (default: 0.02)")
+    parser.add_argument("--fast-settle-tolerance", type=positive, default=0.05,
+                        help="tolerance for samples at or above --fast-speed-percent (default: 0.05; "
+                             "set it equal to --settle-tolerance for fine A/B work on fast records)")
+    parser.add_argument("--fast-speed-percent", type=positive, default=150.0,
+                        help="capacity from which --fast-settle-tolerance applies (default: 150)")
     parser.add_argument("--block-seconds", type=positive, default=0.2,
-                        help="host wall seconds per speed block in the settle test (default: 0.2)")
+                        help="settle-clock seconds per speed block in the settle test (default: 0.2)")
     parser.add_argument("--perf", action="store_true",
                         help="attach perf record once; require working perf permissions, save hotpaths")
     parser.add_argument("--expect", action="append", default=[],
@@ -438,6 +448,9 @@ def inplace_vm(args, image):
             if not config.has_section("General"):
                 config.add_section("General")
             config["General"]["sound_muted"] = "1"
+            # Offscreen Qt draws nothing; the OpenGL renderer then skips the software
+            # renderer's per-frame host copies. Frames, text and screenshots are unchanged.
+            config["General"]["vid_renderer"] = "qt_opengl"
 
     with edited_config(source, edit) as (config, source_hash):
         yield source, dict(config["Machine"]), source_hash
@@ -629,6 +642,7 @@ class Automation:
         self.transcript = transcript
         self.deadline = deadline
         self.request_seconds = request_seconds
+        self.timing = {}
 
     def _remaining(self, command, limit):
         now = time.monotonic()
@@ -640,8 +654,8 @@ class Automation:
         return min(self.deadline, limit) - now
 
     def request(self, command, allow_failure=False):
-        limit = (time.monotonic() + self.request_seconds if self.request_seconds
-                 else math.inf)
+        began = time.monotonic()
+        limit = (began + self.request_seconds if self.request_seconds else math.inf)
         self.connection.settimeout(self._remaining(command, limit))
         self.connection.sendall(command.encode("utf-8") + b"\n")
         while b"\n" not in self.buffer:
@@ -655,6 +669,10 @@ class Automation:
                 raise RuntimeError("86Box closed automation connection; see emulator.log")
             self.buffer += chunk
         line, self.buffer = self.buffer.split(b"\n", 1)
+        verb = " ".join(command.split()[:2 if command.startswith(("serial", "key")) else 1])
+        entry = self.timing.setdefault(verb, [0, 0.0])
+        entry[0] += 1
+        entry[1] += time.monotonic() - began
         reply = json.loads(line)
         if hasattr(self.transcript, "record"):
             self.transcript.record(command, reply)
@@ -959,9 +977,11 @@ def execute(args, run_dir, command, machine):
             last_text_ms = None
             last_f1 = -5000
             text = ""
+            boot = result.setdefault("boot_milestones", {})
 
             def snapshot(ms):
-                return (time.monotonic(), clock.cpu_seconds(), ms)
+                cpu, delay = clock.sample()
+                return (time.monotonic(), cpu, ms, delay)
 
             def read_serial():
                 nonlocal serial_from
@@ -1036,7 +1056,9 @@ def execute(args, run_dir, command, machine):
                 if tail:
                     # Finish the boundary line in 1 ms steps, charged to no workload.
                     for _ in range(TAIL_STEPS):
-                        if tail.endswith(b"\n") or now >= args.emulated_ms:
+                        # The boundary line is whole once the tail has a newline; what
+                        # follows it belongs to no sample, so later bytes need no 1 ms steps.
+                        if b"\n" in tail or now >= args.emulated_ms:
                             break
                         tail_before = snapshot(now)
                         now = api.request("step 1")["ms"]
@@ -1050,6 +1072,10 @@ def execute(args, run_dir, command, machine):
                     serial_log.write(chunk)
                     serial_log.flush()
                     decoded = chunk.decode("cp437")
+                    for marker in ("CPUBURN-TEST", "WORK phase=", "TEST r="):
+                        if marker in decoded and marker not in boot:
+                            boot[marker] = {"wall_seconds": round(time.monotonic() - started, 3),
+                                            "emulated_ms": chunk_ms}
                     serial_tail += decoded
                     if re.search(r"(?m)^BUILD [^\n]*\bbenchmarks=0\r?$", serial_tail):
                         accuracy = True
@@ -1285,6 +1311,9 @@ def finish_run(result, run_dir, started, capture, recorder, perf_stopped, emulat
     stop_process(emulator)
     LIVE_EMULATORS.discard(emulator)
     result["transcript"] = transcript.close()
+    if isinstance(getattr(api, "timing", None), dict):
+        result["request_timing"] = {verb: {"count": count, "wall_seconds": round(seconds, 6)}
+                                    for verb, (count, seconds) in sorted(api.timing.items())}
     (run_dir / "result.json").write_text(json.dumps(result, indent=2) + "\n")
 
 

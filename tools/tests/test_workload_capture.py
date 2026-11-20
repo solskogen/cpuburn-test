@@ -36,8 +36,7 @@ class CaptureTests(unittest.TestCase):
         capture = WorkloadCapture(250)
         self.assertEqual(self.step(capture, (10, 1, 0), (11, 1.2, 250), marker()),
                          ["+00000001\n"])
-        self.assertEqual(self.step(capture, (20, 1.3, 250), (20.5, 1.8, 500)),
-                         ["+00000001\n"])
+        self.assertEqual(self.step(capture, (20, 1.3, 250), (20.5, 1.8, 500)), [])
         self.step(capture, (30, 2, 500), (31, 2.5, 750), marker("end"))
         report = capture.report()
         workload = report["workloads"][0]
@@ -54,8 +53,8 @@ class CaptureTests(unittest.TestCase):
     def test_lease_heartbeat_and_release_when_settled(self):
         capture = WorkloadCapture(min_seconds=2, block_seconds=.5, min_blocks=2)
         self.assertEqual(capture.feed(marker(identifier=255), 0, 1), ["+000000ff\n"])
-        self.assertEqual(self.step(capture, (1, 0, 0), (2, 1, 1000)), ["+000000ff\n"])
-        self.assertEqual(self.step(capture, (2, 1, 1000), (3, 2, 2000)), ["+000000ff\n"])
+        self.assertEqual(self.step(capture, (1, 0, 0), (2, 1, 1000)), [])
+        self.assertEqual(self.step(capture, (2, 1, 1000), (3, 2, 2000)), [])
         self.assertEqual(self.step(capture, (3, 2, 2000), (4, 3, 3000)), ["-000000ff\n"])
         self.assertEqual(self.step(capture, (4, 3, 3000), (5, 4, 3100)), [])
         self.assertEqual(self.step(capture, (5, 4, 3100), (6, 5, 3250)), ["-000000ff\n"])
@@ -64,6 +63,12 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual(workload["sample_stop"], "settled")
         self.assertFalse(workload["under_sampled"])
         self.assertEqual(workload["settle"]["discarded_blocks"], 1)
+
+    def test_lease_renewed_well_inside_guest_hold(self):
+        capture = WorkloadCapture(min_seconds=60, max_seconds=60)
+        self.assertEqual(capture.feed(marker(), 0, 0), ["+00000001\n"])
+        self.assertEqual(self.step(capture, (0, 0, 0), (1, 1, 4999)), [])
+        self.assertEqual(self.step(capture, (1, 1, 4999), (2, 2, 5000)), ["+00000001\n"])
 
     def test_unsettled_sample_is_capped(self):
         capture = WorkloadCapture(min_seconds=1, max_seconds=4, block_seconds=.5, min_blocks=2)
@@ -80,6 +85,57 @@ class CaptureTests(unittest.TestCase):
         self.assertIn("capped:1", report["warnings"])
         self.assertEqual(report["aggregates"]["heavy"]["capped"], 1)
         self.assertEqual(workload["block_speed_percent"], [25, 100, 25, 100])
+
+    def test_fast_records_settle_at_the_wider_tolerance(self):
+        noisy = [(1, s) for s in (3000, 3100, 2950, 3080, 2990, 3060, 3010, 3070, 2960, 3050)]
+        self.assertFalse(settle_state(noisy, .01, 5)["settled"])
+        state = settle_state(noisy, .01, 5, fast_tolerance=.05, fast_percent=150)
+        self.assertTrue(state["settled"])
+        self.assertEqual(state["tolerance"], .05)
+        slow = [(1, s / 3) for _, s in noisy]
+        state = settle_state(slow, .01, 5, fast_tolerance=.05, fast_percent=150)
+        self.assertFalse(state["settled"])
+        self.assertEqual(state["tolerance"], .01)
+
+    def test_sample_length_counts_the_settle_clock(self):
+        capture = WorkloadCapture(min_seconds=1, max_seconds=2, block_seconds=.5, min_blocks=2)
+        capture.cpu_scope = "emulation_thread_schedstat_ns"
+        capture.feed(marker(), 0, 0)
+        speeds = (250, 1000, 250, 1000, 250, 1000)
+        # 2 s of wall per step but only .5 s of thread CPU: capped after 4 steps, not 1.
+        commands = [self.step(capture, (2 * i, i / 2, i * 1000), (2 * i + 2, (i + 1) / 2, i * 1000 + g))
+                    for i, g in enumerate(speeds)]
+        self.assertEqual([i for i, c in enumerate(commands) if "-00000001\n" in c][0], 3)
+        workload = capture.report()["workloads"][0]
+        self.assertEqual(workload["sample_stop"], "capped")
+        self.assertEqual(workload["settle_clock"], "cpu")
+        self.assertEqual(workload["settle_clock_seconds"], 3)
+
+    def test_run_queue_delay_flags_contended_samples(self):
+        capture = WorkloadCapture(min_seconds=60, max_seconds=60)
+        capture.feed(marker(identifier=1), 0, 0)
+        self.step(capture, (0, 0, 0, 0), (1, 1, 1000, .001))
+        capture.feed(marker("end", 1), 1000, 1)
+        capture.feed(marker(identifier=2), 1000, 1)
+        self.step(capture, (1, 1, 1000, .001), (2, 2, 2000, .2))
+        capture.feed(marker("end", 2), 2000, 2)
+        capture.feed(marker(identifier=3), 2000, 2)
+        self.step(capture, (2, 2, 2000), (3, 3, 3000))
+        report = capture.report()
+        self.assertEqual([w["contended"] for w in report["workloads"]], [False, True, None])
+        self.assertEqual(report["workloads"][1]["run_delay_seconds"], .199)
+        self.assertIn("contended:2", report["warnings"])
+        self.assertNotIn("contended:1", report["warnings"])
+
+    def test_blocks_span_whole_invocations(self):
+        capture = WorkloadCapture(block_seconds=.2)
+        capture.feed(marker()[:-1] + " inv_ms=700\n", 0, 0)
+        for i in range(6):
+            self.step(capture, (i * .25, i * .25, i * 250), ((i + 1) * .25, (i + 1) * .25, (i + 1) * 250))
+        self.assertEqual([guest for _, guest in capture.active["_blocks"]], [750, 750])
+        self.assertEqual(capture.active["invocation_ms"], 700)
+        capture.feed(marker(identifier=2)[:-1] + " inv_ms=90000\n", 1500, 2)
+        self.assertEqual(capture.active["block_min_emulated_ms"], 2000)
 
     def test_short_steps_accumulate_into_blocks(self):
         capture = WorkloadCapture(block_seconds=.5)
@@ -353,7 +409,7 @@ class RunnerTests(unittest.TestCase):
             self.assertTrue(result["correctness"]["complete"])
             self.assertFalse(result["correctness"]["passed"])
             self.assertEqual(result["workload_capture"]["workloads"][0]["steps"], 1)
-            self.assertEqual(sum(c.startswith("serial write ") for c in commands), 2)
+            self.assertEqual(sum(c.startswith("serial write ") for c in commands), 1)
             self.assertTrue((run_dir / "result.json").is_file())
 
     def fake_run(self, args, chunks, process):
@@ -413,7 +469,7 @@ class RunnerTests(unittest.TestCase):
             args = arguments()
         self.assertEqual((args.profile, args.min_sample_seconds, args.max_sample_seconds,
                           args.settle_tolerance, args.emulated_ms, args.wall_seconds),
-                         ("mmx", 1, 20, .01, 86400000, 28800))
+                         ("mmx", 1, 10, .02, 86400000, 28800))
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
             options = SimpleNamespace(profile="mmx", config=None, memory_mb=16, dynarec=None)
             machine = write_config(options, Path(directory))
