@@ -117,18 +117,23 @@ static u32 mixed_body(u32 *data, u32 *pt, u32 *frames, u32 iterations) {
     return sum ^ x;
 }
 
+/* Mixed by design: every iteration also remaps the window PTE with INVLPG and
+   every eighth reloads CR3. 86Box's INVLPG flushes the whole TLB, so there
+   the record is dominated by TLB refill rather than the integer/x87/MMX work. */
+#define MIX_WORDS 256u
+static u32 mix_reference[MIX_WORDS];
+static u32 mix_reference_iterations;
+
 static u32 heavy_mix_transitions(void) {
-    enum { WORDS = 256, FRAME_COUNT = 4, PAGE_WORDS = 1024 };
+    enum { WORDS = MIX_WORDS, FRAME_COUNT = 4, PAGE_WORDS = 1024 };
     u32 *data = arena_alloc(WORDS * sizeof(u32), 16);
-    u32 *reference = arena_alloc(WORDS * sizeof(u32), 16);
     u32 *pt = arena_alloc(4096, 4096);
     u32 *frames = arena_alloc(FRAME_COUNT * 4096, 4096);
-    if (!data || !reference || !pt || !frames) SKIP("arena too small for mixed-state pages");
+    if (!data || !pt || !frames) SKIP("arena too small for mixed-state pages");
     const u32 pde_index = 0x50000000u >> 22;
     u32 old_pde = pg_dir[pde_index];
     if (old_pde) SKIP("scratch page-directory slot is occupied");
     fill_seeded(data, WORDS, (u32)TEST_SEED);
-    fill_seeded(reference, WORDS, (u32)TEST_SEED);
     kmemset(pt, 0, 4096);
     for (u32 i = 0; i < FRAME_COUNT; i++) frames[i * PAGE_WORDS] = 0x6A530000u + i;
     u32 saved_cr3 = rd_cr3();
@@ -154,13 +159,17 @@ static u32 heavy_mix_transitions(void) {
     CHECK_EQ(mixed_bad_vector, 0);
     CHECK_EQ(mixed_soft_count, (iterations + 255u) / 256u);
     if (cpu_test_feature(REQ_FPU)) CHECK_EQ(mixed_fpu_count, (iterations + 255u) / 256u);
-    u32 ref_x = (u32)TEST_SEED;
-    for (u32 i = 0; i < iterations; i++) {
-        ref_x = lcg_next(ref_x);
-        u32 ix = (ref_x >> 24) & 255u;
-        reference[ix] ^= ref_x ^ i;
+    if (mix_reference_iterations != iterations) {
+        u32 ref_x = (u32)TEST_SEED;
+        fill_seeded(mix_reference, WORDS, (u32)TEST_SEED);
+        for (u32 i = 0; i < iterations; i++) {
+            ref_x = lcg_next(ref_x);
+            u32 ix = (ref_x >> 24) & 255u;
+            mix_reference[ix] ^= ref_x ^ i;
+        }
+        mix_reference_iterations = iterations;
     }
-    for (u32 i = 0; i < WORDS; i++) CHECK_EQ(data[i], reference[i]);
+    for (u32 i = 0; i < WORDS; i++) CHECK_EQ(data[i], mix_reference[i]);
     u32 ops = iterations * (cpu_test_feature(REQ_FPU) ? (cpu_test_feature(REQ_MMX) ? 18u : 14u) : 8u);
     t_ops(ops);
     t_note("iterations=%u integer=%u x87=%u mmx=%u page_remaps=%u cr3_reloads=%u checksum=%08x",
@@ -420,6 +429,9 @@ static void apic_timer_body(u32 periodic) {
     apic[APIC_SVR / 4] = apic_saved_svr | (1u << 8);
     apic[APIC_LVT_TIMER / 4] = lvt | (1u << 16);
     apic[APIC_TIMER_INIT / 4] = 0x70000000u;
+    /* Start on a PIT tick edge so the interval is exactly three ticks. */
+    calibration_start = pit_ticks;
+    while (pit_ticks == calibration_start) hlt();
     before = apic[APIC_TIMER_CURRENT / 4];
     calibration_start = pit_ticks;
     while ((s32)(pit_ticks - (calibration_start + 3u)) < 0) hlt();
@@ -463,6 +475,10 @@ static void apic_timer_body(u32 periodic) {
     apic_test_elapsed_ms = apic_elapsed_ms(start_tick);
 }
 
+/* Mostly HLT idle: about 30 ms of calibration, then at least
+   250 * HEAVY_SCALE ms (periodic) or 128 * HEAVY_SCALE 1 ms one-shots spent in
+   HLT waiting for timer interrupts. Its time tracks the guest clock, not
+   emulation speed; the counts and restoration are the checked part. */
 static u32 apic_timer_test(u32 periodic) {
     if (guard_call(read_apic_base)) {
         if (cpu.hv) t_note("hypervisor=%s APIC feature advertised but APIC_BASE RDMSR trapped (metadata gap)", cpu.hv_vendor);
@@ -525,7 +541,7 @@ const test_t tests_heavy_state[] = {
     {"heavy_state_interrupt", heavy_state_interrupt, REQ_486},
     {"heavy_x87_save_restore", heavy_x87_save_restore, REQ_486 | REQ_FPU},
     {"heavy_fx_save_restore", heavy_fx_save_restore, REQ_486 | REQ_FXSR | REQ_FPU},
-    {"heavy_apic_periodic", heavy_apic_periodic, REQ_PAGING | REQ_486 | REQ_APIC},
-    {"heavy_apic_oneshot", heavy_apic_oneshot, REQ_PAGING | REQ_486 | REQ_APIC},
+    {"heavy_apic_periodic_hlt", heavy_apic_periodic, REQ_PAGING | REQ_486 | REQ_APIC},
+    {"heavy_apic_oneshot_hlt", heavy_apic_oneshot, REQ_PAGING | REQ_486 | REQ_APIC},
     {0, 0, 0}
 };

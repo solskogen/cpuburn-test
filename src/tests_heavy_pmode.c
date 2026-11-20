@@ -96,21 +96,30 @@ __asm__(
     ".code32\n"
     "hp_code16_end:\n");
 
+/* Each case moves the 256-byte DS window (selector 0x50) to one of
+   HP16_WINDOWS word offsets in a table filled and summed once per invocation,
+   so the timed loop does no per-case data generation. */
+#define HP16_WINDOWS 64u
 static void hp_16_body(void) {
     u32 bytes = (u32)(hp_code16_end - hp_code16_begin);
+    u16 *table = (u16 *)(hp_mem + 256), expect[HP16_WINDOWS];
     kmemcpy(hp_mem, hp_code16_begin, bytes);
     gdt_set(8, (u32)hp_mem, bytes - 1, 0x9b, 0);
     gdt_set(9, 0, 0xffff, 0x93, 0);
-    gdt_set(10, (u32)hp_mem + 256, 255, 0x93, 0);
-    for (hp_case = 0; hp_case < 1024u * HEAVY_SCALE; hp_case++) {
-        u16 expected = 0;
+    for (u32 j = 0; j < 128 + HP16_WINDOWS; j++) table[j] = (u16)hp_rand();
+    for (u32 k = 0; k < HP16_WINDOWS; k++) {
+        u16 e = 0;
         for (u32 j = 0; j < 128; j++) {
-            u16 v = (u16)hp_rand();
-            ((u16 *)(hp_mem + 256))[j] = v;
-            expected = (u16)(expected + v);
-            expected = (u16)((expected << 1) | (expected >> 15));
-            expected ^= 0x5a3c;
+            e = (u16)(e + table[k + j]);
+            e = (u16)((e << 1) | (e >> 15));
+            e ^= 0x5a3c;
         }
+        expect[k] = e;
+    }
+    for (hp_case = 0; hp_case < 1024u * HEAVY_SCALE; hp_case++) {
+        u32 k = hp_rand() & (HP16_WINDOWS - 1);
+        u16 expected = expect[k];
+        gdt_set(10, (u32)(table + k), 255, 0x93, 0);
         u32 flags = rd_eflags();
         cli();
         u32 got = hp_enter16();
@@ -153,33 +162,60 @@ __asm__(
     "hp_huge16_end:\n");
 
 static u8 *hp_huge_buf;
+static u32 hp_huge_crossings;
+
+/*
+ * Each pointer is a huge pointer over two consecutive GDT selectors whose
+ * bases are 64 KiB apart: offsets f000..ffff of the first and 0000..0fff of
+ * the second are one contiguous 8 KiB buffer. Case bit 0 makes the source
+ * cross 64 KiB, bit 1 the destination, so the selector step runs mid-copy
+ * and later LES loads the next descriptor.
+ */
+static u32 hp_huge_offset(u32 n, int cross) {
+    if (cross) return 0xffffu - (hp_rand() & 1023u); /* n >= 1024: always crosses */
+    u32 off = 0xf000u + (hp_rand() & 0xfffu);
+    return off + n > 0x10000u ? 0x10000u - n : off;
+}
 
 static void hp_huge_body(void) {
-    u32 bytes = (u32)(hp_huge16_end - hp_huge16_begin);
+    u32 bytes = (u32)(hp_huge16_end - hp_huge16_begin), crossings = 0;
     u8 *src = hp_huge_buf, *dst = hp_huge_buf + 8192;
     volatile u16 *v = (volatile u16 *)(hp_mem + 256);
     kmemcpy(hp_mem, hp_huge16_begin, bytes);
     gdt_set(8, (u32)hp_mem, bytes - 1, 0x9b, 0);
     gdt_set(9, 0, 0xffff, 0x93, 0);
     gdt_set(10, (u32)hp_mem + 256, 255, 0x93, 0);
-    gdt_set(11, (u32)src, 8191, 0x93, 0);
-    gdt_set(12, (u32)dst, 8191, 0x93, 0);
+    gdt_set(11, (u32)src - 0xf000u, 0xffff, 0x93, 0);
+    gdt_set(12, (u32)src + 0x1000u, 0x0fff, 0x93, 0);
+    gdt_set(13, (u32)dst - 0xf000u, 0xffff, 0x93, 0);
+    gdt_set(14, (u32)dst + 0x1000u, 0x0fff, 0x93, 0);
+    for (u32 i = 0; i < 8192; i++) {
+        u8 b = (u8)hp_rand();
+        src[i] = b ? b : 0x5a; /* never zero: the destination is zero-poisoned */
+    }
     for (hp_case = 0; hp_case < 32u * HEAVY_SCALE; hp_case++) {
-        u32 n = 1024 + (hp_rand() & 3071), so = hp_rand() & 4095, dof = hp_rand() & 4095;
-        for (u32 i = 0; i < n; i++) src[so + i] = (u8)hp_rand();
-        v[0] = (u16)so; v[1] = 0x58; v[2] = (u16)dof; v[3] = 0x60; v[4] = 0x50; v[6] = (u16)n;
+        u32 n = 1024 + (hp_rand() & 3071);
+        u32 so = hp_huge_offset(n, hp_case & 1), dof = hp_huge_offset(n, hp_case & 2);
+        u32 src_sel = so + n > 0xffffu ? 0x60 : 0x58, dst_sel = dof + n > 0xffffu ? 0x70 : 0x68;
+        u8 *s8 = src + (so - 0xf000u), *d8 = dst + (dof - 0xf000u);
+        kmemset(d8, 0, n);
+        v[0] = (u16)so; v[1] = 0x58; v[2] = (u16)dof; v[3] = 0x68; v[4] = 0x50; v[6] = (u16)n;
         u32 flags = rd_eflags();
         cli();
         hp_enter16();
         wr_eflags(flags);
-        if (kmemcmp(dst + dof, src + so, n) || v[0] != (u16)(so + n) || v[2] != (u16)(dof + n)) {
-            t_note("seed=%08x case=%u n=%u", TEST_SEED, hp_case, n);
+        if (kmemcmp(d8, s8, n) || v[0] != (u16)(so + n) || v[2] != (u16)(dof + n) ||
+            v[1] != src_sel || v[3] != dst_sel) {
+            t_note("seed=%08x case=%u n=%u so=%04x do=%04x sel=%04x/%04x want=%04x/%04x",
+                   TEST_SEED, hp_case, n, so, dof, v[1], v[3], src_sel, dst_sel);
             CHECK(0);
             break;
         }
-        hp_sum = csum_mix(hp_sum, dst[dof] ^ n);
+        crossings += (src_sel == 0x60) + (dst_sel == 0x70);
+        hp_sum = csum_mix(hp_sum, d8[0] ^ n);
         t_ops(n * 19);
     }
+    hp_huge_crossings = crossings;
 }
 
 static u32 hp_huge_copy(void) {
@@ -192,12 +228,12 @@ static u32 hp_huge_copy(void) {
     hp_sum = 0;
     hp_run(hp_huge_body);
     kmemcpy((void *)0x8000, low_save, 32768);
-    t_note("rounds=%u seg_loads_per_byte=6 address_bits=16", hp_case);
+    t_note("rounds=%u seg_loads_per_byte=6 address_bits=16 64KiB_selector_steps=%u", hp_case, hp_huge_crossings);
     return hp_sum;
 }
 
 static u32 hp_16bit(void) {
-    hp_mem = arena_alloc(512, 16);
+    hp_mem = arena_alloc(256 + 2 * (128 + HP16_WINDOWS), 16);
     void *low_save = arena_alloc(32768, 16);
     CHECK(hp_mem && low_save);
     if (!hp_mem || !low_save) return 0;
@@ -343,6 +379,8 @@ __asm__(
     "pushl $0x31b76a95\n"
     "hp_stack16_bad_push: pushl $0x2468ace0\n int $0x80\n");
 
+/* Fault-machinery benchmark: six expected #GP per case plus a ring-3 #SS
+   round trip; heavy_pm_expand_down_loop is the fault-free counterpart. */
 static void hp_expand_body(void) {
     for (hp_case = 0; hp_case < 512u * HEAVY_SCALE; hp_case++) {
         u32 lim = 0x100 + (hp_rand() & 0x7fff);
@@ -405,6 +443,96 @@ static u32 hp_expand(void) {
     t_note("seed=%08x cases=%u expand_down_B=0,1 faults_per_case=6", TEST_SEED, hp_case);
     t_note("ring3_SS16_low_boundary_rounds=%u normal_push_then_SS_fault=1",
            hp_ss_visits);
+    return hp_sum;
+}
+
+/*
+ * Fault-free expand-down loop: FS and SS (selectors 0x40/0x48) are the same
+ * expand-down data segment, limit 7fff, so only offsets 8000..ffff (B=0) or
+ * 8000..ffffffff (B=1) are legal. Per iteration: FS load, PUSH/POP through
+ * SS, an SS-override store and an FS load of the next slot; nothing faults.
+ * Interrupts are off while SS is not flat.
+ */
+#define HP_EDL_SLOTS 2048u
+#define HP_EDL_ITER (16384u * HEAVY_SCALE)
+static volatile u32 hp_edl_esp __attribute__((used)), hp_edl_count __attribute__((used));
+static volatile u32 hp_edl_seed __attribute__((used)), hp_edl_sum __attribute__((used));
+extern void hp_edl_run(void);
+__asm__(
+    ".text\n .global hp_edl_run\n"
+    "hp_edl_run:\n"
+    "pushl %ebx\n pushl %esi\n pushl %edi\n pushl %ebp\n"
+    "movl %esp,hp_edl_esp\n"
+    "movl hp_edl_count,%ecx\n movl hp_edl_seed,%edx\n"
+    "xorl %ebx,%ebx\n xorl %edi,%edi\n"
+    "movw $0x40,%ax\n movw %ax,%fs\n"
+    "movw $0x48,%ax\n movw %ax,%ss\n movl $0xb000,%esp\n"
+    "1: movl %fs:0x8000(%ebx),%eax\n addl %eax,%edx\n roll $5,%edx\n"
+    "pushl %edx\n popl %esi\n xorl %edi,%esi\n"
+    "movl %esi,%ss:0xc000(%ebx)\n"
+    "leal 4(%ebx),%ebx\n andl $0x1ffc,%ebx\n"
+    "xorl %fs:0xc000(%ebx),%edx\n"
+    "incl %edi\n decl %ecx\n jnz 1b\n"
+    "movw $0x10,%ax\n movw %ax,%ss\n movl hp_edl_esp,%esp\n"
+    "movw %ax,%fs\n"
+    "movl %edx,hp_edl_sum\n"
+    "popl %ebp\n popl %edi\n popl %esi\n popl %ebx\n ret\n");
+
+static u32 hp_edl_read(u32 k) { return (k * 0x9e3779b1u) ^ 0x6c8e9cf5u; }
+static u32 hp_edl_write_init(u32 k) { return (k * 0x85ebca6bu) + 0x3c6ef372u; }
+
+static void hp_edl_body(void) {
+    static u32 ref_sum, ref_words;
+    static int ref_ok;
+    u32 *rd = (u32 *)(hp_mem + 0x8000), *wr = (u32 *)(hp_mem + 0xc000);
+    if (!ref_ok) {
+        u32 x = TEST_SEED, k = 0, w = 0;
+        for (u32 j = 0; j < HP_EDL_SLOTS; j++) wr[j] = hp_edl_write_init(j);
+        for (u32 i = 0; i < HP_EDL_ITER; i++) {
+            x += hp_edl_read(k);
+            x = (x << 5) | (x >> 27);
+            wr[k] = x ^ i;
+            k = (k + 1) & (HP_EDL_SLOTS - 1);
+            x ^= wr[k];
+        }
+        for (u32 j = 0; j < HP_EDL_SLOTS; j++) w = csum_mix(w, wr[j]);
+        ref_sum = x;
+        ref_words = w;
+        ref_ok = 1;
+    }
+    for (u32 j = 0; j < HP_EDL_SLOTS; j++) rd[j] = hp_edl_read(j);
+    for (hp_case = 0; hp_case < 2; hp_case++) {
+        u8 flags = hp_case ? 4 : 0;
+        u32 w = 0;
+        gdt_set(8, (u32)hp_mem, 0x7fff, 0x97, flags);
+        gdt_set(9, (u32)hp_mem, 0x7fff, 0x97, flags);
+        for (u32 j = 0; j < HP_EDL_SLOTS; j++) wr[j] = hp_edl_write_init(j);
+        hp_edl_count = HP_EDL_ITER;
+        hp_edl_seed = TEST_SEED;
+        cli();
+        hp_edl_run();
+        for (u32 j = 0; j < HP_EDL_SLOTS; j++) w = csum_mix(w, wr[j]);
+        if (hp_edl_sum != ref_sum || w != ref_words) {
+            t_note("expand-down B=%u sum=%08x want=%08x words=%08x want=%08x",
+                   hp_case, hp_edl_sum, ref_sum, w, ref_words);
+            CHECK_EQ(hp_edl_sum, ref_sum);
+            CHECK_EQ(w, ref_words);
+            return;
+        }
+        hp_sum = csum_mix(hp_sum, hp_edl_sum ^ w);
+    }
+}
+
+static u32 hp_expand_loop(void) {
+    hp_mem = arena_alloc(65536, 16);
+    CHECK(hp_mem);
+    if (!hp_mem) return 0;
+    hp_sum = 0;
+    if (hp_run(hp_edl_body)) return 0;
+    t_ops(2u * HP_EDL_ITER * 5u);
+    t_work_unit("access");
+    t_note("expand_down_B=0,1 iterations_per_B=%u FS/SS_accesses_per_iteration=5 limit=7fff faults=0",
+           HP_EDL_ITER);
     return hp_sum;
 }
 
@@ -517,6 +645,8 @@ __attribute__((naked)) static void hp_bad_far(void) {
     __asm__ volatile("lcall $8,$0; int $0x80");
 }
 
+/* Fault-machinery benchmark: every case is ten ring3_call round trips, each
+   ending in #GP or #NP, guard recovery and harness re-entry. */
 static void hp_priv_body(void) {
     static const u8 access[5] = { 0x8c, 0x6c, 0xec, 0xec, 0xec };
     static const u16 target[5] = { 8, 8, 0, 0x10, 0x60 };
@@ -795,7 +925,12 @@ static void hp_shadow_body(void) {
     CHECK_EQ(hp_shadow_count, 2048u * HEAVY_SCALE);
     t_note("MOV_SS_POP_SS_pending_TF_traps=%u first_bad_eip=%08x", hp_shadow_count,
            hp_shadow_bad ? hp_shadow_eip : 0);
-    int_hook[1] = hp_saved_db;
+}
+
+/* Correctness only: each sample waits (IF=0) for a real IRQ0 to become
+   pending, so its duration follows the PIT phase. */
+static void hp_irq_shadow_body(void) {
+    cli();
     int_hook[0x20] = hp_irq_hook;
     hp_shadow_count = hp_shadow_bad = 0;
     for (hp_case = 0; hp_case < 4u * HEAVY_SCALE; hp_case++) {
@@ -829,6 +964,11 @@ static u32 hp_shadows(void) {
     __asm__ volatile("mov %%dr6,%0" : "=r"(dr6));
     hp_run(hp_shadow_body);
     __asm__ volatile("mov %0,%%dr6" :: "r"(dr6) : "memory");
+    return csum_mix(hp_shadow_count, hp_shadow_bad);
+}
+
+static u32 hp_irq_shadows(void) {
+    hp_run(hp_irq_shadow_body);
     return csum_mix(hp_shadow_count, hp_shadow_bad);
 }
 
@@ -1010,12 +1150,14 @@ const test_t tests_heavy_pmode[] = {
     { "heavy_pm_16bit", hp_16bit, REQ_486 },
     { "heavy_pm_huge_copy16", hp_huge_copy, REQ_486 },
     { "heavy_pm_ldt", hp_ldt_test, REQ_486 },
-    { "heavy_pm_expand_down", hp_expand, REQ_486 },
+    { "heavy_pm_expand_down_faults", hp_expand, REQ_486 },
+    { "heavy_pm_expand_down_loop", hp_expand_loop, REQ_486 },
     { "heavy_pm_call_gates", hp_callgates, REQ_486 },
-    { "heavy_pm_privilege", hp_privilege, REQ_486 },
+    { "heavy_pm_privilege_faults", hp_privilege, REQ_486 },
     { "heavy_pm_pvi", hp_pvi, REQ_VME },
     { "heavy_pm_vme", hp_vme, REQ_VME },
     { "heavy_pm_v86_monitor", hp_v86_monitor, REQ_486 },
-    { "heavy_pm_irq_shadows", hp_shadows, REQ_486 },
+    { "heavy_pm_ss_shadow_traps", hp_shadows, REQ_486 },
+    { "heavy_pm_irq_shadow_check", hp_irq_shadows, REQ_486, T_CHECK },
     { 0, 0, 0 }
 };

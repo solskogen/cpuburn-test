@@ -377,17 +377,46 @@ static u32 pm_syscall(void) {
     return sc_return_pc;
 }
 
-static u32 pm_irq_nesting(void) {
-    pm_int_count = 0;
-    int_hook[0x81] = pm_count_int;
+#define PM_NEST_DEPTH 4u
+static volatile u32 pm_nest_depth, pm_nest_max, pm_nest_bad, pm_nest_count, pm_nest_outer_if;
+static volatile u32 pm_nest_eip[PM_NEST_DEPTH + 2];
+
+/* Each level re-enters INT 0x81 from inside the interrupt-gate handler until
+   PM_NEST_DEPTH, then checks the inner frame's return EIP and IF. */
+static void pm_nest_hook(regs_t *r) {
+    u32 d = ++pm_nest_depth;
+    pm_nest_count++;
+    if (d > pm_nest_max) pm_nest_max = d;
+    if (d > PM_NEST_DEPTH || r->cs != SEL_KCODE ||
+        (r->eflags & 0x200u) != (d == 1 ? pm_nest_outer_if : 0u)) {
+        pm_nest_bad++;
+        pm_nest_depth = d - 1;
+        return;
+    }
+    pm_nest_eip[d] = r->eip;
+    if (d < PM_NEST_DEPTH) {
+        u32 ret;
+        __asm__ volatile("int $0x81\n1:\tmovl $1b,%0" : "=r"(ret) :: "memory", "cc");
+        if (pm_nest_eip[d + 1] != ret || pm_nest_depth != d) pm_nest_bad++;
+    }
+    pm_nest_depth = d - 1;
+}
+
+static u32 pm_int_nesting(void) {
+    enum { OUTER = 50000 };
+    pm_nest_depth = pm_nest_max = pm_nest_bad = pm_nest_count = 0;
+    pm_nest_outer_if = rd_eflags() & 0x200u;
+    int_hook[0x81] = pm_nest_hook;
     idt_set_gate(0x81, isr_stub[0x81], SEL_KCODE, 0x8E);
-    u32 ticks = pit_ticks;
-    for (u32 i = 0; i < 200000; i++) __asm__ volatile("int $0x81" ::: "memory");
-    CHECK_EQ(pm_int_count, 200000);
-    t_ops(200000);
-    CHECK(pit_ticks > ticks);
-    t_note("software_ints=%u pit_ticks=%u", pm_int_count, pit_ticks - ticks);
-    return pm_int_count; /* the tick count is timing; it stays in the note */
+    for (u32 i = 0; i < OUTER; i++) __asm__ volatile("int $0x81" ::: "memory", "cc");
+    int_hook[0x81] = NULL;
+    CHECK_EQ(pm_nest_bad, 0);
+    CHECK_EQ(pm_nest_depth, 0);
+    CHECK_EQ(pm_nest_max, PM_NEST_DEPTH);
+    CHECK_EQ(pm_nest_count, OUTER * PM_NEST_DEPTH);
+    t_ops(OUTER * PM_NEST_DEPTH);
+    t_note("outer_ints=%u depth=%u software_ints=%u", (u32)OUTER, PM_NEST_DEPTH, pm_nest_count);
+    return pm_nest_count;
 }
 
 extern void pm_bp_target(void);
@@ -430,8 +459,10 @@ static u32 pm_debug_regs(void) {
 
     int rc = guard_call(pm_debug_probe);
     u32 disable = 0;
-    __asm__ volatile("mov %6,%%dr7; mov %0,%%dr0; mov %1,%%dr1; mov %2,%%dr2; mov %3,%%dr3; mov %4,%%dr6; mov %5,%%dr7"
-                     :: "r"(dr0), "r"(dr1), "r"(dr2), "r"(dr3), "r"(dr6), "r"(dr7), "r"(disable) : "memory");
+    __asm__ volatile("mov %0,%%dr7" :: "r"(disable) : "memory");
+    __asm__ volatile("mov %0,%%dr0; mov %1,%%dr1; mov %2,%%dr2; mov %3,%%dr3"
+                     :: "r"(dr0), "r"(dr1), "r"(dr2), "r"(dr3) : "memory");
+    __asm__ volatile("mov %0,%%dr6; mov %1,%%dr7" :: "r"(dr6), "r"(dr7) : "memory");
     int_hook[1] = NULL;
     if (rc) {
         CHECK_EQ(rc, 0);
@@ -578,7 +609,7 @@ const test_t tests_pmode[] = {
     { "pm_v86", pm_v86, REQ_486, T_CHECK },
     { "pm_sysenter", pm_sysenter, REQ_SEP | REQ_MSR, T_CHECK },
     { "pm_syscall", pm_syscall, REQ_SYSCALL | REQ_MSR, T_CHECK },
-    { "pm_irq_nesting", pm_irq_nesting, REQ_486 },
+    { "pm_int_nesting", pm_int_nesting, REQ_486 },
     { "pm_debug_regs", pm_debug_regs, REQ_486, T_CHECK },
     { 0, 0, 0 }
 };
