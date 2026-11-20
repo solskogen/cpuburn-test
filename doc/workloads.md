@@ -770,6 +770,7 @@ fault-time registers.
 | `mem_unaligned_page_split` | PAGING | The same accesses at offsets 4093–4095 where the second page maps to a non-adjacent physical frame, so each access needs two translations; 1,024×`HEAVY_SCALE` passes, final bytes and sentinel frames checked. |
 | `mem_lock` | PAGING + 486 | Locked arithmetic, XCHG/CMPXCHG, optional CX8 and INVLPG; 5,120 aggregate operations, not a multiprocessor test. |
 | `mem_cache_ctl` | PAGING + 486 + NOHV | Guarded WBINVD and bounded CR0.CD/NW windows with data and restoration checks; no explicit `t_ops` count. |
+| `mem_cache_off_loop` | 486 + NOHV | A 20,000-step call/load/store loop over a 64-dword buffer run with CR0.CD set and NW clear, as firmware and boot code run before enabling the caches; CR0 during the loop and the result (against a cached reference run) are checked. `ops` counts 12 per step. |
 | `heavy_decode_align` | PAGING + 486 | Prefixed variable-length code at 67 offsets and both branch paths, each path one call that loops in the generated code. |
 | `heavy_decode_worksets_cold` | PAGING + 486 | Each generated function rewritten before its call, over 4 KiB–4 MiB footprints (`rewrite_and_call`). |
 | `heavy_decode_worksets_warm` | PAGING + 486 | The same footprints written once and called at least 16 times each (`call`). |
