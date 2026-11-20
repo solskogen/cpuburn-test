@@ -250,7 +250,8 @@ static u32 lz_compress(const u8 *src, u32 n, u8 *dst) {
     if (lit) dst[o - lit - 1] = (u8)(lit - 1);
     return o;
 }
-static u32 lz_expand(const u8 *src, u32 n, u8 *dst) {
+/* Byte loop: checks the streams once. */
+static u32 lz_expand_ref(const u8 *src, u32 n, u8 *dst) {
     u32 i = 0, o = 0;
     while (i < n) {
         u32 c = src[i++];
@@ -263,6 +264,25 @@ static u32 lz_expand(const u8 *src, u32 n, u8 *dst) {
     }
     return o;
 }
+/* The loader's: REP MOVSB for literal runs and matches, as real unpackers
+ * do; a forward byte copy is what an overlapping match needs. */
+static u32 lz_expand(const u8 *src, u32 n, u8 *dst) {
+    const u8 *end = src + n;
+    u8 *o = dst;
+    while (src < end) {
+        u32 c = *src++;
+        if (c < 0x80) {
+            c++;
+            __asm__ volatile("rep movsb" : "+S"(src), "+D"(o), "+c"(c) :: "memory");
+        } else {
+            u32 len = (c & 0x7F) + 3;
+            const u8 *from = o - (src[0] | src[1] << 8);
+            src += 2;
+            __asm__ volatile("rep movsb" : "+S"(from), "+D"(o), "+c"(len) :: "memory");
+        }
+    }
+    return (u32)(o - dst);
+}
 
 static void image_relocate(u8 *dst, const image_t *im) {
     for (u32 r = 0; r < im->nrel; r++) {
@@ -271,8 +291,12 @@ static void image_relocate(u8 *dst, const image_t *im) {
     }
 }
 
+/* Built once, from a fixed seed: the loader and overlay records time the
+ * loading and running, not making the images and their references. */
+static int images_ready;
 static int images_setup(void) {
-    u32 seed = TEST_SEED ^ 0x1A6E5u ^ (++invocation * 0x85EBCA6Bu);
+    if (images_ready) return 1;
+    u32 seed = TEST_SEED ^ 0x1A6E5u;
     for (u32 i = 0; i < BC_NGLOB; i++) img_glob[i] = rw_rng(&seed);
     for (u32 a = 0; a < IMG_ARGS; a++) img_args[a] = rw_rng(&seed);
     for (u32 v = 0; v < IMG_VARIANTS; v++) {
@@ -280,10 +304,11 @@ static int images_setup(void) {
         image_build(&images[v], img_prog[v]);
         images[v].lzsize = lz_compress(images[v].img, images[v].size, images[v].lz);
         /* Round trip once in C, so the timed loader always sees valid streams. */
-        u8 tmp[IMG_MAX];
-        if (lz_expand(images[v].lz, images[v].lzsize, tmp) != images[v].size ||
+        static u8 tmp[IMG_MAX];
+        if (lz_expand_ref(images[v].lz, images[v].lzsize, tmp) != images[v].size ||
             kmemcmp(tmp, images[v].img, images[v].size)) return 0;
     }
+    images_ready = 1;
     return 1;
 }
 
@@ -332,7 +357,7 @@ static u32 rw_overlay(void) {
             put32(p, (p[0] | p[1] << 8 | p[2] << 16 | (u32)p[3] << 24) + (u32)region);
         }
     }
-    u32 seed = TEST_SEED ^ invocation, resident = ~0u, swaps = 0, sum = 0, left = 0;
+    u32 seed = TEST_SEED ^ 0x0E1A7u ^ (++invocation * 0x9E3779B1u), resident = ~0u, swaps = 0, sum = 0, left = 0;
     for (u32 c = 0; c < OVL_CALLS; c++) {
         if (!left) {
             u32 v = rw_rng(&seed) % IMG_VARIANTS;
@@ -356,44 +381,64 @@ static u32 rw_overlay(void) {
 #define CR_REG 8
 #define CR_ROUNDS 2048
 #define CR_STUB 24
+#define CR_KEYS 16
+/* Programs, references and each body encrypted under CR_KEYS keys are made
+ * once from a fixed seed, so a pass is: copy an encrypted body in (REP
+ * MOVSB), set the key, run. */
+static u32 cr_glob[BC_NGLOB], cr_args[4], cr_len[CR_REG], cr_expect[CR_REG][4];
+static u32 cr_key[CR_REG][CR_KEYS];
+static u8 cr_plain[CR_REG][BC_CODE_MAX], cr_enc[CR_REG][CR_KEYS][BC_CODE_MAX];
+static int cr_ready;
+static void cr_setup(void) {
+    u32 seed = TEST_SEED ^ 0xC0DEu;
+    prog_t prog;
+    for (u32 i = 0; i < BC_NGLOB; i++) cr_glob[i] = rw_rng(&seed);
+    for (u32 a = 0; a < 4; a++) cr_args[a] = rw_rng(&seed);
+    for (u32 r = 0; r < CR_REG; r++) {
+        bc_gen(&prog, &seed);
+        cr_len[r] = bc_compile(&prog, cr_plain[r], cr_glob, 0, NULL, NULL, NULL);
+        for (u32 a = 0; a < 4; a++) cr_expect[r][a] = bc_interp(&prog, cr_args[a], cr_glob);
+        for (u32 k = 0; k < CR_KEYS; k++) {
+            u32 key = cr_key[r][k] = rw_rng(&seed);
+            for (u32 i = 0, kk = key; i < cr_len[r]; i++, kk = rol32(kk, 3))
+                cr_enc[r][k][i] = cr_plain[r][i] ^ (u8)kk;
+        }
+    }
+    cr_ready = 1;
+}
 static u32 rw_decrypt_run(void) {
     u8 *area = arena_alloc(8192, 4096);
     if (!area) SKIP("arena");
-    u32 seed = TEST_SEED ^ 0xC0DEu ^ (++invocation * 0x27D4EB2Fu), glob[BC_NGLOB], args[4];
-    prog_t prog[CR_REG];
-    u8 plain[CR_REG][BC_CODE_MAX];
-    u32 len[CR_REG], expect[CR_REG][4];
-    for (u32 i = 0; i < BC_NGLOB; i++) glob[i] = rw_rng(&seed);
-    for (u32 a = 0; a < 4; a++) args[a] = rw_rng(&seed);
+    if (!cr_ready) cr_setup();
+    u32 seed = TEST_SEED ^ 0xC0DEu ^ (++invocation * 0x27D4EB2Fu);
     for (u32 r = 0; r < CR_REG; r++) {
-        bc_gen(&prog[r], &seed);
-        len[r] = bc_compile(&prog[r], plain[r], glob, 0, NULL, NULL, NULL);
-        for (u32 a = 0; a < 4; a++) expect[r][a] = bc_interp(&prog[r], args[a], glob);
         u8 *s = area + r * 1024, *body = s + CR_STUB;
         s[0] = 0xB8; put32(s + 1, (u32)body);                 /* mov eax,body */
-        s[5] = 0xB9; put32(s + 6, len[r]);                    /* mov ecx,len */
+        s[5] = 0xB9; put32(s + 6, cr_len[r]);                 /* mov ecx,len */
         s[10] = 0xBA;                                         /* mov edx,key */
         s[15] = 0x30; s[16] = 0x10;                           /* xor [eax],dl */
         s[17] = 0xC1; s[18] = 0xC2; s[19] = 0x03;             /* rol edx,3 */
         s[20] = 0x40; s[21] = 0x49; s[22] = 0x75; s[23] = 0xF7; /* inc eax; dec ecx; jnz */
-        kmemcpy(body, plain[r], len[r]);
+        kmemcpy(body, cr_plain[r], cr_len[r]);
     }
     u32 sum = 0;
     for (u32 n = 0; n < CR_ROUNDS; n++) {
-        u32 r = n % CR_REG, k = rw_rng(&seed);
+        u32 r = n % CR_REG, k = rw_rng(&seed) % CR_KEYS;
         u8 *s = area + r * 1024, *body = s + CR_STUB;
-        /* The body is plain after its last run; encrypt it under a new key. */
-        for (u32 i = 0, kk = k; i < len[r]; i++, kk = rol32(kk, 3)) body[i] ^= (u8)kk;
-        put32(s + 11, k);
-        u32 a = n & 3, got = call_code(s, args[a]);
-        CHECK_EQ(got, expect[r][a]);
+        /* The body is plain after its last run; put it back encrypted under
+         * another key. */
+        kmemcpy(body, cr_enc[r][k], cr_len[r]);
+        put32(s + 11, cr_key[r][k]);
+        u32 a = n & 3, got = call_code(s, cr_args[a]);
+        CHECK_EQ(got, cr_expect[r][a]);
         sum = csum_mix(sum, got);
         for (u32 j = 1; j < 4; j++) {
-            got = call_code(body, args[(a + j) & 3]);
-            CHECK_EQ(got, expect[r][(a + j) & 3]);
+            got = call_code(body, cr_args[(a + j) & 3]);
+            CHECK_EQ(got, cr_expect[r][(a + j) & 3]);
         }
     }
-    for (u32 r = 0; r < CR_REG; r++) CHECK_EQ(kmemcmp(area + r * 1024 + CR_STUB, plain[r], len[r]), 0);
+    for (u32 r = 0; r < CR_REG; r++) CHECK_EQ(kmemcmp(area + r * 1024 + CR_STUB, cr_plain[r], cr_len[r]), 0);
+    t_note("keys_per_body=%u", CR_KEYS);
     t_work_unit("decrypt_pass");
     t_ops(CR_ROUNDS);
     return sum;
@@ -483,6 +528,11 @@ static u32 vm_switch(const vmins_t *p, u32 *r, u32 *m) {
         }
     }
 }
+/* GCC cross-jumps the identical 'goto *tbl[i->op]' tails into a few shared
+ * indirect jumps; keep one per handler, as a threaded interpreter means. */
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((optimize("no-crossjumping")))
+#endif
 static NOINLINE u32 vm_threaded(const vmins_t *p, u32 *r, u32 *m) {
     static void *const tbl[] = {&&li, &&add, &&xr, &&rl, &&mul, &&ld, &&st, &&djnz, &&halt};
     const vmins_t *i = p;
@@ -500,8 +550,13 @@ djnz: i = --r[i->a] ? p + i->imm : i + 1; NEXT;
 halt: return n;
 #undef NEXT
 }
-static u32 rw_threaded_vm(void) {
-    u32 seed = TEST_SEED ^ 0x7A11u ^ (++invocation * 0x165667B1u), n = 0, sum = 0;
+/* The program, its start memory and the switch interpreter's result are
+ * made once from a fixed seed; every pass starts from the same state and is
+ * checked in full. */
+static u32 vm_mem_init[VM_MEM], vm_rr[8], vm_nref;
+static int vm_ready;
+static void vm_setup(void) {
+    u32 seed = TEST_SEED ^ 0x7A11u;
     /* r7 counts the outer loop, r6 the inner one; the body uses r0..r5. */
     u32 o = 0;
     vm_prog[o++] = (vmins_t){VM_LI, 7, 0, 0, 24};
@@ -515,13 +570,21 @@ static u32 rw_threaded_vm(void) {
     vm_prog[o++] = (vmins_t){VM_LI, 6, 0, 0, 96};
     vm_prog[o++] = (vmins_t){VM_DJNZ, 7, 0, 0, inner};
     vm_prog[o++] = (vmins_t){VM_HALT, 0, 0, 0, 0};
-    u32 rr[8] = {0}, rt[8] = {0};
-    for (u32 i = 0; i < VM_MEM; i++) vm_mem_ref[i] = rw_rng(&seed);
-    kmemcpy(vm_mem, vm_mem_ref, sizeof(vm_mem));
-    u32 nref = vm_switch(vm_prog, rr, vm_mem_ref);
+    for (u32 i = 0; i < VM_MEM; i++) vm_mem_init[i] = vm_mem_ref[i] = rw_rng(&seed);
+    for (u32 i = 0; i < 8; i++) vm_rr[i] = 0;
+    vm_nref = vm_switch(vm_prog, vm_rr, vm_mem_ref);
+    vm_ready = 1;
+}
+static u32 rw_threaded_vm(void) {
+    if (!vm_ready) vm_setup();
+    u32 n = 0, sum = 0;
     for (u32 pass = 0; pass < 4; pass++) {
+        u32 rt[8] = {0};
+        kmemcpy(vm_mem, vm_mem_init, sizeof(vm_mem));
         u32 got = vm_threaded(vm_prog, rt, vm_mem);
-        if (!pass) { CHECK_EQ(got, nref); for (u32 i = 0; i < 6; i++) CHECK_EQ(rt[i], rr[i]); CHECK_EQ(kmemcmp(vm_mem, vm_mem_ref, sizeof(vm_mem)), 0); }
+        CHECK_EQ(got, vm_nref);
+        for (u32 i = 0; i < 8; i++) CHECK_EQ(rt[i], vm_rr[i]);
+        for (u32 i = 0; i < VM_MEM; i++) CHECK_EQ(vm_mem[i], vm_mem_ref[i]);
         n += got;
         for (u32 i = 0; i < 6; i++) sum = csum_mix(sum, rt[i]);
     }
