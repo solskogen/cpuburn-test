@@ -167,6 +167,21 @@ class BuildTests(unittest.TestCase):
         self.assertEqual(contents, archive_path.read_bytes())
         self.assertEqual(checksums, (directory / "SHA256SUMS").read_bytes())
 
+    def test_image_budget_is_the_floppy(self):
+        build = self.root / "build"
+        build.mkdir()
+        (build / "rm.bin").write_bytes(bytes(4096))
+        (build / "boot.bin").write_bytes(bytes(512))
+        args = ("-B", "-o", "build/rm.bin", "-o", "build/kernel.bin", "NASM=true", "floppy.img")
+        limit = (2880 - 1 - 8) * 512
+        (build / "kernel.bin").write_bytes(bytes(limit))
+        self.assertIn("2880 of 2880 sectors", self.make(*args))
+        self.assertEqual((self.root / "floppy.img").stat().st_size, 1474560)
+        (build / "kernel.bin").write_bytes(bytes(limit + 1))
+        with self.assertRaises(subprocess.CalledProcessError) as error:
+            self.make(*args)
+        self.assertIn("runtime too large for the 1.44 MB floppy", error.exception.stderr)
+
     def test_serial_build_record_preserved(self):
         line = 'BUILD version=0.1.0 compiler="GCC 16"'
         parsed = parse_log(line + "\n")

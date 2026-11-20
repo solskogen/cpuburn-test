@@ -1,5 +1,8 @@
-; Real-mode stub (flat binary, org 0, runs at 0x1000:0000, linear 0x10000). Padded to 4 KiB.
-; Gathers BIOS info, enables A20, validates RAM and relocates the runtime to 1 MiB.
+; Real-mode stub (flat binary, org 0, runs at 0x1000:0000, linear 0x10000). Padded to RM_SECTORS.
+; Gathers BIOS info, enables A20 and validates RAM for the whole runtime (file + BSS),
+; then reads the runtime from the boot disk one track per INT 13h call into a low
+; bounce buffer and copies each chunk to its final address at 1 MiB from a brief
+; 16-bit protected-mode window. Only the floppy capacity and RAM bound its size.
 bits 16
 org 0
 %ifndef KERNEL_BYTES
@@ -9,6 +12,17 @@ org 0
 %error KERNEL_END must include the linked runtime BSS
 %endif
 
+%define RM_SECTORS 8            ; size of this file; boot.asm loads it after the boot sector
+%define KERNEL_LBA (1 + RM_SECTORS)
+%define KERNEL_SECTORS ((KERNEL_BYTES + 511) / 512)
+%define KERNEL_BASE 0x100000
+%if KERNEL_BYTES < 1 || KERNEL_LBA + KERNEL_SECTORS > 2880
+%error runtime file does not fit the 1.44 MB floppy
+%endif
+%define BOUNCE_SEG 0x1100       ; linear 0x11000; even a 63-sector track ends below the
+                                ; 0x20000 DMA boundary
+%define BPB_SPT 0x7C18          ; geometry boot.asm left in its BPB (queried for HDD-style boot)
+%define BPB_HEADS 0x7C1A
 %define BOOTINFO 0x600          ; linear: filled for the kernel
 ; BOOTINFO layout:
 ;  +0  dword magic 'CBI1'
@@ -29,6 +43,11 @@ entry:
     mov ss, ax
     mov sp, 0x7000
     cld
+    mov [drive], dl
+    mov ax, [es:BPB_SPT]
+    mov [spt], ax
+    mov ax, [es:BPB_HEADS]
+    mov [heads], ax
     push dx
     mov di, BOOTINFO
     mov cx, 800 / 2
@@ -44,11 +63,6 @@ entry:
     mov si, lowmem_error
     jmp entry.errchar
 .enough_lowmem:
-    ; stop floppy motor (BIOS timer ISR will no longer run)
-    mov dx, 0x3F2
-    mov al, 0x0C
-    out dx, al
-
     ; known text mode for VGA output
     mov ax, 0x0003
     int 0x10
@@ -155,12 +169,13 @@ entry:
 .a20no:
     mov [es:BOOTINFO+24], eax
     test eax, eax
-    jnz .enter_pm
+    jnz .check_ram
     mov si, a20_error
 .errchar:
     lodsb
     test al, al
     jz .stop
+    out 0xe9, al
     mov ah, 0x0E
     mov bx, 7
     int 0x10
@@ -170,14 +185,127 @@ entry:
     hlt
     jmp .stop
 
-    ; --- protected mode ---
-.enter_pm:
+    ; --- validate RAM for file + BSS in 32-bit protected mode before any copy ---
+.check_ram:
     cli
     lgdt [gdtr]
     mov eax, cr0
     or al, 1
     mov cr0, eax
+    jmp dword 0x08:pm_check + 0x10000
+
+    ; --- back in real mode: load the runtime track by track ---
+load_kernel:
+    mov ax, cs
+    mov ds, ax
+    xor ax, ax
+    mov es, ax
+    mov ss, ax
+    mov sp, 0x7000
+    sti
+.next:
+    mov ax, [left]
+    test ax, ax
+    jz .done
+    mov ax, [lba]                   ; LBA -> CHS
+    xor dx, dx
+    div word [spt]
+    inc dx
+    mov [sec], dl
+    xor dx, dx
+    div word [heads]
+    mov [head], dl
+    mov [cyl], ax
+    mov ax, [spt]                   ; never cross a track: min(left, spt - sec + 1)
+    movzx bx, byte [sec]
+    sub ax, bx
+    inc ax
+    cmp ax, [left]
+    jbe .count
+    mov ax, [left]
+.count:
+    mov [cnt], ax
+    mov byte [tries], 5
+.retry:
+    mov ax, BOUNCE_SEG
+    mov es, ax
+    xor bx, bx
+    mov ax, [cyl]
+    mov ch, al
+    mov cl, ah
+    shl cl, 6
+    or cl, [sec]
+    mov dh, [head]
+    mov dl, [drive]
+    mov al, [cnt]
+    mov ah, 0x02
+    int 0x13
+    jnc .read
+    xor ah, ah
+    mov dl, [drive]
+    int 0x13
+    dec byte [tries]
+    jnz .retry
+    mov si, disk_error
+    jmp entry.errchar
+.read:
+    xor ax, ax
+    mov es, ax
+    call a20_check                  ; a BIOS call must not have left A20 off
+    jnz .copy
+    mov si, a20_error
+    jmp entry.errchar
+.copy:
+    call copy_chunk
+    mov ax, [cnt]
+    add [lba], ax
+    sub [left], ax
+    jmp .next
+.done:
+    cli
+    ; stop floppy motor (BIOS timer ISR will no longer run)
+    mov dx, 0x3F2
+    mov al, 0x0C
+    out dx, al
+    mov eax, cr0
+    or al, 1
+    mov cr0, eax
     jmp dword 0x08:pm32 + 0x10000
+
+; Copy [cnt] sectors from the bounce buffer to linear [dest] and advance [dest].
+; Real mode in and out (IF=1 on return); the copy runs in 16-bit protected mode.
+copy_chunk:
+    movzx ecx, word [cnt]
+    shl ecx, 7                      ; dwords
+    mov edi, [dest]
+    lea eax, [edi + ecx * 4]
+    mov [dest], eax
+    mov esi, BOUNCE_SEG * 16
+    cld
+    cli
+    mov eax, cr0
+    or al, 1
+    mov cr0, eax
+    jmp 0x18:.pm
+.pm:
+    mov ax, 0x10                    ; flat 4 GiB data
+    mov ds, ax
+    mov es, ax
+    a32 rep movsd
+    mov ax, 0x20                    ; 64 KiB limits again before real mode
+    mov ds, ax
+    mov es, ax
+    mov eax, cr0
+    and al, 0xFE
+    mov cr0, eax
+    jmp 0x1000:.rm
+.rm:
+    mov ax, cs
+    mov ds, ax
+    xor ax, ax
+    mov es, ax
+    sti
+    ret
 
 kbc_wait:
     mov cx, 0xFFFF
@@ -192,6 +320,19 @@ kbc_wait:
 
 a20_error: db 'CPUBURN: A20 unavailable; halted safely.', 0
 lowmem_error: db 'CPUBURN: 576 KiB conventional RAM required.', 0
+disk_error: db 'CPUBURN: disk read error loading the runtime; halted safely.', 0
+
+drive: db 0
+sec:   db 0
+head:  db 0
+tries: db 0
+spt:   dw 0
+heads: dw 0
+cyl:   dw 0
+cnt:   dw 0
+lba:   dw KERNEL_LBA
+left:  dw KERNEL_SECTORS
+dest:  dd KERNEL_BASE
 
 ; ZF=0 if A20 enabled (memory at 0:0x500 differs from FFFF:0x510)
 a20_check:
@@ -220,11 +361,26 @@ gdt:
     dq 0
     dq 0x00CF9A000000FFFF   ; 0x08 code32 flat
     dq 0x00CF92000000FFFF   ; 0x10 data32 flat
+    dq 0x00009A010000FFFF   ; 0x18 code16, base 0x10000 (this file)
+    dq 0x000092000000FFFF   ; 0x20 data16, real-mode limits
 gdtr:
-    dw 3*8-1
+    dw 5*8-1
     dd gdt + 0x10000
 
 bits 32
+pm_check:
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov ss, ax
+    mov esp, 0x7000
+    mov eax, KERNEL_END
+    mov ebx, BOOTINFO
+    call boot_ram_available
+    test eax, eax
+    jz ram_error
+    jmp 0x18:to_real
+
 pm32:
     mov ax, 0x10
     mov ds, ax
@@ -233,17 +389,7 @@ pm32:
     mov gs, ax
     mov ss, ax
     mov esp, 0x90000
-    mov eax, KERNEL_END
-    mov ebx, BOOTINFO
-    call boot_ram_available
-    test eax, eax
-    jz ram_error
-    cld
-    mov esi, 0x11000
-    mov edi, 0x100000
-    mov ecx, KERNEL_BYTES
-    rep movsb
-    jmp 0x08:0x100000
+    jmp 0x08:KERNEL_BASE
 
 ram_error:
     mov esi, ram_message + 0x10000
@@ -267,4 +413,17 @@ ram_error:
 ram_message: db 'CPUBURN: runtime extended RAM unavailable; halted safely.', 0
 %include "boot_memory.asm"
 
-times 4096-($-$$) db 0
+bits 16
+to_real:                            ; 16-bit protected mode, then real mode
+    mov ax, 0x20
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    mov ss, ax
+    mov eax, cr0
+    and al, 0xFE
+    mov cr0, eax
+    jmp 0x1000:load_kernel
+
+times RM_SECTORS*512-($-$$) db 0

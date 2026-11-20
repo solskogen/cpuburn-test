@@ -27,8 +27,8 @@ repetition; benchmark-enabled builds remain the default. See
 The floppy now relocates the runtime to 1 MiB after validating usable extended
 RAM, including BSS. Test allocations begin after the runtime; low-memory V86
 fixtures and the main stack retain their addresses. The 1.44 MB floppy format
-is unchanged. The current loader still stages the file below `0x70000`,
-with explicit size checks; BSS no longer consumes that staging budget.
+is unchanged. The loader reads the runtime one track at a time through a
+low bounce buffer, so the runtime may use the whole floppy.
 
 The optional 86Box runner accepts `--vm` with a VM directory or a direct
 configuration path, finds `86Box` on PATH by default, and preserves CPU,

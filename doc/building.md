@@ -67,32 +67,50 @@ the image layout, not guest page protections for self-modifying-code tests.
 
 ### Floppy boot and memory layout
 
-The 512-byte BIOS boot sector loads a 4 KiB bootstrap and the runtime file into
-low-memory staging. The bootstrap gathers the BIOS memory map, enables A20,
-enters protected mode and verifies that the entire runtime range, including
-BSS, is usable extended RAM before copying the file to `0x100000`.
+The 512-byte BIOS boot sector loads only the 4 KiB bootstrap (`rm.asm`, 8
+sectors). The bootstrap gathers the BIOS memory map, enables A20, and in a
+brief protected-mode call verifies that the entire runtime range, including
+BSS, is usable extended RAM **before reading any of the runtime**.
 Enabled E820 reservations override overlapping usable entries; adjacent usable
 entries may cover the range together. Without E820, the contiguous RAM size
 reported by E801 or INT 15h/AH=88 is checked. Missing RAM produces a visible
-halt, not an unchecked copy. Startup clears BSS, and the allocator places its
+halt (`runtime extended RAM unavailable`, also on port `0xE9`), not an
+unchecked copy. The bootstrap then reads the runtime with INT 13h one track per
+call (never a multi-track read; CHS from the boot sector's BPB, 18 sectors × 2
+heads × 80 cylinders on the 1.44 MB floppy, or the geometry the BIOS reports
+when it presents the image as a hard disk) into a bounce buffer at `0x11000`,
+and copies each track to its final address at `0x100000` with 32-bit
+`rep movsd` from a 16-bit protected-mode window, returning to real mode for the
+next read. Failed reads are retried five times with a drive reset, then halt
+with `disk read error`. Startup clears BSS, and the allocator places its
 reserved header and workload buffers after the linked runtime's end.
 The `MEM` record includes `kernel_start` and `kernel_end`.
 
 The main stack remains below `0x90000`, and V86 code/stack fixtures retain
-their low-memory addresses. The runtime and its exception tables/stacks stay
-inside the first 16 MiB identity-mapped window. This is still a normal
-1,474,560-byte raw floppy image, not an ISO.
+their low-memory addresses; the runtime is linked at 1 MiB and cannot overlap
+them, the loader or the bounce buffer. The runtime and its exception
+tables/stacks stay inside the first 16 MiB identity-mapped window. This is
+still a normal 1,474,560-byte raw floppy image, not an ISO.
 
-This first-stage relocation deliberately retains the existing bounded BIOS
-loader: bootstrap plus **file payload** must fit in 384 KiB of staging below
-`0x70000`. BSS does not occupy that file budget. Linker and image-size checks
-enforce both limits; relocation removes the former combined code/BSS
-low-memory limit, not every future size limit. Growing beyond the staging
-budget would require chunked loading through a reusable low-memory buffer.
-It does not require changing media format.
+Size limits, enforced by the linker script and the image recipe:
+
+- **Runtime file:** at most 2,871 sectors (1,469,952 bytes): the 1.44 MB floppy
+  minus the boot sector and the bootstrap. BSS does not occupy the floppy.
+- **Runtime end including BSS:** at most `0x3F0000`, so the arena's 64 KiB
+  header still fits below `0x400000` and `REQ_MEM8M` workloads keep their
+  `0x400000`–`0x7FFFFF` window. The bootstrap rejects machines whose
+  contiguous RAM from 1 MiB does not reach the runtime end.
+
+A boot with the 334,044-byte `-O2` runtime makes 39 INT 13h calls (one reset,
+one read for the bootstrap, one for the rest of track 0, then one per track),
+against 43 with the former loader, which staged the whole file below
+`0x70000` and also split reads at 64 KiB DMA boundaries.
 
 To exercise the actual bootstrap RAM validator and linker budgets, run
 `PYTHONPATH=tools python3 -m unittest discover -s tools/tests -p 'test_boot_memory.py' -v`.
+With NASM and QEMU installed, it also boots the real boot sector and bootstrap
+with a synthetic runtime that fills the floppy and checks every dword of it,
+and checks rejection with too little or no extended RAM.
 With QEMU installed and a full `BENCHMARKS=0` image, setting
 `CPUBURN_BOOT_IMAGE="$PWD/floppy.img"` for that command also checks relocated
 486 execution and safe rejection of a machine with no extended RAM.

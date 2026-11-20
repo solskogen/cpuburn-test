@@ -126,12 +126,15 @@ $(BUILD)/rm.bin: $(SRC)/rm.asm $(SRC)/boot_memory.asm $(BUILD)/kernel.elf $(BUIL
 	$(NASM) -f bin -I$(SRC)/ -DKERNEL_BYTES=$$(stat -c %s $(BUILD)/kernel.bin) \
 	    -DKERNEL_END=0x$$($(NM) -n $(BUILD)/kernel.elf | awk '$$3 == "_end" { print $$1 }') $< -o $@
 
+# boot.asm loads only rm.bin; rm.asm reads the runtime track by track, so the
+# limit is the floppy: boot sector + loader + runtime within 2880 sectors.
 $(IMAGE): $(SRC)/boot.asm $(BUILD)/rm.bin $(BUILD)/kernel.bin
-	@set -eu; bytes=$$(( $$(stat -c %s $(BUILD)/rm.bin) + $$(stat -c %s $(BUILD)/kernel.bin) )); \
-	secs=$$(( (bytes + 511) / 512 )); \
-	echo "stage2: $$bytes bytes, $$secs sectors"; \
-	test $$secs -le 768 || { echo "kernel too large for low-memory loader staging"; exit 1; }; \
-	$(NASM) -f bin -I$(SRC)/ -DSTAGE2_SECTORS=$$secs $(SRC)/boot.asm -o $(BUILD)/boot.bin; \
+	@set -eu; rm_secs=$$(( ($$(stat -c %s $(BUILD)/rm.bin) + 511) / 512 )); \
+	kernel_bytes=$$(stat -c %s $(BUILD)/kernel.bin); \
+	secs=$$(( 1 + rm_secs + (kernel_bytes + 511) / 512 )); \
+	echo "floppy: runtime $$kernel_bytes bytes, $$secs of 2880 sectors"; \
+	test $$secs -le 2880 || { echo "runtime too large for the 1.44 MB floppy" >&2; exit 1; }; \
+	$(NASM) -f bin -I$(SRC)/ -DSTAGE2_SECTORS=$$rm_secs $(SRC)/boot.asm -o $(BUILD)/boot.bin; \
 	cat $(BUILD)/boot.bin $(BUILD)/rm.bin $(BUILD)/kernel.bin > $(BUILD)/floppy.tmp; \
 	truncate -s 1474560 $(BUILD)/floppy.tmp; \
 	mv $(BUILD)/floppy.tmp $@

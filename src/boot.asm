@@ -1,10 +1,12 @@
-; Boot sector: loads STAGE2_SECTORS sectors from the boot drive to 0x1000:0000 (linear 0x10000), jumps there.
+; Boot sector: loads STAGE2_SECTORS sectors (the rm.asm loader) from the boot drive to 0x1000:0000
+; (linear 0x10000) and jumps there with DL = drive. rm.asm reads the runtime itself and reuses the
+; geometry left in this sector's BPB at 0x7C18/0x7C1A.
 ; Read-only use of the disk. Works for floppy and for BIOSes that present the image as a floppy/HDD (DL passed through).
 bits 16
 org 0x7C00
 
 %ifndef STAGE2_SECTORS
-%define STAGE2_SECTORS 64
+%define STAGE2_SECTORS 8
 %endif
 
 start:
