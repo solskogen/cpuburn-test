@@ -57,8 +57,10 @@ scripts or generated provenance headers. `VERSION` supplies the guest version;
 the compiler's built-in version string supplies its `BUILD` identification.
 Serial parsers/reports retain this record, including with plain COM1 logs.
 
-The default `-O2` preserves the established guest instruction mix and keeps the
-floppy payload compact. The runtime now executes at **1 MiB** in protected mode;
+The default `-O2` (the `OPT` make variable) preserves the established guest
+instruction mix the records were measured with; image size no longer decides
+it, and `make OPT=-O3` links and boots too (GCC: 461,020-byte runtime against
+334,044 at `-O2`). The runtime executes at **1 MiB** in protected mode;
 its zero-initialized state no longer competes with low-memory V86 fixtures.
 Diagnostic notes use the upper 32 KiB of
 the arena's already-reserved header, leaving workload allocations unchanged.

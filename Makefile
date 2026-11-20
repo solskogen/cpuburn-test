@@ -68,11 +68,12 @@ OBJCOPY ?= $(CROSS_COMPILE)objcopy
 NM ?= $(CROSS_COMPILE)nm
 endif
 
-# Keep -O2 for the established guest instruction mix and compact floppy payload.
-# The runtime executes in extended RAM; the BIOS loader still stages the file
-# below 0x70000. Keep that size check rather than dropping coverage to fit.
+# OPT defaults to -O2 for the established guest instruction mix the records and
+# their documented 86Box paths were measured with. Size no longer decides it:
+# the loader reads the runtime track by track, so OPT=-O3 also links and boots.
+OPT ?= -O2
 CFLAGS  = $(TARGET_FLAGS) -march=i486 -mtune=i486 $(STACK_FLAGS) \
-          -mno-sse -mno-mmx -mno-80387 -msoft-float -O2 -ffreestanding -fno-pic -fno-pie \
+          -mno-sse -mno-mmx -mno-80387 -msoft-float $(OPT) -ffreestanding -fno-pic -fno-pie \
           -fno-stack-protector -fno-builtin -fno-asynchronous-unwind-tables -fcf-protection=none -nostdlib -Wall -Wno-unused-function \
           -fno-strict-aliasing \
           -DROUNDS=$(ROUNDS) -DBURN_SECONDS=$(BURN_SECONDS) -DWATCHDOG_SECONDS=$(WATCHDOG_SECONDS) \
