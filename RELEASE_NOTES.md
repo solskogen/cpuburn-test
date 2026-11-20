@@ -50,32 +50,22 @@ redundant records once instead of sampling them. See
 
 ## Known results and limitations
 
-- MediaGX MMX (`mediagxm`) is integrated with the ECS P5GX-M source-bound
-  matrix. Full 306-record host-FPU accuracy runs complete in both engines
-  with identical outcomes: 201 PASS, 73 FAIL, 30 SKIP and 2 FAULT.
+- Default image on TestVM (Pentium II Deschutes 333, Virtual PC 2007,
+  dynarec, host FPU backend): 423 records, 312 PASS, 74 FAIL, 37 SKIP,
+  0 FAULT. Most failures are x87 checks that 86Box's default host-double
+  FPU backend cannot pass; with softfloat five non-FPU failures remain.
+  See [known results](README.md#known-results) for the list and the
+  86Box settings and fixes that clear them. Failures are findings, not
+  accepted baselines.
+- MediaGX MMX (`mediagxm`) runs on the ECS P5GX-M source-bound matrix.
   The CPU identity contract, GXm CPUID, Cyrix CPUID controls, disabled-SMM
-  checks and all fourteen aggregate/individual EMMI records pass.
-  Both focused benchmark runs pass those seventeen workloads plus the
-  identity contract; all seventeen have attributed samples and explicit
-  work units/scopes. These short samples verify wiring, not performance.
-  The two full-suite faults are `fpu_stack` and `fpu_p6`; failures/faults
-  remain findings, not accepted baselines or proof that every oracle is
-  correct. SoftFPU and positive CPU-side SMM execution are not newly validated.
-- The earlier 281-record MMX/dynarec integration image completed with 187 PASS,
-  72 FAIL, 22 SKIP and no FAULT. All 271 pre-vendor outcomes were unchanged;
-  the ten vendor records skipped correctly. All original 266 outcomes were
-  also unchanged by the boundary additions. These are observed emulator results, not expected
-  results to substitute for architectural checks.
-- The expanded 291-record MMX accuracy suite completed on both runtime
-  engines: host FPU 190 PASS / 73 FAIL / 28 SKIP, softfloat 258 PASS /
-  5 FAIL / 28 SKIP, with no FAULT. All previous host-FPU workload statuses
-  are unchanged apart from the strengthened identity contract, which now
-  detects the missing required DE advertisement. Backend differences are
-  retained as real outcomes, not accepted-failure baselines.
-- Focused baseline 3DNow! workloads pass on 86Box K6-2 in both engines.
-  K6-2+ additionally passes enhanced horizontal arithmetic and PSWAPD;
-  PI2FW/PF2IW lane/sign-extension checks fail in both engines, consistent with
-  the discrepancies described in README.md and AMD 22466D.
+  checks and the EMMI records pass in both engines. Earlier full runs
+  faulted in `fpu_stack` and `fpu_p6`; this has not been rechecked with the
+  current image.
+- Baseline 3DNow! workloads pass on 86Box K6-2 in both engines. K6-2+
+  also passes enhanced horizontal arithmetic and PSWAPD; its PI2FW/PF2IW
+  lane/sign-extension checks fail in both engines, consistent with AMD
+  22466D (see [results](doc/results.md)).
 - All twelve EMMI opcodes pass the selected 6x86MX cases in both engines.
   Intel MMX, 486DX and 486SX correctly skip unavailable vendor features.
 - Host-side throughput numbers require matched builds/configurations and
@@ -110,5 +100,6 @@ cross-toolchain using `make CROSS_COMPILE=i686-linux-gnu-`.
 NASM, make and GNU utilities run natively on the build host.
 Python is only needed for optional tests and host runner/reporting tools,
 not image compilation or release packaging. No x86 sysroot/libc or
-guest emulator is needed for compilation. CI contains both aarch64 build
-paths; configured jobs do not constitute a completed native-ARM validation.
+guest emulator is needed for compilation. Clang is the checked path; the
+GNU cross-toolchain option is not tested, and no native-ARM build has been
+validated.

@@ -208,17 +208,17 @@ README, release notes, MIT license and checksums for every artifact.
 Use `SHA256SUMS` for the actual image identity rather
 than copying a hash from an older README.
 
-The source tarball contains build sources, host tools, documentation and CI;
+The source tarball contains build sources, host tools and documentation;
 it excludes Git metadata, build products, VM state, captured logs and ROMs.
 Rebuild it with the same tool versions/settings as the original release. With matching
 inputs/toolchain, artifacts contain no build timestamp or absolute build
 directory. Builds do not inspect Git or generate source/build digest headers.
 This is not a claim that different compiler versions produce identical images.
 
-The CI workflow builds with x86-64 GCC/Clang and aarch64 Clang/GNU-cross,
-runs the Python tool tests and checks packaged hashes. A separate job runs
-`make guest-test`, which boots three focused images under QEMU.
-It does not run 86Box regression comparisons or
+There is no hosted CI. Before a release, run `make test`, `make release`
+with both GCC and `CC=clang` (Clang covers the cross-build path; it targets
+i386 explicitly on any host) and `make guest-test`, which boots three focused
+images under QEMU. None of these run 86Box regression comparisons or
 decide which emulator failures are acceptable. Guest execution still requires
 the user's selected emulator, machine and locally supplied ROMs.
 See [RELEASE_NOTES.md](../RELEASE_NOTES.md) for preview limitations.

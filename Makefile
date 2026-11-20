@@ -103,7 +103,7 @@ OBJS    = $(SRCS:%.c=$(BUILD)/%.o) $(BUILD)/start.o
 DIST    = dist/cpuburn-test-$(VERSION)
 SOURCES = $(sort .gitignore LICENSE VERSION README.md RELEASE_NOTES.md Makefile \
           $(wildcard $(SRC)/*.c $(SRC)/*.h $(SRC)/*.asm $(SRC)/*.ld tools/*.py tools/tests/*.py \
-                     doc/*.md .github/workflows/*))
+                     doc/*.md))
 
 all: $(IMAGE)
 

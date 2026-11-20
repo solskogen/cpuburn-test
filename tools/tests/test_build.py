@@ -34,8 +34,6 @@ class BuildTests(unittest.TestCase):
         (self.root / "tools/test.py").write_text("# source\n")
         (self.root / "doc").mkdir()
         (self.root / "doc/cpu-contracts.md").write_text("# CPU contracts\n")
-        (self.root / ".github/workflows").mkdir(parents=True)
-        (self.root / ".github/workflows/build.yml").write_text("name: test\n")
 
     def make(self, *args):
         # Make exports command-line overrides such as `make guest-test BUILD=x`
@@ -164,7 +162,6 @@ class BuildTests(unittest.TestCase):
         with tarfile.open(fileobj=io.BytesIO(contents), mode="r:gz") as archive:
             names = archive.getnames()
             self.assertIn("cpuburn-test-0.1.0/tools/test.py", names)
-            self.assertIn("cpuburn-test-0.1.0/.github/workflows/build.yml", names)
             self.assertIn("cpuburn-test-0.1.0/doc/cpu-contracts.md", names)
             self.assertIn("cpuburn-test-0.1.0/src/core.c", names)
             self.assertNotIn("cpuburn-test-0.1.0/build/secret.log", names)
