@@ -540,13 +540,27 @@ def _dso(text):
     return match[1] if match else ""
 
 
-def parse_perf_script(lines, windows):
+def parse_perf_script(lines, windows, leaves=None):
     """Attribute leaf and inclusive stacks only to interior step intervals.
 
     A leaf in an anonymous executable mapping (perf shows `[unknown]`, or the
     JIT's /tmp/perf-PID.map when 86Box writes one) counts as dynarec-generated
-    code; jit_share is the fraction of a workload's samples there."""
+    code; jit_share is the fraction of a workload's samples there.
+
+    leaves, when given, is the same perf.data printed with --hide-call-graph
+    (one `time: ip sym (dso)` line per sample, in the same order): each
+    sample's leaf is then its own IP. Without it the leaf is the first
+    callchain row, and a sample whose callchain is empty (DWARF unwinding
+    cannot start in generated code, which has no CFI) has no leaf."""
     starts = [window[0] for window in windows]
+    leaves = iter(leaves) if leaves is not None else None
+
+    def sample_leaf(stamp):
+        for line in leaves:
+            match = re.match(r"^\s*(\d+\.\d+):\s+(.*)$", line)
+            if match and match[1] == stamp:
+                return symbol_text(match[2]) or None
+        return None
     counts = {}
     current = None
     stack = set()
@@ -575,6 +589,11 @@ def parse_perf_script(lines, windows):
             current, stack, leaf_pending = None, set(), False
             stamp = float(match[1])
             symbol = symbol_text(match[2])
+            if leaves is not None:
+                own = sample_leaf(match[1])
+                if own and not symbol:
+                    stack.add(own)
+                symbol = own or symbol
             index = bisect.bisect_right(starts, stamp) - 1
             if index >= 0 and stamp < windows[index][1]:
                 current = windows[index][2]
@@ -711,14 +730,28 @@ class PerfRecorder:
         if not data.is_file() or data.stat().st_size == 0:
             raise self._error("perf record produced no nonempty perf.data")
         command = [self.command[0], "script", "--ns", "-i", str(data), "-F", "time,ip,sym,dso"]
+        # A second stream gives each sample's own IP as its leaf: callchains
+        # are empty for samples in generated code, the JIT share's subject.
+        leaf_command = command + ["--hide-call-graph"]
         with (self.directory / "perf-script.log").open("w") as errors:
             process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=errors,
                                        text=True, errors="replace")
+            leaf_process = None
+            if self.call_graph != "none":
+                leaf_process = subprocess.Popen(leaf_command, stdout=subprocess.PIPE,
+                                                stderr=errors, text=True, errors="replace")
             try:
-                hotpaths = parse_perf_script(process.stdout, windows)
+                hotpaths = parse_perf_script(process.stdout, windows,
+                                             leaf_process.stdout if leaf_process else None)
             finally:
                 process.stdout.close()
                 code = process.wait()
+                if leaf_process is not None:
+                    leaf_process.stdout.close()
+                    leaf_code = leaf_process.wait()
+                    # Closing the pipe early ends it with SIGPIPE: not a failure.
+                    if leaf_code not in (0, -signal.SIGPIPE, 128 + signal.SIGPIPE):
+                        code = code or leaf_code
         if code:
             raise RuntimeError("perf script failed; see perf-script.log")
         samples = sum(v["samples"] for v in hotpaths.values())

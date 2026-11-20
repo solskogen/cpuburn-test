@@ -285,8 +285,12 @@ class PerfTests(unittest.TestCase):
             (Path(directory) / "perf.data").write_bytes(b"recording")
 
             def script(command, stdout, stderr, **options):
-                self.assertEqual(command[-1], "time,ip,sym,dso")
+                self.assertIn("time,ip,sym,dso", command)
                 self.assertEqual(stdout, subprocess.PIPE)
+                if command[-1] == "--hide-call-graph":
+                    output = io.StringIO(" 10.100000000:  abc leaf (86Box)\n")
+                    return SimpleNamespace(stdout=output, wait=lambda: 0)
+                self.assertEqual(command[-1], "time,ip,sym,dso")
                 output = io.StringIO(" 10.100000000: \n\t abc leaf (86Box)\n"
                                      "\t def caller (86Box)\n\n")
                 return SimpleNamespace(stdout=output, wait=lambda: 0)
@@ -489,6 +493,20 @@ class PerfJitTests(unittest.TestCase):
         ], [(10, 11, 1)])
         self.assertEqual(report["1"]["jit_samples"], 3)
         self.assertEqual(report["1"]["jit_share"], .75)
+
+    def test_leaf_stream_supplies_ip_for_empty_callchains(self):
+        # DWARF unwinding yields no callchain rows for samples in JIT code.
+        stacks = [" 10.1: \n", "\n",
+                  " 10.2: \n", "\t4000 exec386 (/usr/bin/86Box)\n",
+                  "\t3000 main (/usr/bin/86Box)\n", "\n"]
+        leaves = [" 10.1:  7f00 [unknown] (/tmp/perf-42.map)\n",
+                  " 10.2:  4000 exec386 (/usr/bin/86Box)\n"]
+        without = parse_perf_script(stacks, [(10, 11, 1)])
+        self.assertEqual(without["1"]["jit_samples"], 0)
+        report = parse_perf_script(stacks, [(10, 11, 1)], leaves)
+        self.assertEqual(report["1"]["samples"], 2)
+        self.assertEqual(report["1"]["jit_samples"], 1)
+        self.assertEqual(dict(report["1"]["leaf_hotpaths"])["exec386 (/usr/bin/86Box)"], 1)
 
     def test_record_targets_thread_and_starts_disabled(self):
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:

@@ -384,7 +384,10 @@ interior sampling steps, without writing a script file. Unresolved symbols
 retain their instruction addresses instead of collapsing every JIT location
 into one `[unknown]` bucket; `jit_share` is the fraction of samples whose
 leaf lies in an anonymous executable mapping or `[unknown]`, i.e. generated
-code. If 86Box wrote `/tmp/perf-<pid>.map`, perf uses it and `perf_map`
+code. Each sample's leaf is its own IP, read from a second streamed
+`perf script --hide-call-graph` pass, because DWARF unwinding produces an
+empty callchain for samples in generated code (it has no unwind tables);
+inclusive hotpaths come from the callchains. If 86Box wrote `/tmp/perf-<pid>.map`, perf uses it and `perf_map`
 names it. Useful callchains still depend
 on emulator symbols and host unwinding support; raw samples remain in
 `perf.data`.
