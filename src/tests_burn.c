@@ -39,9 +39,17 @@ static u32 mmx_work(void) {
     CHECK_EQ((u32)result,224); CHECK_EQ((u32)(result>>32),96);
     return (u32)result^(u32)(result>>32);
 }
+/* Exact compare with REPE CMPSD (bytes is a multiple of 4): the byte-loop
+   kmemcmp cost several times more than the copy being measured. */
+static u32 words_differ(const u8 *a,const u8 *b,u32 n) {
+    u32 left=n/4;
+    __asm__ volatile("cld; repe cmpsl" : "+S"(a),"+D"(b),"+c"(left) :: "memory","cc");
+    if(left) return 1;
+    return ((const u32 *)a)[-1]!=((const u32 *)b)[-1];
+}
 static u32 memory_work(void) {
     kmemcpy(dst,src,bytes);
-    CHECK_EQ(kmemcmp(dst,src,bytes),0);
+    CHECK_EQ(words_differ(dst,src,bytes),0);
     u32 h=0; for(u32 i=0;i<bytes;i+=64) h=csum_mix(h,dst[i]);
     return h;
 }

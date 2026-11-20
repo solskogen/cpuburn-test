@@ -202,6 +202,15 @@ static void hp_pf(regs_t *r) {
     hp_map(hp_missing, phys);
 }
 
+static void hp_restore_missing(void) {
+    if (hp_pt[hp_missing]) return;
+    u32 phys;
+    if (hp_missing < 6) phys = (u32)hp_data + (hp_missing - 4) * HP_PAGE;
+    else if (hp_missing < 8) phys = (u32)hp_src + (hp_missing - 6) * HP_PAGE;
+    else phys = (u32)hp_stack + (hp_missing - 8) * HP_PAGE;
+    hp_map(hp_missing, phys);
+}
+
 static void hp_int80(regs_t *r) {
     hp_exits++;
     kmemcpy(&hp_exit, r, sizeof hp_exit);
@@ -369,9 +378,9 @@ static void hp_rep_body(void) {
         CHECK_EQ(hp_data[HP_PAGE - 257], 0xA5);
         CHECK_EQ(hp_data[HP_PAGE + 256], 0xA5);
         hp_sum += value;
-        /* Restore whichever half was missing before preparing the next case. */
-        hp_map(4, (u32)hp_data); hp_map(5, (u32)hp_data + HP_PAGE);
-        hp_map(6, (u32)hp_src); hp_map(7, (u32)hp_src + HP_PAGE);
+        /* hp_pf already remapped the missing page; remapping all four pages
+           cost four extra INVLPGs (whole-TLB flushes in 86Box) per case. */
+        hp_restore_missing();
     }
     t_note("partial_REP_restarts=%u movsd_elements=%u forward/backward source/destination whole_state", count, count * 128);
     t_ops(count * 128);
@@ -404,7 +413,7 @@ static void hp_stack_body(void) {
         CHECK_EQ(hp_stack[HP_PAGE - 3], 0x5A);
         CHECK_EQ(hp_stack[HP_PAGE + 2], 0xA5);
         hp_sum += got;
-        hp_map(8, (u32)hp_stack); hp_map(9, (u32)hp_stack + HP_PAGE);
+        hp_restore_missing();
     }
     t_note("split_stack_restarts=%u push=%u pop=%u ESP/registers/flags/segments/exact_EIP checked",
            count, count / 2, count / 2);

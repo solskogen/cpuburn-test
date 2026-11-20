@@ -1,5 +1,7 @@
 #include "kernel.h"
 
+#define MEM_NOINLINE __attribute__((noinline))
+
 static u32 rng(u32 *s) { *s = *s * 1664525u + 1013904223u; return *s; }
 static u32 mem_walk(void) {
     u32 bytes = arena_size > 0x200000 ? 0x200000 : arena_size & ~4095u;
@@ -86,28 +88,144 @@ static u32 mem_bandwidth(void) {
     mem_sink = sum; return sum;
 }
 
+/* Unaligned load/store mix: 4 stores and 5 loads per offset. The byte-loop
+   reference runs once (per variant) on a scratch buffer; timed invocations
+   compare a checksum of every readback and of the final bytes against it. */
+#define UA_GUARD 16u
 static u32 ref_load(const u8 *p, u32 n) { u32 v = 0; for (u32 i = 0; i < n; i++) v |= (u32)p[i] << (8 * i); return v; }
 static void ref_store(u8 *p, u32 n, u32 v) { for (u32 i = 0; i < n; i++) p[i] = v >> (8 * i); }
-static u32 mem_unaligned(void) {
-    u8 *p = arena_alloc(8192, 4096), *r = arena_alloc(8192, 4096);
-    if (!p || !r) SKIP("arena too small");
-    for (u32 i = 0; i < 8192; i++) p[i] = r[i] = i ^ (i >> 8);
-    for (u32 region = 0; region < 2; region++) {
-        u32 base = region ? 4096 - 64 : 0;
-        for (u32 j = 0; j < 128; j++) {
-            u32 off = base + j, v = j * 0xABC123u + 0x176423;
-            *(volatile u32 *)(p + off) = v; ref_store(r + off, 4, v);
-            CHECK_EQ(*(volatile u32 *)(p + off), ref_load(r + off, 4));
-            *(volatile u16 *)(p + off + 1) = v >> 8; ref_store(r + off + 1, 2, v >> 8);
-            CHECK_EQ(*(volatile u32 *)(p + off), ref_load(r + off, 4));
-            *(volatile u8 *)(p + off + 2) = (u8)~v; ref_store(r + off + 2, 1, ~v);
-            CHECK_EQ(*(volatile u32 *)(p + off), ref_load(r + off, 4));
-            *(volatile u32 *)(p + off + 1) = ~v; ref_store(r + off + 1, 4, ~v);
-            CHECK_EQ(*(volatile u16 *)(p + off + 2), ref_load(r + off + 2, 2));
-            CHECK_EQ(*(volatile u32 *)(p + off), ref_load(r + off, 4));
-        }
+static u32 ua_value(u32 j, u32 pass) { return (j * 0xABC123u + 0x176423u) ^ (pass * 0x9E3779B9u); }
+static u32 ua_span_lo(u32 base) { return (base - UA_GUARD) & ~3u; }
+static u32 ua_span_hi(u32 base, u32 count) { return (base + count + 4u + UA_GUARD + 3u) & ~3u; }
+static u32 ua_pattern(u32 i) {
+    u32 d = 0;
+    for (u32 k = 0; k < 4; k++) d |= (u32)(u8)((i + k) ^ ((i + k) >> 8) ^ 0x5Au) << (8 * k);
+    return d;
+}
+static void ua_init(u8 *p, u32 base, u32 count) {
+    for (u32 i = ua_span_lo(base); i < ua_span_hi(base, count); i += 4)
+        *(volatile u32 *)(p + i) = ua_pattern(i);
+}
+static MEM_NOINLINE u32 ua_hw(u8 *p, u32 base, u32 count, u32 pass, u32 s) {
+    for (u32 j = 0; j < count; j++) {
+        u32 off = base + j, v = ua_value(j, pass);
+        *(volatile u32 *)(p + off) = v;
+        s = csum_mix(s, *(volatile u32 *)(p + off));
+        *(volatile u16 *)(p + off + 1) = v >> 8;
+        s = csum_mix(s, *(volatile u32 *)(p + off));
+        *(volatile u8 *)(p + off + 2) = (u8)~v;
+        s = csum_mix(s, *(volatile u32 *)(p + off));
+        *(volatile u32 *)(p + off + 1) = ~v;
+        s = csum_mix(s, *(volatile u16 *)(p + off + 2));
+        s = csum_mix(s, *(volatile u32 *)(p + off));
     }
-    CHECK_EQ(kmemcmp(p, r, 8192), 0); t_ops(256 * 9); return ref_load(r + 4095, 4);
+    return s;
+}
+static u32 ua_ref(u8 *r, u32 base, u32 count, u32 pass, u32 s) {
+    for (u32 j = 0; j < count; j++) {
+        u32 off = base + j, v = ua_value(j, pass);
+        ref_store(r + off, 4, v);
+        s = csum_mix(s, ref_load(r + off, 4));
+        ref_store(r + off + 1, 2, v >> 8);
+        s = csum_mix(s, ref_load(r + off, 4));
+        ref_store(r + off + 2, 1, ~v);
+        s = csum_mix(s, ref_load(r + off, 4));
+        ref_store(r + off + 1, 4, ~v);
+        s = csum_mix(s, ref_load(r + off + 2, 2));
+        s = csum_mix(s, ref_load(r + off, 4));
+    }
+    return s;
+}
+static u32 ua_bytes_sum(const u8 *lo_page, const u8 *hi_page, u32 base, u32 count, u32 s) {
+    for (u32 i = ua_span_lo(base); i < ua_span_hi(base, count); i++)
+        s = csum_mix(s, i < 4096u ? lo_page[i] : hi_page[i - 4096u]);
+    return s;
+}
+
+#define UA_PLAIN_PASSES (16u * HEAVY_SCALE)
+static const u32 ua_plain_base[2] = { 64u, 4096u - 64u };
+static u32 mem_unaligned(void) {
+    static u32 ref_sum, ref_bytes;
+    static int ref_ok;
+    u8 *p = arena_alloc(8192, 4096);
+    if (!p) SKIP("arena too small");
+    if (!ref_ok) {
+        u8 *r = arena_alloc(8192, 4096);
+        if (!r) SKIP("arena too small");
+        u32 sum = 0, bytes = 0;
+        for (u32 g = 0; g < 2; g++) ua_init(r, ua_plain_base[g], 128);
+        for (u32 pass = 0; pass < UA_PLAIN_PASSES; pass++)
+            for (u32 g = 0; g < 2; g++) sum = ua_ref(r, ua_plain_base[g], 128, pass, sum);
+        for (u32 g = 0; g < 2; g++) bytes = ua_bytes_sum(r, r + 4096, ua_plain_base[g], 128, bytes);
+        ref_sum = sum;
+        ref_bytes = bytes;
+        ref_ok = 1;
+    }
+    u32 sum = 0, bytes = 0;
+    for (u32 g = 0; g < 2; g++) ua_init(p, ua_plain_base[g], 128);
+    for (u32 pass = 0; pass < UA_PLAIN_PASSES; pass++)
+        for (u32 g = 0; g < 2; g++) sum = ua_hw(p, ua_plain_base[g], 128, pass, sum);
+    for (u32 g = 0; g < 2; g++) bytes = ua_bytes_sum(p, p + 4096, ua_plain_base[g], 128, bytes);
+    CHECK_EQ(sum, ref_sum);
+    CHECK_EQ(bytes, ref_bytes);
+    t_ops(UA_PLAIN_PASSES * 256u * 9u);
+    t_work_unit("access");
+    return sum ^ bytes;
+}
+
+/* Offsets 4093-4095 of a two-page window whose pages map to non-contiguous
+   physical frames (page 0 -> frame 2, page 1 -> frame 0), so every access
+   needs two translations. Frames 1 and 3 are sentinels. */
+#define UA_SPLIT_VA 0x5C000000u
+#define UA_SPLIT_BASE 4093u
+#define UA_SPLIT_COUNT 3u
+#define UA_SPLIT_PASSES (1024u * HEAVY_SCALE)
+static u32 mem_unaligned_page_split(void) {
+    static u32 ref_sum, ref_bytes;
+    static int ref_ok;
+    const u32 pde = UA_SPLIT_VA >> 22;
+    if (pg_dir[pde]) SKIP("scratch page-directory slot is occupied");
+    u32 *pd = arena_alloc(4096, 4096), *pt = arena_alloc(4096, 4096);
+    u8 *frames = arena_alloc(4 * 4096, 4096);
+    if (!pd || !pt || !frames) SKIP("arena too small");
+    if (!ref_ok) {
+        u8 *r = arena_alloc(8192, 4096);
+        if (!r) SKIP("arena too small");
+        u32 sum = 0;
+        ua_init(r, UA_SPLIT_BASE, UA_SPLIT_COUNT);
+        for (u32 pass = 0; pass < UA_SPLIT_PASSES; pass++)
+            sum = ua_ref(r, UA_SPLIT_BASE, UA_SPLIT_COUNT, pass, sum);
+        ref_bytes = ua_bytes_sum(r, r + 4096, UA_SPLIT_BASE, UA_SPLIT_COUNT, 0);
+        ref_sum = sum;
+        ref_ok = 1;
+    }
+    u8 *lo = frames + 2 * 4096, *hi = frames;
+    kmemcpy(pd, pg_dir, 4096);
+    kmemset(pt, 0, 4096);
+    kmemset(frames + 4096, 0xA5, 4096);
+    kmemset(frames + 3 * 4096, 0x5A, 64);
+    pt[0] = (u32)lo | 3u;
+    pt[1] = (u32)hi | 3u;
+    pd[pde] = (u32)pt | 3u;
+    u32 old_cr3 = rd_cr3();
+    wr_cr3((u32)pd);
+    u8 *w = (u8 *)UA_SPLIT_VA;
+    u32 sum = 0;
+    ua_init(w, UA_SPLIT_BASE, UA_SPLIT_COUNT);
+    for (u32 pass = 0; pass < UA_SPLIT_PASSES; pass++)
+        sum = ua_hw(w, UA_SPLIT_BASE, UA_SPLIT_COUNT, pass, sum);
+    wr_cr3(old_cr3);
+    u32 bytes = ua_bytes_sum(lo, hi, UA_SPLIT_BASE, UA_SPLIT_COUNT, 0);
+    CHECK_EQ(sum, ref_sum);
+    CHECK_EQ(bytes, ref_bytes);
+    u32 sentinel_bad = 0;
+    for (u32 i = 0; i < 4096; i++) sentinel_bad += frames[4096 + i] != 0xA5;
+    for (u32 i = 0; i < 64; i++) sentinel_bad += frames[3 * 4096 + i] != 0x5A;
+    CHECK_EQ(sentinel_bad, 0);
+    t_ops(UA_SPLIT_PASSES * UA_SPLIT_COUNT * 9u);
+    t_work_unit("access");
+    t_note("passes=%u offsets=4093-4095 page0_frame=%08x page1_frame=%08x", UA_SPLIT_PASSES, (u32)lo, (u32)hi);
+    return sum ^ bytes;
 }
 
 static volatile u32 lock_word;
@@ -174,8 +292,6 @@ static u32 mem_cache_ctl(void) {
     return cache_page[128];
 }
 
-#define MEM_NOINLINE __attribute__((noinline))
-
 /* An integer and call loop over a small buffer, as firmware runs it: the
    CPU's caches off (CR0.CD set, NW clear, as an Award BIOS's setup screen
    runs). Checked against the same loop with the caches on. */
@@ -196,7 +312,12 @@ static MEM_NOINLINE u32 uncached_loop(u32 *buf, u32 n) {
 static u32 mem_cache_off_loop(void) {
     u32 *buf = arena_alloc(64 * 4, 64); if (!buf) SKIP("arena too small");
     const u32 n = 20000;
-    u32 ref = uncached_loop(buf, n);
+    static u32 ref;
+    static int ref_ok;
+    if (!ref_ok) {
+        ref = uncached_loop(buf, n);
+        ref_ok = 1;
+    }
     u32 cr0 = rd_cr0();
     wr_cr0((cr0 | 0x40000000u) & ~0x20000000u);
     u32 got = uncached_loop(buf, n);
@@ -258,6 +379,7 @@ const test_t tests_mem[] = {
     {"mem_walk", mem_walk, REQ_PAGING, T_CHECK},
     {"mem_bandwidth", mem_bandwidth, REQ_PAGING, T_CHECK},
     {"mem_unaligned", mem_unaligned, REQ_PAGING},
+    {"mem_unaligned_page_split", mem_unaligned_page_split, REQ_PAGING},
     {"mem_lock", mem_lock, REQ_PAGING | REQ_486, T_CHECK},
     {"mem_cache_ctl", mem_cache_ctl, REQ_PAGING | REQ_486 | REQ_NOHV, T_CHECK},
     {"mem_cache_off_loop", mem_cache_off_loop, REQ_486 | REQ_NOHV},

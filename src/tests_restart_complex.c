@@ -20,6 +20,8 @@ static volatile u32 *rcx_pd, *rcx_pt;
 static u8 *rcx_code, *rcx_data, *rcx_stack;
 static u32 rcx_phys[RCX_WINDOW_PAGES];
 static u32 rcx_missing, rcx_fault_eip, rcx_fault_access;
+#define RCX_NONE (~0u)
+static u32 rcx_absent = RCX_NONE;
 static u32 rcx_fault_count, rcx_exit_count;
 static u32 rcx_fault_addr, rcx_fault_vec, rcx_fault_err, rcx_fault_ip;
 static volatile u32 rcx_fault_cs;
@@ -64,6 +66,8 @@ static u32 rcx_get32(const u8 *p) {
 
 static void rcx_map(u32 page, int present) {
     rcx_pt[page] = present ? rcx_phys[page] | 7u : 0;
+    if (!present) rcx_absent = page;
+    else if (rcx_absent == page) rcx_absent = RCX_NONE;
     invlpg((void *)(RCX_BASE + page * RCX_PAGE));
 }
 
@@ -100,9 +104,12 @@ static void rcx_case_begin(u32 missing_page, u32 access) {
     rcx_fault_addr = rcx_fault_vec = rcx_fault_err = 0;
     rcx_fault_cs = rcx_fault_ip = 0;
     kmemset(&rcx_exit, 0, sizeof rcx_exit);
-    for (u32 i = 0; i < RCX_WINDOW_PAGES; i++)
-        rcx_map(i, rcx_phys[i] != 0);
-    rcx_map(missing_page, 0);
+    /* At most one window page is ever absent; 86Box INVLPG flushes the whole
+       TLB, so touch only the page that changes. */
+    if (rcx_absent != missing_page) {
+        if (rcx_absent != RCX_NONE) rcx_map(rcx_absent, 1);
+        rcx_map(missing_page, 0);
+    }
 }
 
 static void rcx_user_init(const rcx_state_t *s) {
@@ -230,6 +237,7 @@ static u32 rcx_prepare(void (*body)(void)) {
     rcx_pd[RCX_BASE >> 22] = (u32)rcx_pt | 7u;
     for (u32 i = 0; i < RCX_WINDOW_PAGES; i++)
         if (rcx_phys[i]) rcx_pt[i] = rcx_phys[i] | 7u;
+    rcx_absent = RCX_NONE;
     rcx_sum = 0;
     int_hook[14] = rcx_pf;
     int_hook[0x80] = rcx_int80;
