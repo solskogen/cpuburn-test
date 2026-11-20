@@ -42,6 +42,22 @@ $(error BENCHMARKS must be 0 or 1)
 endif
 endif
 ONLY ?=
+# QUICK=1 checks QUICK_RECORDS once (like BENCHMARKS=0) instead of sampling
+# them. They still run and report PASS/FAIL, so no feature goes untested; only
+# their capacity numbers are dropped. The default list holds sampled records
+# whose capacity tracked another record's in recorded full runs, and that cost
+# the most host time.
+QUICK ?= 0
+empty :=
+space := $(empty) $(empty)
+ifeq ($(filter 0 1,$(QUICK)),)
+$(error QUICK must be 0 or 1)
+endif
+QUICK_RECORDS ?= restart_iret,restart_enter_leave,restart_far_call_retf,heavy_pg_stack_restart,\
+int_smc_mixed_k2_h1,int_smc_mixed_k8_h16,int_smc_mixed_k8_h1,int_smc_alu_family_exit,\
+int_smc_rate_op_k1_n16,int_smc_rate_k8_n16,int_smc_rate_k16_n16,heavy_pg_split_data,\
+heavy_pg_rep_restart,int_bn_muladd,int_smc_rate_k1_n16,int_smc_rate_k16_n256
+QUICK_LIST := $(if $(filter 1,$(QUICK)),$(subst $(space),,$(QUICK_RECORDS)))
 # Output locations; guest-test uses separate ones so it leaves these alone.
 BUILD ?= build
 IMAGE ?= floppy.img
@@ -77,7 +93,7 @@ CFLAGS  = $(TARGET_FLAGS) -march=i486 -mtune=i486 $(STACK_FLAGS) \
           -fno-stack-protector -fno-builtin -fno-asynchronous-unwind-tables -fcf-protection=none -nostdlib -Wall -Wno-unused-function \
           -fno-strict-aliasing \
           -DROUNDS=$(ROUNDS) -DBURN_SECONDS=$(BURN_SECONDS) -DWATCHDOG_SECONDS=$(WATCHDOG_SECONDS) \
-          -DHEAVY_SCALE=$(HEAVY_SCALE) -DTEST_SECONDS=$(TEST_SECONDS) -DONLY='"$(ONLY)"' \
+          -DHEAVY_SCALE=$(HEAVY_SCALE) -DTEST_SECONDS=$(TEST_SECONDS) -DONLY='"$(ONLY)"' -DQUICK_CHECK='"$(QUICK_LIST)"' \
           -DBENCHMARKS=$(BENCHMARKS) -DSUITE_BENCHMARK=$(if $(filter benchmark,$(SUITE)),1,0) \
           -DCPUBURN_VERSION='"$(VERSION)"'
 # Per-file overrides: FPU/MMX test files need the FPU/MMX instruction sets enabled (inline asm only, no compiler FP code on 486 path).
@@ -121,6 +137,9 @@ $(BUILD)/kernel.bin: $(BUILD)/kernel.elf
 	$(OBJCOPY) -O binary $< $@
 	$(if $(ONLY),@bad=; for t in $(subst $(comma), ,$(ONLY)); do \
 	    tr '\0' '\n' < $@ | grep -qxF -- "$$t" || { echo "ONLY: no test named '$$t'" >&2; bad=1; }; \
+	done; test -z "$$bad")
+	$(if $(QUICK_LIST),@bad=; for t in $(subst $(comma), ,$(QUICK_LIST)); do \
+	    tr '\0' '\n' < $@ | grep -qxF -- "$$t" || { echo "QUICK_RECORDS: no test named '$$t'" >&2; bad=1; }; \
 	done; test -z "$$bad")
 
 $(BUILD)/rm.bin: $(SRC)/rm.asm $(SRC)/boot_memory.asm $(BUILD)/kernel.elf $(BUILD)/kernel.bin Makefile | $(BUILD)
@@ -171,8 +190,8 @@ release: $(IMAGE)
 	cp $(IMAGE) $(DIST)/floppy.img
 	cp LICENSE README.md RELEASE_NOTES.md $(DIST)/
 	cp -r doc $(DIST)/
-	{ printf 'version=%s\nsuite=%s\nrounds=%s\nbenchmarks=%s\nburn_seconds=%s\ntest_seconds=%s\nheavy_scale=%s\nwatchdog_seconds=%s\nonly=%s\n' \
-	    '$(VERSION)' '$(SUITE)' '$(ROUNDS)' '$(BENCHMARKS)' '$(BURN_SECONDS)' '$(TEST_SECONDS)' '$(HEAVY_SCALE)' '$(WATCHDOG_SECONDS)' '$(ONLY)'; \
+	{ printf 'version=%s\nsuite=%s\nrounds=%s\nbenchmarks=%s\nburn_seconds=%s\ntest_seconds=%s\nheavy_scale=%s\nwatchdog_seconds=%s\nonly=%s\nquick=%s\n' \
+	    '$(VERSION)' '$(SUITE)' '$(ROUNDS)' '$(BENCHMARKS)' '$(BURN_SECONDS)' '$(TEST_SECONDS)' '$(HEAVY_SCALE)' '$(WATCHDOG_SECONDS)' '$(ONLY)' '$(QUICK_LIST)'; \
 	  $(CC) --version && $(NASM) --version && $(LD) --version && $(OBJCOPY) --version && $(NM) --version; \
 	} > $(DIST)/BUILD.txt
 	tar --format=gnu --owner=0 --group=0 --numeric-owner --mtime=@0 --mode=0644 \

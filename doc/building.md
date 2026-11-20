@@ -182,6 +182,15 @@ more precise standalone guest timing.
 counts only those. A name that is no test fails the build. A clean default
 rebuild selects the full suite.
 
+`make QUICK=1` checks the records listed in `QUICK_RECORDS` once, as an
+accuracy-only build would, instead of sampling them; it logs them as
+`CFG quick=`. They still run, so every feature stays tested and FAIL/FAULT
+still shows; only their capacity numbers are missing. The default list holds
+the sampled records that cost the most host time while their capacity tracked
+another record's in recorded full runs (SMC rate/mixed variants, restart and
+paging-restart records, `int_bn_muladd`). Override the list with
+`QUICK_RECORDS=a,b`; a name that is no test fails the build.
+
 ## Local release preparation
 
 ```sh

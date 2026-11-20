@@ -76,9 +76,8 @@ def parse_log(text):
     counts = dict(re.findall(r"(\w+)=(\d+)", summary))
     config = {}
     for line in lines:
-        if line.startswith("CFG "):
-            config = dict(re.findall(r"(\w+)=(\S+)", line))
-            break
+        if line.startswith("CFG "):  # the first line, then only=/quick= lists
+            config.update(re.findall(r"(\w+)=(\S+)", line))
     # Constant per-record fields moved from TEST to CFG: put them back on the
     # records (as the old format had them) and keep config comparable.
     timing = {k: config.pop(k) for k in CFG_TIMING_FIELDS if k in config}

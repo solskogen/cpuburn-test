@@ -1016,7 +1016,10 @@ static void poll_lease(u32 id) {
  * Kept in an array rather than a string literal: the linker may otherwise
  * store the last test name as the tail of this string, and the Makefile's
  * ONLY check, which looks for each name as a whole string, would miss it. */
-static const char only_tests[] = ONLY;
+/* The "only=" prefix keeps a one-name list from matching itself in the
+ * Makefile's name check. */
+static const char only_cfg[] = "only=" ONLY;
+#define only_tests (only_cfg + 5)
 /* Offset of the item of comma list p equal to name, or -1. */
 static int list_find(const char *p, const char *name) {
     for (const char *start = p; *p;) {
@@ -1029,6 +1032,14 @@ static int list_find(const char *p, const char *name) {
     return -1;
 }
 static int selected(const char *name) { return !*only_tests || list_find(only_tests, name) >= 0; }
+
+#ifndef QUICK_CHECK
+#define QUICK_CHECK ""
+#endif
+/* Build QUICK=1: these records are checked once instead of sampled. */
+static const char quick_cfg[] = "quick=" QUICK_CHECK;
+#define quick_tests (quick_cfg + 6)
+static int quick_check(const char *name) { return *quick_tests && list_find(quick_tests, name) >= 0; }
 
 /* Runtime selection (protocol sel1): "@sel1 <only> <skip> <from>", each a
  * comma list of record names or "-". Names are checked against the suite by
@@ -1158,7 +1169,8 @@ static void run_table(const test_t *t, int table_check_only, u32 table_tags) {
             continue;
         }
         u32 runtime_start = ms_now();
-        int accuracy_test = cpu_accuracy_mode() || t == tests_cpu_contract || check_only;
+        int accuracy_test = cpu_accuracy_mode() || t == tests_cpu_contract || check_only ||
+                            quick_check(t->name);
         u32 tags = (table_tags | t->flags) & (T_TAG_REP * 2 - T_TAG_SMC);
         if (name_has(t->name, "smc")) tags |= T_TAG_SMC;
         if (name_has(t->name, "irq")) tags |= T_TAG_IRQ;
@@ -1432,7 +1444,8 @@ void kmain(void) {
             " timing_scope=checked_workload ms_resolution=10\n",
             ROUNDS, BURN_SECONDS, WATCHDOG_SECONDS, HEAVY_SCALE, (u32)TEST_SEED, TEST_SECONDS, BENCHMARKS,
             SUITE_BENCHMARK ? "benchmark" : BENCHMARKS ? "full" : "accuracy");
-    if (*only_tests) kprintf("CFG only=%s\n", only_tests);
+    if (*only_tests) kprintf("CFG %s\n", only_cfg);
+    if (*quick_tests) kprintf("CFG %s\n", quick_cfg);
 
     if (cpu.is386) kprintf("WARN 386 detected: unsupported, results may be unreliable\n");
 
