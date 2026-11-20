@@ -16,6 +16,20 @@
 #define NOCLONE
 #endif
 static u32 rng(u32 *s) { u32 x=*s; x^=x<<13; x^=x>>17; x^=x<<5; return *s=x; }
+/* Compares four bytes at a time (unaligned loads are fine on x86), so long
+   checks cost little next to the work they check. */
+static int eq_bytes(const void *a,const void *b,u32 n) {
+    const u8 *x=a,*y=b; u32 i=0;
+    for(;i+4<=n;i+=4) { u32 u,v; __builtin_memcpy(&u,x+i,4); __builtin_memcpy(&v,y+i,4); if(u!=v) return 0; }
+    for(;i<n;i++) if(x[i]!=y[i]) return 0;
+    return 1;
+}
+static int all_bytes(const u8 *p,u32 n,u8 v) {
+    u32 i=0,w=v*0x01010101u;
+    for(;i+4<=n;i+=4) { u32 u; __builtin_memcpy(&u,p+i,4); if(u!=w) return 0; }
+    for(;i<n;i++) if(p[i]!=v) return 0;
+    return 1;
+}
 static u32 maskof(unsigned w) { return w==32 ? ~0u : (1u<<w)-1; }
 static u32 szp(u32 x, unsigned w) {
     u32 p=x&255; p^=p>>4; p&=15;
@@ -239,9 +253,12 @@ static u32 int_far_ptr_copy(void) {
     static volatile u16 es_save;
     u32 sum=0,seed=0xfa2c0b1u;
     const unsigned rounds=256;
+    /* Filled once: each round copies a different random span, and the span
+       copied to is cleared after its check so no round finds it already right */
+    for(unsigned i=0;i<8192;i+=4) { u32 v=rng(&seed); __builtin_memcpy(src+i,&v,4); }
+    kmemset(dst,0,8192);
     for(unsigned r=0;r<rounds;r++) {
         u32 n=1024+(rng(&seed)&3071),so=rng(&seed)&4095,dof=rng(&seed)&4095,cnt=n;
-        for(unsigned i=0;i<n;i++) src[so+i]=(u8)rng(&seed);
         sp.off=so; sp.sel=(GDT_SCRATCH_FIRST+2)<<3;
         dp.off=dof; dp.sel=(GDT_SCRATCH_FIRST+3)<<3;
         __asm__ volatile("movw %%es,%0\n"
@@ -251,8 +268,9 @@ static u32 int_far_ptr_copy(void) {
                          "addl $1,%1; sbbl %%edx,%%edx; addl $1,%2; adcl $0,%%edx\n"
                          "decl %%ecx; jnz 1b"
                          : "+m"(es_save),"+m"(sp),"+m"(dp),"+c"(cnt) :: "eax","ebx","edx","memory","cc");
-        CHECK_EQ(kmemcmp(dst+dof,src+so,n),0);
+        CHECK(eq_bytes(dst+dof,src+so,n)); CHECK_EQ(cnt,0);
         sum=csum_mix(sum,dst[dof]^n);
+        kmemset(dst+dof,0,n);
     }
     t_ops(rounds*2048*12); return sum;
 }
@@ -294,17 +312,23 @@ static u32 int_sha1(void) {
     if(!buf) SKIP("arena_sha1");
     /* "abc", padded: the known digest a9993e36 4706816a ba3e2571 7850c26c 9cd0d89d */
     static const u32 abc[16]={0x80636261,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0x18000000};
-    u32 h[5],hr[5],seed=0x5a1f00du;
+    u32 h[5],seed=0x5a1f00du;
     sha1_init(h); sha1_block(h,abc,0);
     CHECK_EQ(h[0],0xa9993e36); CHECK_EQ(h[1],0x4706816a); CHECK_EQ(h[2],0xba3e2571); CHECK_EQ(h[3],0x7850c26c); CHECK_EQ(h[4],0x9cd0d89d);
     for(unsigned i=0;i<blocks*16;i++) buf[i]=rng(&seed);
-    sha1_init(h); sha1_init(hr);
-    for(unsigned i=0;i<blocks;i++) sha1_block(h,buf+i*16,0);
-    for(unsigned i=0;i<blocks/16;i++) sha1_block(hr,buf+i*16,1);
-    /* the reference pass covers the first sixteenth; its digest must match a fresh fast pass over the same */
-    u32 hf[5]; sha1_init(hf);
-    for(unsigned i=0;i<blocks/16;i++) sha1_block(hf,buf+i*16,0);
-    for(unsigned i=0;i<5;i++) CHECK_EQ(hf[i],hr[i]);
+    /* The reference digest of the first sixteenth is computed in the first
+       call only; every call's fast pass must reach it at that point */
+    static u32 hr[5];
+    static int hr_ok;
+    if(!hr_ok) {
+        sha1_init(hr);
+        for(unsigned i=0;i<blocks/16;i++) sha1_block(hr,buf+i*16,1);
+        hr_ok=1;
+    }
+    sha1_init(h);
+    for(unsigned i=0;i<blocks/16;i++) sha1_block(h,buf+i*16,0);
+    for(unsigned i=0;i<5;i++) CHECK_EQ(h[i],hr[i]);
+    for(unsigned i=blocks/16;i<blocks;i++) sha1_block(h,buf+i*16,0);
     t_ops(blocks*1800); return h[0]^h[1]^h[2]^h[3]^h[4];
 }
 /* Bignum arithmetic as Windows 98 runs it as it first boots, checking
@@ -329,25 +353,48 @@ static u32 bn_ref(u32 *r,const u32 *a,u32 n,u32 w,int sub) {
     }
     return c;
 }
+/* The reference runs in the first call only (the harness's unsampled warmup):
+   it keeps a hash of each round's carries and result, which later calls
+   compare against; a mismatch reruns the reference to name the wrong word. */
+static u32 bn_round_hash[512];
+static int bn_round_hash_ok;
 static u32 int_bn_muladd(void) {
     enum { N=32 };
-    static u32 a[N],b[N],r[2*N],rr[2*N];
+    static u32 a[N],b[N],r[2*N],rr[2*N],c_got[N];
     u32 sum=0,seed=0xb16a0d0u;
     const unsigned rounds=512;
+    const int ref=!bn_round_hash_ok;
     for(unsigned k=0;k<rounds;k++) {
+        u32 rseed;
         for(unsigned i=0;i<N;i++) { a[i]=rng(&seed); b[i]=rng(&seed); }
-        if(k&1) for(unsigned i=0;i<2*N;i++) r[i]=rr[i]=rng(&seed);
-        else for(unsigned i=0;i<2*N;i++) r[i]=rr[i]=0;
+        rseed=seed;
+        if(k&1) for(unsigned i=0;i<2*N;i++) r[i]=rng(&seed);
+        else for(unsigned i=0;i<2*N;i++) r[i]=0;
         /* a product row by row, or (odd rounds) one taken off r, as a reduction does */
+        u32 h=0;
         for(unsigned i=0;i<N;i++) {
             u32 c=(k&1)?bn_mul_sub4(r+i,a,N,b[i]):bn_mul_add4(r+i,a,N,b[i]);
-            u32 cr=bn_ref(rr+i,a,N,b[i],k&1);
-            CHECK_EQ(c,cr);
-            if(k&1) { r[i+N]-=c; rr[i+N]-=cr; } else { r[i+N]=c; rr[i+N]=cr; }
+            if(k&1) r[i+N]-=c; else r[i+N]=c;
+            c_got[i]=c; h=csum_mix(h,c);
         }
-        for(unsigned i=0;i<2*N;i++) CHECK_EQ(r[i],rr[i]);
+        for(unsigned i=0;i<2*N;i++) h=csum_mix(h,r[i]);
+        if(ref || h!=bn_round_hash[k]) {
+            u32 rs=rseed,hr=0;
+            if(k&1) for(unsigned i=0;i<2*N;i++) rr[i]=rng(&rs);
+            else for(unsigned i=0;i<2*N;i++) rr[i]=0;
+            for(unsigned i=0;i<N;i++) {
+                u32 cr=bn_ref(rr+i,a,N,b[i],k&1);
+                CHECK_EQ(c_got[i],cr);
+                if(k&1) rr[i+N]-=cr; else rr[i+N]=cr;
+                hr=csum_mix(hr,cr);
+            }
+            for(unsigned i=0;i<2*N;i++) { CHECK_EQ(r[i],rr[i]); hr=csum_mix(hr,rr[i]); }
+            if(ref) bn_round_hash[k]=hr;
+            else CHECK_EQ(h,bn_round_hash[k]);
+        }
         sum=csum_mix(sum,r[N]^r[2*N-1]);
     }
+    bn_round_hash_ok=1;
     t_ops(rounds*N*N*9); return sum;
 }
 /* The same with DS, ES and SS as Windows 98 gives a Win32 program: base 0,
@@ -436,32 +483,62 @@ static void cf_gen(u32 seed,u8 *code,const u8 *at,const u8 *next,u32 *st,u32 *da
     else code[p++]=0xc3;
     while(p<CF_FN) code[p++]=0xcc;
 }
+static u32 cf_hash(const u32 *p,u32 words) {
+    u32 h=0,g=0;
+    for(u32 i=0;i<words;i+=2) { h=((h<<7)|(h>>25))^p[i]; g=((g<<11)|(g>>21))+p[i+1]; }
+    return csum_mix(h,g);
+}
+/* Per configuration, from the first call: the code's hash, so a later call
+   that finds it in place runs it without building it again, and the
+   model's final state and data hash, which each first pass must match (a
+   mismatch reruns the model to name the wrong word). Building and the model
+   cost more than 16 passes of 12-instruction functions. */
+static struct { u32 seed0,code,code_hash,data_hash,sr[3]; } cf_cache[8];
 static u32 code_footprint(u32 nfn,u32 passes,u32 seed0,int chain) {
     u8 *code=arena_alloc(nfn*CF_FN,4096);
     u32 *data=arena_alloc(CF_DATA*4,4096),*ref=arena_alloc(CF_DATA*4,4096);
     void **table=arena_alloc(nfn*4,4);
     u32 *order=arena_alloc(nfn*4,4);
     if(!code || !data || !ref || !table || !order) SKIP("arena_code_footprint");
+    unsigned slot=0;
+    while(slot<7 && cf_cache[slot].seed0 && cf_cache[slot].seed0!=seed0) slot++;
     u32 seed=seed0;
     for(u32 i=0;i<nfn;i++) order[i]=i;
     for(u32 i=nfn-1;i>0;i--) { u32 j=rng(&seed)%(i+1),t=order[i]; order[i]=order[j]; order[j]=t; }
-    /* Each function built aside and written only where the code differs: an
-       invocation after another one finds its code in place and runs it as
-       compiled, rather than rewriting it with the same bytes */
-    for(u32 i=0;i<nfn;i++) {
-        const u8 *next=(chain && i+1<nfn)?code+order[i+1]*CF_FN:NULL;
-        u8 fn[CF_FN],*at=code+order[i]*CF_FN;
-        cf_gen(seed0+order[i]*0x9e3779b9u,fn,at,next,NULL,NULL);
-        if(kmemcmp(at,fn,CF_FN)) kmemcpy(at,fn,CF_FN);
-        table[i]=at;
+    for(u32 i=0;i<nfn;i++) table[i]=code+order[i]*CF_FN;
+    int cached=cf_cache[slot].seed0==seed0;
+    if(!cached || cf_cache[slot].code!=(u32)code || cf_hash((const u32 *)code,nfn*CF_FN/4)!=cf_cache[slot].code_hash) {
+        /* Each function built aside and written only where the code differs:
+           an invocation after another one finds its code in place and runs it
+           as compiled, rather than rewriting it with the same bytes */
+        for(u32 i=0;i<nfn;i++) {
+            const u8 *next=(chain && i+1<nfn)?code+order[i+1]*CF_FN:NULL;
+            u8 fn[CF_FN],*at=code+order[i]*CF_FN;
+            cf_gen(seed0+order[i]*0x9e3779b9u,fn,at,next,NULL,NULL);
+            if(!eq_bytes(at,fn,CF_FN)) kmemcpy(at,fn,CF_FN);
+        }
+        cf_cache[slot].code=(u32)code;
+        cf_cache[slot].code_hash=cf_hash((const u32 *)code,nfn*CF_FN/4);
     }
-    for(u32 i=0;i<CF_DATA;i++) data[i]=ref[i]=rng(&seed);
-    u32 st[3]={1,2,3},sr[3]={1,2,3},calls=chain?1:nfn;
+    u32 dseed=seed;
+    for(u32 i=0;i<CF_DATA;i++) data[i]=rng(&seed);
+    u32 st[3]={1,2,3},calls=chain?1:nfn;
     /* the first pass checked against the model, function by function in the same order */
     cf_run(st,data,table,calls);
-    for(u32 i=0;i<nfn;i++) cf_gen(seed0+order[i]*0x9e3779b9u,NULL,NULL,NULL,sr,ref);
-    for(u32 i=0;i<3;i++) CHECK_EQ(st[i],sr[i]);
-    CHECK_EQ(kmemcmp(data,ref,CF_DATA*4),0);
+    if(!cached || st[0]!=cf_cache[slot].sr[0] || st[1]!=cf_cache[slot].sr[1] ||
+       st[2]!=cf_cache[slot].sr[2] || cf_hash(data,CF_DATA)!=cf_cache[slot].data_hash) {
+        u32 sr[3]={1,2,3};
+        for(u32 i=0;i<CF_DATA;i++) ref[i]=rng(&dseed);
+        for(u32 i=0;i<nfn;i++) cf_gen(seed0+order[i]*0x9e3779b9u,NULL,NULL,NULL,sr,ref);
+        for(u32 i=0;i<3;i++) CHECK_EQ(st[i],sr[i]);
+        CHECK_EQ(kmemcmp(data,ref,CF_DATA*4),0);
+        if(cached) CHECK_EQ(cf_hash(data,CF_DATA),cf_cache[slot].data_hash);
+        else {
+            for(u32 i=0;i<3;i++) cf_cache[slot].sr[i]=sr[i];
+            cf_cache[slot].data_hash=cf_hash(ref,CF_DATA);
+            cf_cache[slot].seed0=seed0;
+        }
+    }
     for(u32 p=1;p<passes;p++) cf_run(st,data,table,calls);
     t_ops(passes*nfn*12); return st[0]^st[1]^st[2]^data[seed%CF_DATA];
 }
@@ -473,15 +550,30 @@ static u32 int_code_footprint_calls(void) { return code_footprint(2048,256,0xc0d
    more distinct code than any of it runs often, so none of it stays compiled. */
 static u32 int_code_footprint_8m(void) { return code_footprint(131072,16,0xc0de8c0u,1); }
 static u32 int_code_footprint_8m_calls(void) { return code_footprint(131072,16,0xc0de8c1u,0); }
+/* As int_bn_muladd: alu_ref runs in the first call, which keeps a hash of
+   each case's results for later calls to compare against. */
+static u32 alu_hash[4096];
+static int alu_hash_ok;
 static u32 int_alu(void) {
     u32 seed=0x12345678,sum=0;
+    const int ref=!alu_hash_ok;
     static const u32 edge[]={0,1,0xffffffffu,0x80000000u,0x7fffffffu,0xffffu,0xffu,0x80u};
     for(unsigned i=0;i<4096;i++) {
         u32 a=rng(&seed),b=rng(&seed),f,rf;
         if(i<64) { a=edge[i&7]; b=edge[i>>3]; }
+        u32 h=0;
         for(unsigned w=8;w<=32;w*=2) for(unsigned op=0;op<=A_DEC;op++) {
-            u32 v=run_alu(w,op,a,b,i&1,&f),r=alu_ref(op,a,b,i&1,w,&rf);
-            CHECK_EQ(v,r); sum=csum_mix(sum,v);
+            u32 v=run_alu(w,op,a,b,i&1,&f);
+            h=csum_mix(h,v); sum=csum_mix(sum,v);
+        }
+        if(ref || h!=alu_hash[i]) {
+            u32 hr=0;
+            for(unsigned w=8;w<=32;w*=2) for(unsigned op=0;op<=A_DEC;op++) {
+                u32 v=run_alu(w,op,a,b,i&1,&f),r=alu_ref(op,a,b,i&1,w,&rf);
+                CHECK_EQ(v,r); hr=csum_mix(hr,r);
+            }
+            if(ref) alu_hash[i]=hr;
+            else CHECK_EQ(h,alu_hash[i]);
         }
         u32 x,y,z;
         __asm__ volatile("leal 13(%1,%2,4),%0" : "=r"(x) : "r"(a),"r"(b));
@@ -501,6 +593,7 @@ static u32 int_alu(void) {
         __asm__ volatile("addl %2,%0; adcl %3,%1" : "+&r"(x),"+&r"(y):"r"(a),"r"(b):"cc");
         got=((u64)y<<32)|x; CHECK(got==wide+add);
     }
+    alu_hash_ok=1;
     t_ops(4096u*80); return sum;
 }
 static u32 int_flags_boundaries(void) {
@@ -745,18 +838,43 @@ static u32 shift_ref(unsigned op,u32 a,unsigned n,unsigned w,u32 *cf) {
     }
     *cf=c; return a;
 }
+/* As int_alu: shift_ref runs in the first call, which checks every case and
+   keeps a hash per input and operation of the result and the flags the
+   checks look at; later calls compare against it, and a mismatch reruns the
+   checks to name the wrong case. */
+static u32 shift_hash[64*3*7];
+static int shift_hash_ok;
+static u32 shift_checked_flags(unsigned op,unsigned k,unsigned w) {
+    u32 m=0;
+    if(op>=S_ROL || k<w || op==S_SAR) m|=CF;
+    if(k==1 || !k) m|=CF|OF;
+    if(op<=S_SAR && k) m|=SF|ZF|PF;
+    return m;
+}
 static u32 int_shift_rot(void) {
     u32 seed=0x6ac1e2,sum=0;
-    for(unsigned i=0;i<64;i++) for(unsigned w=8;w<=32;w*=2) for(unsigned op=0;op<7;op++) for(unsigned n=0;n<=40;n++) {
-        u32 a=rng(&seed),f,c,r=shift_ref(op,a,n,w,&c);
+    const int ref=!shift_hash_ok;
+    for(unsigned i=0;i<64;i++) for(unsigned w=8;w<=32;w*=2) for(unsigned op=0;op<7;op++) {
+    u32 hseed=seed,h=0,*hp=&shift_hash[(i*3+(w==8?0:w==16?1:2))*7+op];
+    for(unsigned n=0;n<=40;n++) {
+        u32 a=rng(&seed),f;
         u32 v=w==8?shift8(op,a,n,&f):w==16?shift16(op,a,n,&f):shift32(op,a,n,&f);
-        CHECK_EQ(v,r);
         if(n==1 || n==7) {
             u32 ff,fixed=w==8?shift_fixed8(op,a,n,&ff):w==16?shift_fixed16(op,a,n,&ff):shift_fixed32(op,a,n,&ff);
             CHECK_EQ(fixed,v); CHECK_EQ(ff&(n==1?(CF|OF):CF),f&(n==1?(CF|OF):CF));
         }
+        h=csum_mix(csum_mix(h,v),f&shift_checked_flags(op,n&31,w));
+        sum+=v;
+    }
+    if(!ref && h==*hp) continue;
+    u32 hr=0;
+    for(unsigned n=0;n<=40;n++) {
+        u32 a=rng(&hseed),f,c,r=shift_ref(op,a,n,w,&c);
+        u32 v=w==8?shift8(op,a,n,&f):w==16?shift16(op,a,n,&f):shift32(op,a,n,&f);
+        CHECK_EQ(v,r);
         unsigned k=n&31;
-        if(op>=S_ROL || k<w || op==S_SAR) CHECK_EQ(f&CF,c);
+        u32 ef=k?0:CF|OF;
+        if(op>=S_ROL || k<w || op==S_SAR) { CHECK_EQ(f&CF,c); if(k) ef|=c; }
         if(k==1) {
             u32 ov;
             if(op==S_SHR) ov=a>>(w-1)&1;
@@ -764,11 +882,16 @@ static u32 int_shift_rot(void) {
             else if(op==S_ROR || op==S_RCR) ov=(r>>(w-1)^r>>(w-2))&1;
             else ov=((r>>(w-1))^c)&1;
             CHECK_EQ((f&OF)!=0,ov);
+            if(ov) ef|=OF;
         }
         if(!k) CHECK_EQ(f&(CF|OF),CF|OF);
-        if(op<=S_SAR && k) CHECK_EQ(f&(SF|ZF|PF),szp(r,w));
-        sum+=v;
+        if(op<=S_SAR && k) { CHECK_EQ(f&(SF|ZF|PF),szp(r,w)); ef|=szp(r,w); }
+        hr=csum_mix(csum_mix(hr,r),ef);
     }
+    if(ref) *hp=hr;
+    else CHECK_EQ(h,*hp);
+    }
+    shift_hash_ok=1;
     for(unsigned i=0;i<512;i++) for(unsigned n=0;n<=40;n++) {
         u32 a=rng(&seed),b=rng(&seed),v=a,f,k=n&31;
         __asm__ volatile("shldl %%cl,%2,%0; pushfl; popl %1" : "+r"(v),"=m"(f):"r"(b),"c"(n):"cc");
@@ -930,68 +1053,102 @@ static u32 int_bcd(void) {
     exc_expect_clear(); CHECK_EQ(g_exc.count,before+1); CHECK_EQ(g_exc.vec,0); CHECK_EQ(g_exc.eip,site);
     t_ops(2*256*4+2*256*256*4+2*256+2*65536); return sum;
 }
+/* Each REP string case runs STR_REPS times on the same buffers, every run's
+   registers checked, then its bytes once: the buffers are set up once a call
+   and only the bytes a case wrote are checked and put back. Every case first
+   checks that the bytes it will write (and 16 past them) still hold the
+   fill, and the whole destination is checked at the end, so a stray store
+   anywhere is still caught. Work is counted in string elements. */
+enum { STR_REPS=32 };
 static u32 int_string(void) {
-    u8 *p=arena_alloc(65536,16); if(!p) SKIP("arena_64k");
-    u8 *src=p,*dst=p+16384,*ref=p+32768,*save=p+49152;
+    u8 *p=arena_alloc(16384*2+3*1024,16); if(!p) SKIP("arena_string");
+    u8 *src=p,*dst=p+16384,*cmp_a=p+32768,*cmp_b=cmp_a+1024,*cmp_c=cmp_b+1024;
     const u32 lens[]={0,1,2,3,15,31,255,1023,4093};
-    u32 sum=0;
-    for(unsigned round=0;round<1;round++) for(unsigned w=1;w<=4;w*=2) for(unsigned li=0;li<sizeof(lens)/sizeof(lens[0]);li++) {
-        u32 n=lens[li],bytes=n*w;
-        for(u32 j=0;j<16384;j++) { src[j]=(u8)(j*37+(j>>4)+round); dst[j]=ref[j]=0xa5; }
-        for(u32 j=0;j<bytes;j++) ref[j+3]=src[j+1];
-        const u8 *s=src+1; u8 *d=dst+3; u32 c=n;
-        if(w==1) __asm__ volatile("cld; rep movsb" : "+S"(s),"+D"(d),"+c"(c)::"memory","cc");
-        else if(w==2) __asm__ volatile("cld; rep movsw" : "+S"(s),"+D"(d),"+c"(c)::"memory","cc");
-        else __asm__ volatile("cld; rep movsl" : "+S"(s),"+D"(d),"+c"(c)::"memory","cc");
-        CHECK_EQ(kmemcmp(dst,ref,16384),0); CHECK_EQ(c,0); CHECK(s==src+1+bytes); CHECK(d==dst+3+bytes);
-        for(u32 j=0;j<16384;j++) dst[j]=ref[j]=0xa5;
-        s=src+1+(n?(n-1)*w:0); d=dst+3+(n?(n-1)*w:0); c=n;
-        /* CLD is in the same asm: no C code, calls, or compiler spills execute with DF set. */
-        if(w==1) __asm__ volatile("std; rep movsb; cld" : "+S"(s),"+D"(d),"+c"(c)::"memory","cc");
-        else if(w==2) __asm__ volatile("std; rep movsw; cld" : "+S"(s),"+D"(d),"+c"(c)::"memory","cc");
-        else __asm__ volatile("std; rep movsl; cld" : "+S"(s),"+D"(d),"+c"(c)::"memory","cc");
-        for(u32 j=0;j<bytes;j++) ref[j+3]=src[j+1];
-        CHECK_EQ(kmemcmp(dst,ref,16384),0);
-        d=dst+3; c=n; u32 a=0x78563412;
-        if(w==1) __asm__ volatile("rep stosb" : "+D"(d),"+c"(c):"a"(a):"memory");
-        else if(w==2) __asm__ volatile("rep stosw" : "+D"(d),"+c"(c):"a"(a):"memory");
-        else __asm__ volatile("rep stosl" : "+D"(d),"+c"(c):"a"(a):"memory");
-        for(u32 j=0;j<bytes;j++) ref[j+3]=(u8)(a>>(8*(j%w)));
-        CHECK_EQ(kmemcmp(dst,ref,16384),0);
-        s=src+1;c=n;a=0xabcdef55;
-        __asm__ volatile("rep lodsb" : "+S"(s),"+c"(c),"+a"(a)::"memory"); CHECK_EQ(a&255,n?src[n]:0x55); CHECK(s==src+1+n); CHECK_EQ(c,0);
-        /* Compare overlap semantics to sequential byte loops, not memmove. */
+    u32 sum=0; u64 elems=0;
+    for(u32 j=0;j<16384;j++) src[j]=(u8)(j*37+(j>>4));
+    kmemset(dst,0xa5,16384);
+    for(unsigned w=1;w<=4;w*=2) for(unsigned li=0;li<sizeof(lens)/sizeof(lens[0]);li++) {
+        u32 n=lens[li],bytes=n*w,g=16384-3-bytes<16?16384-3-bytes:16;
+        CHECK(all_bytes(dst,3+bytes+g,0xa5));
+        for(unsigned rep=0;rep<STR_REPS;rep++) {
+            const u8 *s=src+1; u8 *d=dst+3; u32 c=n;
+            if(w==1) __asm__ volatile("cld; rep movsb" : "+S"(s),"+D"(d),"+c"(c)::"memory","cc");
+            else if(w==2) __asm__ volatile("cld; rep movsw" : "+S"(s),"+D"(d),"+c"(c)::"memory","cc");
+            else __asm__ volatile("cld; rep movsl" : "+S"(s),"+D"(d),"+c"(c)::"memory","cc");
+            CHECK_EQ(c,0); CHECK(s==src+1+bytes); CHECK(d==dst+3+bytes);
+        }
+        CHECK(eq_bytes(dst+3,src+1,bytes)); CHECK(all_bytes(dst,3,0xa5)); CHECK(all_bytes(dst+3+bytes,g,0xa5));
+        kmemset(dst+3,0xa5,bytes);
+        for(unsigned rep=0;rep<STR_REPS;rep++) {
+            const u8 *s=src+1+(n?(n-1)*w:0); u8 *d=dst+3+(n?(n-1)*w:0); u32 c=n;
+            /* CLD is in the same asm: no C code, calls, or compiler spills execute with DF set. */
+            if(w==1) __asm__ volatile("std; rep movsb; cld" : "+S"(s),"+D"(d),"+c"(c)::"memory","cc");
+            else if(w==2) __asm__ volatile("std; rep movsw; cld" : "+S"(s),"+D"(d),"+c"(c)::"memory","cc");
+            else __asm__ volatile("std; rep movsl; cld" : "+S"(s),"+D"(d),"+c"(c)::"memory","cc");
+            CHECK_EQ(c,0); CHECK(s==src+1-(n?w:0)); CHECK(d==dst+3-(n?w:0));
+        }
+        CHECK(eq_bytes(dst+3,src+1,bytes)); CHECK(all_bytes(dst,3,0xa5)); CHECK(all_bytes(dst+3+bytes,g,0xa5));
+        kmemset(dst+3,0xa5,bytes);
+        u32 a=0x78563412;
+        for(unsigned rep=0;rep<STR_REPS;rep++) {
+            u8 *d=dst+3; u32 c=n;
+            if(w==1) __asm__ volatile("rep stosb" : "+D"(d),"+c"(c):"a"(a):"memory");
+            else if(w==2) __asm__ volatile("rep stosw" : "+D"(d),"+c"(c):"a"(a):"memory");
+            else __asm__ volatile("rep stosl" : "+D"(d),"+c"(c):"a"(a):"memory");
+            CHECK_EQ(c,0); CHECK(d==dst+3+bytes);
+        }
+        for(u32 j=0;j<bytes;j++) if(dst[3+j]!=(u8)(a>>(8*(j%w)))) { CHECK_EQ(dst[3+j],(u8)(a>>(8*(j%w)))); break; }
+        CHECK(all_bytes(dst,3,0xa5)); CHECK(all_bytes(dst+3+bytes,g,0xa5));
+        if(n) sum=csum_mix(sum,dst[3+((n-1)&511)]);
+        kmemset(dst+3,0xa5,bytes);
+        for(unsigned rep=0;rep<STR_REPS;rep++) {
+            const u8 *s=src+1; u32 c=n; a=0xabcdef55;
+            __asm__ volatile("rep lodsb" : "+S"(s),"+c"(c),"+a"(a)::"memory");
+            CHECK_EQ(a&255,n?src[n]:0x55); CHECK(s==src+1+n); CHECK_EQ(c,0);
+        }
+        elems+=(u64)STR_REPS*4*n;
+    }
+    CHECK(all_bytes(dst,16384,0xa5));
+    /* Compare overlap semantics to sequential byte loops, not memmove. */
+    {
+        u8 *ref=src+8192;
         for(u32 j=0;j<512;j++) dst[j]=ref[j]=(u8)j;
         for(u32 j=0;j<257;j++) ref[j+3]=ref[j+1];
-        s=dst+1;d=dst+3;c=257; __asm__ volatile("rep movsb" : "+S"(s),"+D"(d),"+c"(c)::"memory"); CHECK_EQ(kmemcmp(dst,ref,512),0);
+        const u8 *s=dst+1; u8 *d=dst+3; u32 c=257;
+        __asm__ volatile("rep movsb" : "+S"(s),"+D"(d),"+c"(c)::"memory"); CHECK(eq_bytes(dst,ref,512)); CHECK_EQ(c,0);
         for(s32 j=256;j>=0;j--) ref[j+1]=ref[j+3];
-        s=dst+259;d=dst+257;c=257; __asm__ volatile("std; rep movsb; cld" : "+S"(s),"+D"(d),"+c"(c)::"memory","cc"); CHECK_EQ(kmemcmp(dst,ref,512),0);
-        if(n) sum=csum_mix(sum,dst[n&511]);
+        s=dst+259;d=dst+257;c=257; __asm__ volatile("std; rep movsb; cld" : "+S"(s),"+D"(d),"+c"(c)::"memory","cc"); CHECK(eq_bytes(dst,ref,512)); CHECK_EQ(c,0);
+        elems+=2*257;
     }
+    /* REPE/REPNE compares and scans stop one past the planted byte; the
+       buffers are made once and only the planted byte is changed per count */
+    for(u32 j=0;j<1024;j++) { cmp_a[j]=cmp_b[j]=(u8)(j*13); cmp_c[j]=(u8)(j*13)^1; }
+    u8 *scan=src+8192; kmemset(scan,0x44,1024);
     for(u32 n=0;n<=513;n++) {
-        for(u32 j=0;j<1024;j++) src[j]=dst[j]=(u8)(j*13);
-        u32 pos=n/2,c=n,f; const u8 *s=src; u8 *d=dst;
-        if(n) dst[pos]^=1;
-        __asm__ volatile("pushl $0x242; popfl; repe cmpsb; pushfl; popl %3" : "+S"(s),"+D"(d),"+c"(c),"=m"(f)::"memory","cc");
-        CHECK_EQ(c,n?n-pos-1:0); CHECK_EQ(!!(f&ZF),n?0:1); CHECK_EQ((u32)(s-src),n?pos+1:0);
-        for(u32 j=0;j<n;j++) dst[j]=0x44;
-        if(n) dst[pos]=0x77;
-        d=dst;c=n;
-        __asm__ volatile("pushl $0x202; popfl; repne scasb; pushfl; popl %2" : "+D"(d),"+c"(c),"=m"(f):"a"(0x77):"memory","cc");
-        CHECK_EQ(c,n?n-pos-1:0); CHECK_EQ(!!(f&ZF),n?1:0);
-        d=dst;c=n;
-        __asm__ volatile("pushl $0x242; popfl; repe scasb; pushfl; popl %2" : "+D"(d),"+c"(c),"=m"(f):"a"(0x44):"memory","cc");
-        CHECK_EQ(c,n?n-pos-1:0); CHECK_EQ(!!(f&ZF),n?0:1);
-        for(u32 j=0;j<n;j++) dst[j]=src[j]^1;
-        if(n) dst[pos]=src[pos];
-        s=src;d=dst;c=n;
-        __asm__ volatile("pushl $0x202; popfl; repne cmpsb; pushfl; popl %3" : "+S"(s),"+D"(d),"+c"(c),"=m"(f)::"memory","cc");
-        CHECK_EQ(c,n?n-pos-1:0); CHECK_EQ(!!(f&ZF),n?1:0);
+        u32 pos=n/2;
+        if(n) { cmp_b[pos]^=1; scan[pos]=0x77; cmp_c[pos]^=1; }
+        for(unsigned rep=0;rep<8;rep++) {
+            u32 c=n,f; const u8 *s=cmp_a; u8 *d=cmp_b;
+            __asm__ volatile("pushl $0x242; popfl; repe cmpsb; pushfl; popl %3" : "+S"(s),"+D"(d),"+c"(c),"=m"(f)::"memory","cc");
+            CHECK_EQ(c,n?n-pos-1:0); CHECK_EQ(!!(f&ZF),n?0:1); CHECK_EQ((u32)(s-cmp_a),n?pos+1:0);
+            d=scan;c=n;
+            __asm__ volatile("pushl $0x202; popfl; repne scasb; pushfl; popl %2" : "+D"(d),"+c"(c),"=m"(f):"a"(0x77):"memory","cc");
+            CHECK_EQ(c,n?n-pos-1:0); CHECK_EQ(!!(f&ZF),n?1:0);
+            d=scan;c=n;
+            __asm__ volatile("pushl $0x242; popfl; repe scasb; pushfl; popl %2" : "+D"(d),"+c"(c),"=m"(f):"a"(0x44):"memory","cc");
+            CHECK_EQ(c,n?n-pos-1:0); CHECK_EQ(!!(f&ZF),n?0:1);
+            s=cmp_a;d=cmp_c;c=n;
+            __asm__ volatile("pushl $0x202; popfl; repne cmpsb; pushfl; popl %3" : "+S"(s),"+D"(d),"+c"(c),"=m"(f)::"memory","cc");
+            CHECK_EQ(c,n?n-pos-1:0); CHECK_EQ(!!(f&ZF),n?1:0);
+        }
+        if(n) { cmp_b[pos]^=1; scan[pos]=0x44; cmp_c[pos]^=1; elems+=8*4*(pos+1); }
     }
     /* A byte-for-byte sentinel also catches a zero-count store. */
+    u8 save[16];
     for(unsigned i=0;i<16;i++) save[i]=dst[i];
     u8 *d=dst;u32 c=0; __asm__ volatile("rep stosl" : "+D"(d),"+c"(c):"a"(0):"memory"); CHECK_EQ(kmemcmp(dst,save,16),0);
-    t_ops(3000000); return sum;
+    t_work_unit("string_element");
+    t_ops(elems); return sum;
 }
 
 /* Out-of-line stack probes leave the C ABI and original stack intact. */
@@ -1004,7 +1161,6 @@ __asm__(".text\n"
 "pushaw\n popaw\n pushl $-7\n popl %edx\n cmpl $-7,%edx\n jne 1f\n pushl 8(%ebp)\n popl %edx\n cmpl 8(%ebp),%edx\n jne 1f\n push %cs\n popl %edx\n cmpw $8,%dx\n jne 1f\n push %ds\n pop %ds\n pushfl\n popfl\n popal\n movl 8(%ebp),%eax\n xorl $0x55aa55aa,%eax\n leave\n ret\n"
 "1: popal\n movl $0,%eax\n leave\n ret\n"
 ".type int_ret4_probe,@function\nint_ret4_probe:\n movl 4(%esp),%eax\n addl $7,%eax\n ret $4\n");
-static NOINLINE u32 fib(u32 n) { if(n<2) return n; return fib(n-1)+fib(n-2); }
 static NOINLINE u32 branch_vm(u32 x,u32 rounds) {
     for(u32 i=0;i<rounds;i++) {
         switch((x^i)&15) {
@@ -1015,7 +1171,7 @@ static NOINLINE u32 branch_vm(u32 x,u32 rounds) {
         }
     } return x;
 }
-static u32 vm_ref(u32 x,u32 rounds) {
+static NOINLINE u32 vm_ref(u32 x,u32 rounds) {
     for(u32 i=0;i<rounds;i++) {
         u32 k=(x^i)&15;
         if(k==0)x+=13;else if(k==1)x^=0x127;else if(k==2)x=x*3+1;else if(k==3)x=(x>>1)|(x<<31);
@@ -1024,11 +1180,129 @@ static u32 vm_ref(u32 x,u32 rounds) {
         else if(k==12)x=(x<<5)|(x>>27);else if(k==13)x^=i*31;else if(k==14)x+=0x12345;else x*=7;
     } return x;
 }
-static u32 int_prefix_addr(void) {
+/* A 16-way switch compiled to a jump table: one indirect JMP a round, to a
+   target that changes with the data. The if-chain reference runs once. */
+static u32 int_switch_dispatch(void) {
+    static u32 ref; static int have;
+    const u32 rounds=131072;
+    if(!have) { ref=vm_ref(0x12345678,rounds); have=1; }
+    u32 sum=branch_vm(0x12345678,rounds); CHECK_EQ(sum,ref);
+    t_work_unit("switch_dispatch");
+    t_ops(rounds); return sum;
+}
+
+/* Doubly recursive Fibonacci in assembly, EAX in and out, EBX saved: nothing
+   but CALL, RET, PUSH, POP and a compare a call, so the call/return path is
+   what is timed. fib(24) makes 150,049 calls. */
+extern u32 int_fib_asm(u32 n);
+__asm__(".text\n"
+".type int_fib_asm,@function\nint_fib_asm:\n movl 4(%esp),%eax\n call int_fib_r\n ret\n"
+"int_fib_r:\n cmpl $2,%eax\n jb 1f\n pushl %ebx\n leal -1(%eax),%ebx\n movl %ebx,%eax\n call int_fib_r\n"
+" xchgl %eax,%ebx\n decl %eax\n call int_fib_r\n addl %ebx,%eax\n popl %ebx\n1: ret\n");
+static u32 int_call_ret_recursive(void) {
+    u32 v,sum=0;
+    for(unsigned i=0;i<8;i++) { u32 f=int_fib_asm(24); CHECK_EQ(f,46368); sum=csum_mix(sum,f); }
+    CHECK_EQ(int_fib_asm(0),0); CHECK_EQ(int_fib_asm(1),1); CHECK_EQ(int_fib_asm(2),1); CHECK_EQ(int_fib_asm(10),55);
+    for(unsigned i=0;i<256;i++) {
+        CHECK_EQ(int_stack_probe(i),i^0x55aa55aa);
+        __asm__ volatile("pushl %1; call int_ret4_probe" : "=a"(v):"r"(i):"ecx","edx","cc","memory"); CHECK_EQ(v,i+7);
+    }
+    u32 n=7,acc=0;
+    __asm__ volatile("1: incl %0; loop 1b" : "+r"(acc),"+c"(n)::"cc"); CHECK_EQ(acc,7); CHECK_EQ(n,0);
+    n=7;acc=0;
+    __asm__ volatile("xorl %%eax,%%eax; 1: leal 1(%0),%0; loope 1b" : "+r"(acc),"+c"(n)::"eax","cc"); CHECK_EQ(acc,7); CHECK_EQ(n,0);
+    n=7;acc=0;
+    __asm__ volatile("orl $1,%%eax; 1: leal 1(%0),%0; loopne 1b" : "+r"(acc),"+c"(n)::"eax","cc"); CHECK_EQ(acc,7); CHECK_EQ(n,0);
+    n=0;v=5; __asm__ volatile("jecxz 1f; movl $99,%0; 1:" : "+r"(v):"c"(n)); CHECK_EQ(v,5);
+    /* Register and memory indirect jump targets are local, known-safe labels. */
+    void *target;
+    __asm__ volatile("movl $1f,%0; jmp *%0; movl $0,%0; 1:" : "=&r"(target)); CHECK(target!=NULL);
+    __asm__ volatile("movl $1f,%0; jmp *%0; int3; 1:" : "=m"(target)::"memory");
+    u32 (*fp)(u32)=int_stack_probe;
+    __asm__ volatile("pushl $19; call *%1; addl $4,%%esp" : "=a"(v):"r"(fp):"ecx","edx","cc","memory"); CHECK_EQ(v,19^0x55aa55aa);
+    t_work_unit("call");
+    t_ops(8u*150049u+256u*2u); return sum;
+}
+
+/* A loop of nothing but prefixed instructions: FS overrides on 32- and
+   16-bit addressed loads and stores, 66h ALU, rotate, PUSH/POP and MOVSX, 67h
+   [BX] and [BX+disp8] with junk in EBX's top half that 16-bit addressing must
+   ignore, a 67h LEA, and CS/ES overrides on register-only ALU ops that must
+   change nothing. 21 instructions a pass, 16 of them prefixed. */
+extern void int_prefix_loop(u32 *st);
+__asm__(".text\n"
+".type int_prefix_loop,@function\nint_prefix_loop:\n"
+" pushl %ebp\n pushl %ebx\n pushl %esi\n pushl %edi\n pushl %fs\n movl 24(%esp),%ebp\n"
+" movw $0x40,%ax\n movw %ax,%fs\n"
+" movl 0(%ebp),%eax\n movl 4(%ebp),%ebx\n movl 8(%ebp),%edx\n movl 12(%ebp),%esi\n movl 16(%ebp),%edi\n movl 20(%ebp),%ecx\n"
+"1: .byte 0x64,0x8b,0x06\n"            /* mov eax,fs:[esi] */
+" .byte 0x66,0x64,0x03,0x46,0x04\n"    /* add ax,fs:[esi+4] */
+" .byte 0x66,0xc1,0xc0,0x05\n"         /* rol ax,5 */
+" .byte 0x64,0x67,0x03,0x17\n"         /* add edx,fs:[bx] */
+" .byte 0x66,0x81,0xf2,0x34,0x12\n"    /* xor dx,0x1234 */
+" .byte 0x64,0x66,0x89,0x46,0x08\n"    /* mov fs:[esi+8],ax */
+" .byte 0x64,0x67,0x89,0x57,0x0c\n"    /* mov fs:[bx+12],edx */
+" .byte 0x67,0x8d,0x7f,0x05\n"         /* lea edi,[bx+5] */
+" .byte 0x2e,0x01,0xf8\n"              /* cs: add eax,edi */
+" .byte 0x66,0x29,0xc2\n"              /* sub dx,ax */
+" .byte 0x66,0x52\n .byte 0x66,0x5f\n" /* push dx; pop di */
+" .byte 0x31,0xf8\n"                   /* xor eax,edi */
+" .byte 0x66,0x0f,0xbe,0xfa\n"         /* movsx di,dl */
+" .byte 0x26,0x01,0xfa\n"              /* es: add edx,edi */
+" addl $16,%esi\n andl $0x3f0,%esi\n"
+" .byte 0x66,0x83,0xc3,0x1c\n"         /* add bx,28 */
+" .byte 0x66,0x81,0xe3,0xfc,0x07\n"    /* and bx,0x7fc */
+" decl %ecx\n jnz 1b\n"
+" movl %eax,0(%ebp)\n movl %ebx,4(%ebp)\n movl %edx,8(%ebp)\n movl %esi,12(%ebp)\n movl %edi,16(%ebp)\n movl %ecx,20(%ebp)\n"
+" popl %fs\n popl %edi\n popl %esi\n popl %ebx\n popl %ebp\n ret\n");
+static u32 rd32le(const u8 *p) { return p[0]|((u32)p[1]<<8)|((u32)p[2]<<16)|((u32)p[3]<<24); }
+static void prefix_model(u32 *st,u8 *m) {
+    u32 eax=st[0],ebx=st[1],edx=st[2],esi=st[3],edi=st[4];
+    for(u32 n=st[5];n;n--) {
+        u32 bx=ebx&0xffff,ax;
+        eax=rd32le(m+esi);
+        ax=(eax+(m[esi+4]|((u32)m[esi+5]<<8)))&0xffff;
+        ax=((ax<<5)|(ax>>11))&0xffff; eax=(eax&0xffff0000u)|ax;
+        edx+=rd32le(m+bx);
+        edx^=0x1234;
+        m[esi+8]=(u8)ax; m[esi+9]=(u8)(ax>>8);
+        for(unsigned j=0;j<4;j++) m[bx+12+j]=(u8)(edx>>(8*j));
+        edi=(bx+5)&0xffff;
+        eax+=edi;
+        edx=(edx&0xffff0000u)|((edx-eax)&0xffff);
+        edi=(edi&0xffff0000u)|(edx&0xffff);
+        eax^=edi;
+        edi=(edi&0xffff0000u)|((u32)(s32)(signed char)(u8)edx&0xffff);
+        edx+=edi;
+        esi=(esi+16)&0x3f0;
+        ebx=(ebx&0xffff0000u)|((bx+28)&0x7fc);
+    }
+    st[0]=eax; st[1]=ebx; st[2]=edx; st[3]=esi; st[4]=edi; st[5]=0;
+}
+enum { PREFIX_PASSES=65536 };
+/* p[i]=(u8)(i*29), four bytes a store */
+static void prefix_fill(u8 *p) {
+    for(u32 i=0;i<8192;i+=4) { u32 v=(i*29)&0xff; v|=(((i+1)*29)&0xff)<<8; v|=(((i+2)*29)&0xff)<<16; v|=(((i+3)*29)&0xffu)<<24; __builtin_memcpy(p+i,&v,4); }
+}
+static u32 int_prefix_only(void) {
+    static u8 ref_mem[8192]; static u32 ref_st[6]; static int have;
     u8 *p=arena_alloc(8192,16); if(!p) SKIP("arena_prefix");
-    for(unsigned i=0;i<8192;i++) p[i]=(u8)(i*29);
+    prefix_fill(p);
+    const u32 init[6]={0x13579bdfu,0xa5a50124u,0x2468ace0u,0x30,0x5a5a5a5au,PREFIX_PASSES};
+    if(!have) {
+        kmemcpy(ref_mem,p,8192);
+        for(unsigned i=0;i<6;i++) ref_st[i]=init[i];
+        prefix_model(ref_st,ref_mem);
+        have=1;
+    }
     u32 expected=(u32)p[16]|((u32)p[17]<<8)|((u32)p[18]<<16)|((u32)p[19]<<24),v;
     gdt_set(GDT_SCRATCH_FIRST,(u32)p,8191,0x92,0x4);
+    u32 st[6]; for(unsigned i=0;i<6;i++) st[i]=init[i];
+    int_prefix_loop(st);
+    for(unsigned i=0;i<6;i++) CHECK_EQ(st[i],ref_st[i]);
+    CHECK(eq_bytes(p,ref_mem,8192));
+    u32 sum=csum_mix(csum_mix(st[0],st[2]),st[4]);
+    prefix_fill(p);
     /* FS gives 16-bit effective offsets a safe arena-backed segment. */
     __asm__ volatile("push %%fs; movw $0x40,%%ax; movw %%ax,%%fs; .byte 0x64,0x67,0x8b,0x00; pop %%fs" : "=a"(v):"b"(7),"S"(9):"memory"); CHECK_EQ(v,expected);
     __asm__ volatile("push %%fs; movw $0x40,%%ax; movw %%ax,%%fs; xorl %%eax,%%eax; .byte 0x64,0x67,0x66,0x8b,0x00; pop %%fs" : "=a"(v):"b"(7),"S"(9):"memory","cc"); CHECK_EQ(v,expected&65535);
@@ -1063,28 +1337,9 @@ static u32 int_prefix_addr(void) {
         else __asm__ volatile("movl 7(%1,%2,8),%0" : "=r"(v):"r"(base),"r"(idx):"memory");
         u32 r=0;for(unsigned j=0;j<4;j++)r|=(u32)p[512+7+13*scale+j]<<(8*j); CHECK_EQ(v,r);
     }
-    for(unsigned i=0;i<256;i++) {
-        CHECK_EQ(int_stack_probe(i),i^0x55aa55aa);
-        __asm__ volatile("pushl %1; call int_ret4_probe" : "=a"(v):"r"(i):"ecx","edx","cc","memory"); CHECK_EQ(v,i+7);
-    }
-    u32 n=7,acc=0;
-    __asm__ volatile("1: incl %0; loop 1b" : "+r"(acc),"+c"(n)::"cc"); CHECK_EQ(acc,7); CHECK_EQ(n,0);
-    n=7;acc=0;
-    __asm__ volatile("xorl %%eax,%%eax; 1: leal 1(%0),%0; loope 1b" : "+r"(acc),"+c"(n)::"eax","cc"); CHECK_EQ(acc,7); CHECK_EQ(n,0);
-    n=7;acc=0;
-    __asm__ volatile("orl $1,%%eax; 1: leal 1(%0),%0; loopne 1b" : "+r"(acc),"+c"(n)::"eax","cc"); CHECK_EQ(acc,7); CHECK_EQ(n,0);
-    n=0;v=5; __asm__ volatile("jecxz 1f; movl $99,%0; 1:" : "+r"(v):"c"(n)); CHECK_EQ(v,5);
-    /* Register and memory indirect jump targets are local, known-safe labels. */
-    void *target;
-    __asm__ volatile("movl $1f,%0; jmp *%0; movl $0,%0; 1:" : "=&r"(target)); CHECK(target!=NULL);
-    __asm__ volatile("movl $1f,%0; jmp *%0; int3; 1:" : "=m"(target)::"memory");
-    u32 (*fp)(u32)=int_stack_probe;
-    __asm__ volatile("pushl $19; call *%1; addl $4,%%esp" : "=a"(v):"r"(fp):"ecx","edx","cc","memory"); CHECK_EQ(v,19^0x55aa55aa);
-    CHECK_EQ(fib(24),46368);
-    u32 sum=branch_vm(0x12345678,131072); CHECK_EQ(sum,vm_ref(0x12345678,131072));
-    t_ops(131072*8+242785); return sum;
+    t_work_unit("prefix_loop_pass");
+    t_ops(PREFIX_PASSES); return sum;
 }
-
 static void put32(volatile u8 *p,u32 v) { for(unsigned i=0;i<4;i++) p[i]=(u8)(v>>(8*i)); }
 static void smc_sync(void) { __asm__ volatile("jmp 1f\n1:" ::: "memory"); }
 static NOINLINE u32 exec_code(u8 *p) { smc_sync(); return ((u32 (*)(void))p)(); }
@@ -1238,76 +1493,6 @@ static u32 int_smc_mixed_k2_h16(void) { return smc_mixed_page(2,16); }
 static u32 int_smc_mixed_k8_h1(void) { return smc_mixed_page(8,1); }
 static u32 int_smc_mixed_k8_h16(void) { return smc_mixed_page(8,16); }
 
-/* A snippet of n ADDs is patched every k calls: sweeps the patch rate
-   around the dynarec's compile-or-interpret threshold. */
-/* Keep the parameter sweep from duplicating these large bodies at -O3. */
-static NOINLINE NOCLONE u32 smc_rate(unsigned k,unsigned n) {
-    u8 *snip=arena_alloc(4096,4096); if(!snip) SKIP("arena_smc_rate");
-    snip[0]=0xb8;
-    for(unsigned i=0;i<n;i++) { snip[5+5*i]=0x05; put32(snip+6+5*i,0x01010101); }
-    snip[5+5*n]=0xc3;
-    u32 sum=0,seed=0x7a7e0000u^(k<<8)^n;
-    const unsigned calls=16384;
-    for(unsigned c=0;c<calls;c+=k) {
-        u32 a=rng(&seed); put32(snip+1,a);
-        for(unsigned i=0;i<k;i++) CHECK_EQ(exec_code(snip),a+n*0x01010101u);
-        sum=csum_mix(sum,a);
-    }
-    t_ops(((calls+k-1)/k)*k*(n+2)); return sum;
-}
-/* As smc_rate, but each patch also turns a random one of the ADDs into ADD,
-   SUB or XOR, so the block's code itself changes and is rarely seen twice. */
-static NOINLINE NOCLONE u32 smc_rate_op(unsigned k,unsigned n) {
-    static const u8 ops[3]={0x05,0x2d,0x35};
-    u8 *snip=arena_alloc(4096,4096); if(!snip) SKIP("arena_smc_rate");
-    snip[0]=0xb8;
-    for(unsigned i=0;i<n;i++) { snip[5+5*i]=0x05; put32(snip+6+5*i,0x01010101); }
-    snip[5+5*n]=0xc3;
-    u32 sum=0,seed=0x0b7e0000u^(k<<8)^n;
-    const unsigned calls=16384;
-    for(unsigned c=0;c<calls;c+=k) {
-        u32 a=rng(&seed),r=rng(&seed); put32(snip+1,a); snip[5+5*((r>>8)%n)]=ops[r%3];
-        u32 want=a;
-        for(unsigned i=0;i<n;i++) { u8 o=snip[5+5*i]; want=o==0x05?want+0x01010101u:o==0x2d?want-0x01010101u:want^0x01010101u; }
-        for(unsigned i=0;i<k;i++) CHECK_EQ(exec_code(snip),want);
-        sum=csum_mix(sum,want);
-    }
-    t_ops(((calls+k-1)/k)*k*(n+2)); return sum;
-}
-/* As smc_rate_op, but each patch picks from ADD, OR, AND, SUB, XOR, ADC, SBB and
-   CMP EAX,imm32: the same length and form, the last three outside the set a
-   recompiler may treat as one, ADC and SBB taking the carry the instruction
-   before left. */
-static NOINLINE NOCLONE u32 smc_alu_ops(unsigned k,unsigned n) {
-    static const u8 ops[8]={0x05,0x0d,0x25,0x2d,0x35,0x15,0x1d,0x3d};
-    u8 *snip=arena_alloc(4096,4096); if(!snip) SKIP("arena_smc_alu_ops");
-    snip[0]=0xb8;
-    for(unsigned i=0;i<n;i++) { snip[5+5*i]=0x05; put32(snip+6+5*i,0x89abcdefu*(i+1)); }
-    snip[5+5*n]=0xc3;
-    u32 sum=0,seed=0xa1d0f000u^(k<<8)^n;
-    const unsigned calls=8192;
-    for(unsigned c=0;c<calls;c+=k) {
-        /* Not the first: ADC and SBB there would take the caller's carry */
-        u32 a=rng(&seed),r=rng(&seed); put32(snip+1,a); snip[5+5*(1+(r>>8)%(n-1))]=ops[(r>>4)%8];
-        u32 want=a,cf=0;
-        for(unsigned i=0;i<n;i++) {
-            u8 o=snip[5+5*i]; u32 imm=0x89abcdefu*(i+1),res;
-            switch(o) {
-                case 0x05: res=want+imm; cf=res<want; want=res; break;
-                case 0x0d: want|=imm; cf=0; break;
-                case 0x25: want&=imm; cf=0; break;
-                case 0x2d: cf=want<imm; want-=imm; break;
-                case 0x35: want^=imm; cf=0; break;
-                case 0x15: { u64 t=(u64)want+imm+cf; cf=(u32)(t>>32); want=(u32)t; } break;
-                case 0x1d: { u64 t=(u64)want-imm-cf; cf=(u32)((t>>32)&1); want=(u32)t; } break;
-                default:   cf=want<imm; break; /* CMP */
-            }
-        }
-        for(unsigned i=0;i<k;i++) CHECK_EQ(exec_code(snip),want);
-        sum=csum_mix(sum,want);
-    }
-    t_ops(((calls+k-1)/k)*k*(n+2)); return sum;
-}
 /* Patches flip opcodes between ADD, OR, AND, SUB and XOR EAX,imm32, which a
    recompiler may compile to read the opcode as it runs; every eighth puts
    ADC, SBB or CMP in instead, which such code must not run as one of those,
@@ -1408,82 +1593,96 @@ static u32 int_smc_alu_family_flags(void) {
     }
     t_ops(rounds*k*(n+3)); return sum;
 }
-static u32 int_smc_alu_ops_k1_n8(void) { return smc_alu_ops(1,8); }
-static u32 int_smc_alu_ops_k4_n16(void) { return smc_alu_ops(4,16); }
-static u32 int_smc_alu_ops_k16_n8(void) { return smc_alu_ops(16,8); }
-static u32 int_smc_alu_ops_k16_n32(void) { return smc_alu_ops(16,32); }
-static u32 int_smc_rate_k1_n16(void) { return smc_rate(1,16); }
-static u32 int_smc_rate_k2_n16(void) { return smc_rate(2,16); }
-static u32 int_smc_rate_k4_n16(void) { return smc_rate(4,16); }
-static u32 int_smc_rate_k8_n16(void) { return smc_rate(8,16); }
-static u32 int_smc_rate_k12_n16(void) { return smc_rate(12,16); }
-static u32 int_smc_rate_k15_n16(void) { return smc_rate(15,16); }
-static u32 int_smc_rate_k16_n16(void) { return smc_rate(16,16); }
-static u32 int_smc_rate_k17_n16(void) { return smc_rate(17,16); }
-static u32 int_smc_rate_k20_n16(void) { return smc_rate(20,16); }
-static u32 int_smc_rate_k24_n16(void) { return smc_rate(24,16); }
-static u32 int_smc_rate_k32_n16(void) { return smc_rate(32,16); }
-static u32 int_smc_rate_k64_n16(void) { return smc_rate(64,16); }
-static u32 int_smc_rate_k1_n256(void) { return smc_rate(1,256); }
-static u32 int_smc_rate_k2_n256(void) { return smc_rate(2,256); }
-static u32 int_smc_rate_k4_n256(void) { return smc_rate(4,256); }
-static u32 int_smc_rate_k8_n256(void) { return smc_rate(8,256); }
-static u32 int_smc_rate_k12_n256(void) { return smc_rate(12,256); }
-static u32 int_smc_rate_k15_n256(void) { return smc_rate(15,256); }
-static u32 int_smc_rate_k16_n256(void) { return smc_rate(16,256); }
-static u32 int_smc_rate_k17_n256(void) { return smc_rate(17,256); }
-static u32 int_smc_rate_k20_n256(void) { return smc_rate(20,256); }
-static u32 int_smc_rate_k24_n256(void) { return smc_rate(24,256); }
-static u32 int_smc_rate_k32_n256(void) { return smc_rate(32,256); }
-static u32 int_smc_rate_k64_n256(void) { return smc_rate(64,256); }
-static u32 int_smc_rate_op_k1_n16(void) { return smc_rate_op(1,16); }
-static u32 int_smc_rate_op_k2_n16(void) { return smc_rate_op(2,16); }
-static u32 int_smc_rate_op_k4_n16(void) { return smc_rate_op(4,16); }
-static u32 int_smc_rate_op_k8_n16(void) { return smc_rate_op(8,16); }
-static u32 int_smc_rate_op_k12_n16(void) { return smc_rate_op(12,16); }
-static u32 int_smc_rate_op_k15_n16(void) { return smc_rate_op(15,16); }
-static u32 int_smc_rate_op_k16_n16(void) { return smc_rate_op(16,16); }
-static u32 int_smc_rate_op_k17_n16(void) { return smc_rate_op(17,16); }
-static u32 int_smc_rate_op_k20_n16(void) { return smc_rate_op(20,16); }
-static u32 int_smc_rate_op_k24_n16(void) { return smc_rate_op(24,16); }
-static u32 int_smc_rate_op_k32_n16(void) { return smc_rate_op(32,16); }
-static u32 int_smc_rate_op_k64_n16(void) { return smc_rate_op(64,16); }
-static u32 int_smc_rate_op_k1_n256(void) { return smc_rate_op(1,256); }
-static u32 int_smc_rate_op_k2_n256(void) { return smc_rate_op(2,256); }
-static u32 int_smc_rate_op_k4_n256(void) { return smc_rate_op(4,256); }
-static u32 int_smc_rate_op_k8_n256(void) { return smc_rate_op(8,256); }
-static u32 int_smc_rate_op_k12_n256(void) { return smc_rate_op(12,256); }
-static u32 int_smc_rate_op_k15_n256(void) { return smc_rate_op(15,256); }
-static u32 int_smc_rate_op_k16_n256(void) { return smc_rate_op(16,256); }
-static u32 int_smc_rate_op_k17_n256(void) { return smc_rate_op(17,256); }
-static u32 int_smc_rate_op_k20_n256(void) { return smc_rate_op(20,256); }
-static u32 int_smc_rate_op_k24_n256(void) { return smc_rate_op(24,256); }
-static u32 int_smc_rate_op_k32_n256(void) { return smc_rate_op(32,256); }
-static u32 int_smc_rate_op_k64_n256(void) { return smc_rate_op(64,256); }
-static u32 int_smc_rate_op_k2_n8(void) { return smc_rate_op(2,8); }
-static u32 int_smc_rate_op_k4_n8(void) { return smc_rate_op(4,8); }
-static u32 int_smc_rate_op_k6_n8(void) { return smc_rate_op(6,8); }
-static u32 int_smc_rate_op_k8_n8(void) { return smc_rate_op(8,8); }
-static u32 int_smc_rate_op_k10_n8(void) { return smc_rate_op(10,8); }
-static u32 int_smc_rate_op_k12_n8(void) { return smc_rate_op(12,8); }
-static u32 int_smc_rate_op_k14_n8(void) { return smc_rate_op(14,8); }
-static u32 int_smc_rate_op_k16_n8(void) { return smc_rate_op(16,8); }
-static u32 int_smc_rate_op_k2_n32(void) { return smc_rate_op(2,32); }
-static u32 int_smc_rate_op_k4_n32(void) { return smc_rate_op(4,32); }
-static u32 int_smc_rate_op_k6_n32(void) { return smc_rate_op(6,32); }
-static u32 int_smc_rate_op_k8_n32(void) { return smc_rate_op(8,32); }
-static u32 int_smc_rate_op_k10_n32(void) { return smc_rate_op(10,32); }
-static u32 int_smc_rate_op_k12_n32(void) { return smc_rate_op(12,32); }
-static u32 int_smc_rate_op_k14_n32(void) { return smc_rate_op(14,32); }
-static u32 int_smc_rate_op_k16_n32(void) { return smc_rate_op(16,32); }
-static u32 int_smc_rate_op_k2_n48(void) { return smc_rate_op(2,48); }
-static u32 int_smc_rate_op_k4_n48(void) { return smc_rate_op(4,48); }
-static u32 int_smc_rate_op_k6_n48(void) { return smc_rate_op(6,48); }
-static u32 int_smc_rate_op_k8_n48(void) { return smc_rate_op(8,48); }
-static u32 int_smc_rate_op_k10_n48(void) { return smc_rate_op(10,48); }
-static u32 int_smc_rate_op_k12_n48(void) { return smc_rate_op(12,48); }
-static u32 int_smc_rate_op_k14_n48(void) { return smc_rate_op(14,48); }
-static u32 int_smc_rate_op_k16_n48(void) { return smc_rate_op(16,48); }
+/* Patch-rate sweeps: MOV EAX,imm32, n ALU EAX,imm32 (ADD to start with)
+   and RET, patched every k calls, 16,384 calls in all. A recompiler that
+   stops a block at 50 instructions (86Box) makes blocks starting at
+   instructions 0, 50, 100, ...; a patch changes the immediate of each of
+   those, exactly four bytes (XOR with bytes that are never zero), so every
+   block of the snippet is rewritten and none by more than an imm32:
+     SMC_IMM    only that;
+     SMC_IMM5   also one byte of the next instruction's immediate (five bytes);
+     SMC_OP     also one random opcode, to ADD, SUB or XOR;
+     SMC_OPC    nothing but one random opcode, changed to another of ADD, SUB
+                and XOR (the family a recompiler may read as it runs);
+     SMC_NONFAM also one opcode but the first, to ADC, SBB or CMP, outside it.
+   The expected EAX after each patch comes from replaying the same patches
+   on a copy and interpreting it, in the first call of a record only (the
+   harness's unsampled warmup); the timed calls only patch, run and compare. */
+enum { SMC_IMM=1, SMC_IMM5, SMC_OP, SMC_OPC, SMC_NONFAM };
+enum { SMC_CALLS=16384, SMC_MAX_N=256 };
+static u32 smc_want[SMC_CALLS];
+static u32 smc_want_key;
+static void smc_sweep_init(u8 *snip,unsigned mode,unsigned n) {
+    snip[0]=0xb8; put32(snip+1,0x12345678);
+    for(unsigned i=0;i<n;i++) { snip[5+5*i]=0x05; put32(snip+6+5*i,mode==SMC_NONFAM?0x89abcdefu*(i+1):0x01010101u); }
+    snip[5+5*n]=0xc3;
+}
+static void smc_sweep_patch(u8 *snip,unsigned mode,unsigned n,u32 *seed) {
+    static const u8 fam[3]={0x05,0x2d,0x35},nonfam[3]={0x15,0x1d,0x3d};
+    if(mode!=SMC_OPC) for(unsigned j=0;j<=n;j+=50) {
+        u8 *imm=j?snip+6+5*(j-1):snip+1;
+        put32(imm,rd32le(imm)^(rng(seed)|0x01010101u));
+    }
+    u32 r=(mode==SMC_IMM)?0:rng(seed);
+    if(mode==SMC_IMM5) snip[6]^=(u8)(r|1);
+    else if(mode==SMC_OP) snip[5+5*((r>>8)%n)]=fam[r%3];
+    else if(mode==SMC_OPC) { u8 *o=snip+5+5*((r>>8)%n); unsigned cur=*o==0x05?0:*o==0x2d?1:2; *o=fam[(cur+1+(r&1))%3]; }
+    else if(mode==SMC_NONFAM) snip[5+5*(1+(r>>8)%(n-1))]=nonfam[r%3];
+}
+static u32 smc_sweep_eval(const u8 *snip,unsigned n) {
+    u32 want=rd32le(snip+1),cf=0,fl;
+    for(unsigned i=0;i<n;i++) want=alu_eax_ref(snip[5+5*i],want,rd32le(snip+6+5*i),&cf,&fl);
+    return want;
+}
+static NOINLINE NOCLONE u32 smc_sweep(unsigned mode,unsigned k,unsigned n) {
+    static u8 shadow[5*SMC_MAX_N+8];
+    u8 *snip=arena_alloc(4096,4096); if(!snip) SKIP("arena_smc_rate");
+    const unsigned patches=(SMC_CALLS+k-1)/k;
+    const u32 seed0=0x7a7e0000u^(mode<<20)^(k<<8)^n,key=(mode<<24)|(k<<12)|n;
+    if(smc_want_key!=key) {
+        u32 seed=seed0;
+        smc_sweep_init(shadow,mode,n);
+        for(unsigned i=0;i<patches;i++) { smc_sweep_patch(shadow,mode,n,&seed); smc_want[i]=smc_sweep_eval(shadow,n); }
+        smc_want_key=key;
+    }
+    u32 sum=0,seed=seed0;
+    smc_sweep_init(snip,mode,n);
+    for(unsigned c=0;c<patches;c++) {
+        smc_sweep_patch(snip,mode,n,&seed);
+        u32 want=smc_want[c];
+        for(unsigned i=0;i<k;i++) CHECK_EQ(exec_code(snip),want);
+        sum=csum_mix(sum,want);
+    }
+    t_ops((u64)patches*k*(n+2)); return sum;
+}
+#define SMC_SWEEP(name,mode,k,n) static u32 name(void) { return smc_sweep(mode,k,n); }
+SMC_SWEEP(int_smc_rate_k1_n16,SMC_IMM,1,16)
+SMC_SWEEP(int_smc_rate_k7_n16,SMC_IMM,7,16)
+SMC_SWEEP(int_smc_rate_k8_n16,SMC_IMM,8,16)
+SMC_SWEEP(int_smc_rate_k9_n16,SMC_IMM,9,16)
+SMC_SWEEP(int_smc_rate_k16_n16,SMC_IMM,16,16)
+SMC_SWEEP(int_smc_rate_k64_n16,SMC_IMM,64,16)
+SMC_SWEEP(int_smc_rate_k16_n47,SMC_IMM,16,47)
+SMC_SWEEP(int_smc_rate_k16_n48,SMC_IMM,16,48)
+SMC_SWEEP(int_smc_rate_k16_n49,SMC_IMM,16,49)
+SMC_SWEEP(int_smc_rate_k16_n50,SMC_IMM,16,50)
+SMC_SWEEP(int_smc_rate_k1_n256,SMC_IMM,1,256)
+SMC_SWEEP(int_smc_rate_k16_n256,SMC_IMM,16,256)
+SMC_SWEEP(int_smc_patch4_k16_n32,SMC_IMM,16,32)
+SMC_SWEEP(int_smc_patch5_k16_n32,SMC_IMM5,16,32)
+SMC_SWEEP(int_smc_rate_op_k1_n16,SMC_OP,1,16)
+SMC_SWEEP(int_smc_rate_op_k7_n16,SMC_OP,7,16)
+SMC_SWEEP(int_smc_rate_op_k8_n16,SMC_OP,8,16)
+SMC_SWEEP(int_smc_rate_op_k9_n16,SMC_OP,9,16)
+SMC_SWEEP(int_smc_rate_op_k16_n16,SMC_OP,16,16)
+SMC_SWEEP(int_smc_rate_op_k16_n256,SMC_OP,16,256)
+SMC_SWEEP(int_smc_rate_opc_k16_n16,SMC_OPC,16,16)
+SMC_SWEEP(int_smc_rate_opc_k63_n16,SMC_OPC,63,16)
+SMC_SWEEP(int_smc_rate_opc_k65_n16,SMC_OPC,65,16)
+SMC_SWEEP(int_smc_rate_opc_k127_n16,SMC_OPC,127,16)
+SMC_SWEEP(int_smc_rate_opc_k129_n16,SMC_OPC,129,16)
+SMC_SWEEP(int_smc_rate_nonfam_k1_n16,SMC_NONFAM,1,16)
+SMC_SWEEP(int_smc_rate_nonfam_k16_n16,SMC_NONFAM,16,16)
 
 /* Patched code in the last usable RAM, where chipsets that remap the RAM
    behind 0xA0000-0xFFFFF to the top of memory put it. */
@@ -1659,7 +1858,9 @@ const test_t tests_int[]={
     {"int_cmov",int_cmov,REQ_CMOV, T_CHECK},
     {"int_bcd",int_bcd,REQ_486, T_CHECK},
     {"int_string",int_string,REQ_486},
-    {"int_prefix_addr",int_prefix_addr,REQ_486},
+    {"int_switch_dispatch",int_switch_dispatch,REQ_486},
+    {"int_call_ret_recursive",int_call_ret_recursive,REQ_486},
+    {"int_prefix_only",int_prefix_only,REQ_486},
     {"int_smc",int_smc,REQ_486},
     {"int_smc_split_w_chunk",int_smc_split_w_chunk,REQ_486},
     {"int_smc_split_d_chunk",int_smc_split_d_chunk,REQ_486},
@@ -1668,87 +1869,38 @@ const test_t tests_int[]={
     {"int_smc_rep_stos",int_smc_rep_stos,REQ_486},
     {"int_smc_alu_family_exit",int_smc_alu_family_exit,REQ_486},
     {"int_smc_alu_family_flags",int_smc_alu_family_flags,REQ_486,T_CHECK},
-    {"int_smc_alu_ops_k1_n8",int_smc_alu_ops_k1_n8,REQ_486},
-    {"int_smc_alu_ops_k4_n16",int_smc_alu_ops_k4_n16,REQ_486},
-    {"int_smc_alu_ops_k16_n8",int_smc_alu_ops_k16_n8,REQ_486},
-    {"int_smc_alu_ops_k16_n32",int_smc_alu_ops_k16_n32,REQ_486},
     {"int_smc_mixed_k2_h1",int_smc_mixed_k2_h1,REQ_486},
     {"int_smc_mixed_k2_h16",int_smc_mixed_k2_h16,REQ_486},
     {"int_smc_mixed_k8_h1",int_smc_mixed_k8_h1,REQ_486},
     {"int_smc_mixed_k8_h16",int_smc_mixed_k8_h16,REQ_486},
     {"int_smc_ram_top",int_smc_ram_top,REQ_486},
     {"int_smc_rate_k1_n16",int_smc_rate_k1_n16,REQ_486},
-    {"int_smc_rate_k2_n16",int_smc_rate_k2_n16,REQ_486},
-    {"int_smc_rate_k4_n16",int_smc_rate_k4_n16,REQ_486},
+    {"int_smc_rate_k7_n16",int_smc_rate_k7_n16,REQ_486},
     {"int_smc_rate_k8_n16",int_smc_rate_k8_n16,REQ_486},
-    {"int_smc_rate_k12_n16",int_smc_rate_k12_n16,REQ_486},
-    {"int_smc_rate_k15_n16",int_smc_rate_k15_n16,REQ_486},
+    {"int_smc_rate_k9_n16",int_smc_rate_k9_n16,REQ_486},
     {"int_smc_rate_k16_n16",int_smc_rate_k16_n16,REQ_486},
-    {"int_smc_rate_k17_n16",int_smc_rate_k17_n16,REQ_486},
-    {"int_smc_rate_k20_n16",int_smc_rate_k20_n16,REQ_486},
-    {"int_smc_rate_k24_n16",int_smc_rate_k24_n16,REQ_486},
-    {"int_smc_rate_k32_n16",int_smc_rate_k32_n16,REQ_486},
     {"int_smc_rate_k64_n16",int_smc_rate_k64_n16,REQ_486},
-    {"int_smc_rate_k1_n256",int_smc_rate_k1_n256,REQ_486, T_CHECK},
-    {"int_smc_rate_k2_n256",int_smc_rate_k2_n256,REQ_486, T_CHECK},
-    {"int_smc_rate_k4_n256",int_smc_rate_k4_n256,REQ_486, T_CHECK},
-    {"int_smc_rate_k8_n256",int_smc_rate_k8_n256,REQ_486, T_CHECK},
-    {"int_smc_rate_k12_n256",int_smc_rate_k12_n256,REQ_486, T_CHECK},
-    {"int_smc_rate_k15_n256",int_smc_rate_k15_n256,REQ_486, T_CHECK},
-    {"int_smc_rate_k16_n256",int_smc_rate_k16_n256,REQ_486, T_CHECK},
-    {"int_smc_rate_k17_n256",int_smc_rate_k17_n256,REQ_486, T_CHECK},
-    {"int_smc_rate_k20_n256",int_smc_rate_k20_n256,REQ_486, T_CHECK},
-    {"int_smc_rate_k24_n256",int_smc_rate_k24_n256,REQ_486, T_CHECK},
-    {"int_smc_rate_k32_n256",int_smc_rate_k32_n256,REQ_486, T_CHECK},
-    {"int_smc_rate_k64_n256",int_smc_rate_k64_n256,REQ_486, T_CHECK},
+    {"int_smc_rate_k16_n47",int_smc_rate_k16_n47,REQ_486},
+    {"int_smc_rate_k16_n48",int_smc_rate_k16_n48,REQ_486},
+    {"int_smc_rate_k16_n49",int_smc_rate_k16_n49,REQ_486},
+    {"int_smc_rate_k16_n50",int_smc_rate_k16_n50,REQ_486},
+    {"int_smc_rate_k1_n256",int_smc_rate_k1_n256,REQ_486},
+    {"int_smc_rate_k16_n256",int_smc_rate_k16_n256,REQ_486},
+    {"int_smc_patch4_k16_n32",int_smc_patch4_k16_n32,REQ_486},
+    {"int_smc_patch5_k16_n32",int_smc_patch5_k16_n32,REQ_486},
     {"int_smc_rate_op_k1_n16",int_smc_rate_op_k1_n16,REQ_486},
-    {"int_smc_rate_op_k2_n16",int_smc_rate_op_k2_n16,REQ_486},
-    {"int_smc_rate_op_k4_n16",int_smc_rate_op_k4_n16,REQ_486},
+    {"int_smc_rate_op_k7_n16",int_smc_rate_op_k7_n16,REQ_486},
     {"int_smc_rate_op_k8_n16",int_smc_rate_op_k8_n16,REQ_486},
-    {"int_smc_rate_op_k12_n16",int_smc_rate_op_k12_n16,REQ_486},
-    {"int_smc_rate_op_k15_n16",int_smc_rate_op_k15_n16,REQ_486},
+    {"int_smc_rate_op_k9_n16",int_smc_rate_op_k9_n16,REQ_486},
     {"int_smc_rate_op_k16_n16",int_smc_rate_op_k16_n16,REQ_486},
-    {"int_smc_rate_op_k17_n16",int_smc_rate_op_k17_n16,REQ_486},
-    {"int_smc_rate_op_k20_n16",int_smc_rate_op_k20_n16,REQ_486},
-    {"int_smc_rate_op_k24_n16",int_smc_rate_op_k24_n16,REQ_486},
-    {"int_smc_rate_op_k32_n16",int_smc_rate_op_k32_n16,REQ_486},
-    {"int_smc_rate_op_k64_n16",int_smc_rate_op_k64_n16,REQ_486},
-    {"int_smc_rate_op_k1_n256",int_smc_rate_op_k1_n256,REQ_486},
-    {"int_smc_rate_op_k2_n256",int_smc_rate_op_k2_n256,REQ_486},
-    {"int_smc_rate_op_k4_n256",int_smc_rate_op_k4_n256,REQ_486},
-    {"int_smc_rate_op_k8_n256",int_smc_rate_op_k8_n256,REQ_486},
-    {"int_smc_rate_op_k12_n256",int_smc_rate_op_k12_n256,REQ_486},
-    {"int_smc_rate_op_k15_n256",int_smc_rate_op_k15_n256,REQ_486},
     {"int_smc_rate_op_k16_n256",int_smc_rate_op_k16_n256,REQ_486},
-    {"int_smc_rate_op_k17_n256",int_smc_rate_op_k17_n256,REQ_486},
-    {"int_smc_rate_op_k20_n256",int_smc_rate_op_k20_n256,REQ_486},
-    {"int_smc_rate_op_k24_n256",int_smc_rate_op_k24_n256,REQ_486},
-    {"int_smc_rate_op_k32_n256",int_smc_rate_op_k32_n256,REQ_486},
-    {"int_smc_rate_op_k64_n256",int_smc_rate_op_k64_n256,REQ_486},
-    {"int_smc_rate_op_k2_n8",int_smc_rate_op_k2_n8,REQ_486},
-    {"int_smc_rate_op_k4_n8",int_smc_rate_op_k4_n8,REQ_486},
-    {"int_smc_rate_op_k6_n8",int_smc_rate_op_k6_n8,REQ_486},
-    {"int_smc_rate_op_k8_n8",int_smc_rate_op_k8_n8,REQ_486},
-    {"int_smc_rate_op_k10_n8",int_smc_rate_op_k10_n8,REQ_486},
-    {"int_smc_rate_op_k12_n8",int_smc_rate_op_k12_n8,REQ_486},
-    {"int_smc_rate_op_k14_n8",int_smc_rate_op_k14_n8,REQ_486},
-    {"int_smc_rate_op_k16_n8",int_smc_rate_op_k16_n8,REQ_486},
-    {"int_smc_rate_op_k2_n32",int_smc_rate_op_k2_n32,REQ_486},
-    {"int_smc_rate_op_k4_n32",int_smc_rate_op_k4_n32,REQ_486},
-    {"int_smc_rate_op_k6_n32",int_smc_rate_op_k6_n32,REQ_486},
-    {"int_smc_rate_op_k8_n32",int_smc_rate_op_k8_n32,REQ_486},
-    {"int_smc_rate_op_k10_n32",int_smc_rate_op_k10_n32,REQ_486},
-    {"int_smc_rate_op_k12_n32",int_smc_rate_op_k12_n32,REQ_486},
-    {"int_smc_rate_op_k14_n32",int_smc_rate_op_k14_n32,REQ_486},
-    {"int_smc_rate_op_k16_n32",int_smc_rate_op_k16_n32,REQ_486},
-    {"int_smc_rate_op_k2_n48",int_smc_rate_op_k2_n48,REQ_486},
-    {"int_smc_rate_op_k4_n48",int_smc_rate_op_k4_n48,REQ_486},
-    {"int_smc_rate_op_k6_n48",int_smc_rate_op_k6_n48,REQ_486},
-    {"int_smc_rate_op_k8_n48",int_smc_rate_op_k8_n48,REQ_486},
-    {"int_smc_rate_op_k10_n48",int_smc_rate_op_k10_n48,REQ_486},
-    {"int_smc_rate_op_k12_n48",int_smc_rate_op_k12_n48,REQ_486},
-    {"int_smc_rate_op_k14_n48",int_smc_rate_op_k14_n48,REQ_486},
-    {"int_smc_rate_op_k16_n48",int_smc_rate_op_k16_n48,REQ_486},
+    {"int_smc_rate_opc_k16_n16",int_smc_rate_opc_k16_n16,REQ_486},
+    {"int_smc_rate_opc_k63_n16",int_smc_rate_opc_k63_n16,REQ_486},
+    {"int_smc_rate_opc_k65_n16",int_smc_rate_opc_k65_n16,REQ_486},
+    {"int_smc_rate_opc_k127_n16",int_smc_rate_opc_k127_n16,REQ_486},
+    {"int_smc_rate_opc_k129_n16",int_smc_rate_opc_k129_n16,REQ_486},
+    {"int_smc_rate_nonfam_k1_n16",int_smc_rate_nonfam_k1_n16,REQ_486},
+    {"int_smc_rate_nonfam_k16_n16",int_smc_rate_nonfam_k16_n16,REQ_486},
     {"int_cpuid_cr",int_cpuid_cr,REQ_486, T_CHECK},
     {"int_alu_burn",int_alu_burn,REQ_486},
     {0,0,0}
