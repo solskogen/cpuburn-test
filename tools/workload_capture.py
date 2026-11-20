@@ -1,21 +1,27 @@
-"""Step-only, whole-emulator CPU accounting and optional Linux perf capture.
+"""Step-only CPU accounting of the emulation thread and optional Linux perf capture.
 
 WORK boundaries are observed after a step, not at the guest instruction that
-printed them. Mixed/partial boundary steps are therefore never attributed.
-Ratios describe unthrottled speed capacity, not the GUI's reported actual speed.
+printed them. Mixed/partial boundary steps are therefore never attributed; the
+runner stops its steps at WORK lines (automation `wait serial`) so that they
+are short. Ratios describe unthrottled speed capacity, not the GUI's reported
+actual speed.
 """
 
 from collections import Counter
 import bisect
+import ctypes
 import math
 import os
 from pathlib import Path
 import platform
 import re
+import select
 import shutil
 import signal
 import statistics
+import struct
 import subprocess
+import sys
 import time
 
 
@@ -25,15 +31,138 @@ WORK = re.compile(r"WORK phase=(warmup|sample|end) r=([1-9][0-9]*) "
 # then, and are repeated well inside the guest's 1 s minimum: a stale frame
 # queued with the current one can overrun the 16-byte UART FIFO.
 LEASE_RENEW_MS = 250
+# 86Box names its emulation thread (src/qt/qt_main.cpp, main_thread_fn).
+EMULATION_THREAD = "main_thread"
+
+
+def is_linux():
+    return sys.platform.startswith("linux")
+
+
+def require_linux(feature):
+    """Fail clearly where a feature depends on Linux /proc, perf or affinity."""
+    if not is_linux():
+        raise RuntimeError(f"{feature} requires Linux (/proc, perf_event, sched_setaffinity); "
+                           f"this host is {sys.platform}")
 
 
 def process_cpu_seconds(pid):
     """Linux /proc/PID/stat utime+stime includes all threads, not just main."""
+    require_linux("process CPU accounting")
     fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
     return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
 
 
-def host_metadata():
+def find_thread(pid, name=EMULATION_THREAD):
+    """The TID of the first thread of PID whose comm is `name`, or None."""
+    if not is_linux():
+        return None
+    try:
+        tasks = sorted(Path(f"/proc/{pid}/task").iterdir(), key=lambda p: int(p.name))
+    except (OSError, ValueError):
+        return None
+    for task in tasks:
+        try:
+            if (task / "comm").read_text().strip() == name:
+                return int(task.name)
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def parse_schedstat(text):
+    """CPU seconds from /proc/.../schedstat: on-CPU nanoseconds, run delay, slices."""
+    fields = text.split()
+    if len(fields) < 3:
+        raise ValueError(f"malformed schedstat: {text!r}")
+    return int(fields[0]) / 1e9
+
+
+def thread_cpu_seconds(pid, tid):
+    """(seconds, source) for one thread: schedstat in ns, else stat in ticks."""
+    base = Path(f"/proc/{pid}/task/{tid}")
+    try:
+        return parse_schedstat((base / "schedstat").read_text()), "schedstat_ns"
+    except (OSError, ValueError):
+        fields = (base / "stat").read_text().rsplit(")", 1)[1].split()
+        return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK"), "stat_ticks"
+
+
+class EmulationClock:
+    """CPU time of 86Box's emulation thread, with clean fallbacks.
+
+    locate() is called once, after the first automation reply (requests run on
+    the emulation thread, so it exists by then); the scope is then fixed for the
+    whole run, so no step mixes two clocks. Without the named thread the whole
+    process's /proc/PID/stat (all threads, 10 ms ticks) is used; on hosts
+    without /proc CPU time is unavailable and reads as a constant 0."""
+
+    def __init__(self, pid, fallback=None):
+        self.pid = pid
+        self.tid = None
+        self.fallback = fallback or (lambda: process_cpu_seconds(pid))
+        self.scope = "process_all_threads_stat_ticks" if is_linux() else "unavailable"
+        self.note = None if is_linux() else "CPU time needs Linux /proc; capacity per CPU second unavailable"
+
+    def locate(self):
+        if not is_linux():
+            return self.scope
+        tid = find_thread(self.pid)
+        if tid is not None:
+            try:
+                _, source = thread_cpu_seconds(self.pid, tid)
+            except (OSError, ValueError):
+                tid = None
+        if tid is None:
+            self.note = (f"no thread named {EMULATION_THREAD}; charging all emulator "
+                         "threads at 10 ms resolution")
+            return self.scope
+        self.tid = tid
+        self.scope = "emulation_thread_" + source
+        return self.scope
+
+    def cpu_seconds(self):
+        if self.scope == "unavailable":
+            return 0.0
+        if self.tid is not None:
+            return thread_cpu_seconds(self.pid, self.tid)[0]
+        return self.fallback()
+
+
+def _read(path):
+    try:
+        return Path(path).read_text().strip()
+    except OSError:
+        return None
+
+
+def cpu_boost_state():
+    """'on'/'off' for AMD/acpi-cpufreq boost or intel_pstate turbo, else None."""
+    boost = _read("/sys/devices/system/cpu/cpufreq/boost")
+    if boost in ("0", "1"):
+        return "on" if boost == "1" else "off"
+    no_turbo = _read("/sys/devices/system/cpu/intel_pstate/no_turbo")
+    if no_turbo in ("0", "1"):
+        return "off" if no_turbo == "1" else "on"
+    return None
+
+
+def core_state(core):
+    """Volatile frequency state of one logical CPU (kHz), or {} without sysfs."""
+    base = f"/sys/devices/system/cpu/cpu{int(core)}/cpufreq/"
+    state = {"core": int(core)}
+    for key in ("scaling_cur_freq", "scaling_max_freq", "cpuinfo_max_freq"):
+        value = _read(base + key)
+        if value and value.isdigit():
+            state[key + "_khz"] = int(value)
+    governor = _read(base + "scaling_governor")
+    if governor:
+        state["governor"] = governor
+    return state
+
+
+def host_metadata(pin=None):
+    """Stable host description; volatile frequencies go in host_state()."""
     cpu = platform.processor()
     try:
         for line in Path("/proc/cpuinfo").read_text().splitlines():
@@ -42,11 +171,99 @@ def host_metadata():
                 break
     except OSError:
         pass
+    core = pin if pin is not None else 0
     return {"platform": platform.platform(), "kernel": platform.release(),
             "architecture": platform.machine(), "python": platform.python_version(),
-            "cpu": cpu, "logical_cpus": os.cpu_count(),
-            "process_cpu_scope": "total_process_all_threads",
-            "clock": "CLOCK_MONOTONIC", "clock_ticks_per_second": os.sysconf("SC_CLK_TCK")}
+            "cpu": cpu, "logical_cpus": os.cpu_count(), "pinned_core": pin,
+            "governor": core_state(core).get("governor") if is_linux() else None,
+            "boost": cpu_boost_state() if is_linux() else None,
+            "clock": "CLOCK_MONOTONIC",
+            "clock_ticks_per_second": os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else None}
+
+
+def host_state(pin=None):
+    """Frequencies of the pinned (or first) core at this moment."""
+    if not is_linux():
+        return {}
+    return core_state(pin if pin is not None else 0)
+
+
+PERF_SYSCALL = {"x86_64": 298, "amd64": 298, "i386": 336, "i686": 336,
+                "aarch64": 241, "arm64": 241, "riscv64": 241, "armv7l": 364,
+                "ppc64le": 319, "ppc64": 319}
+
+
+class ThreadCounters:
+    """Hardware cycles and instructions of one thread, read at step boundaries.
+
+    Uses perf_event_open(2) directly, so per-step deltas line up exactly with
+    the CPU-time snapshots. Counts user and kernel mode where
+    perf_event_paranoid allows it, otherwise user mode only."""
+
+    EVENTS = (("cycles", 0), ("instructions", 1))
+
+    def __init__(self, tid):
+        require_linux("--perf-stat")
+        number = PERF_SYSCALL.get(platform.machine().lower())
+        if number is None:
+            raise RuntimeError(f"--perf-stat: unknown perf_event_open syscall on {platform.machine()}")
+        libc = ctypes.CDLL(None, use_errno=True)
+        self.fds, self.scope = [], "user+kernel"
+        for _, config in self.EVENTS:
+            fd = -1
+            for exclude_kernel in (0, 1):
+                flags = (1 << 6) | (exclude_kernel << 5)  # exclude_hv, exclude_kernel
+                attr = struct.pack("<IIQQQQQIIQ", 0, 64, config, 0, 0, 3, flags, 0, 0, 0)
+                buffer = ctypes.create_string_buffer(attr, 64)
+                fd = libc.syscall(ctypes.c_long(number), buffer, ctypes.c_long(tid),
+                                  ctypes.c_long(-1), ctypes.c_long(-1), ctypes.c_ulong(8))
+                if fd >= 0:
+                    if exclude_kernel:
+                        self.scope = "user"
+                    break
+            if fd < 0:
+                error = ctypes.get_errno()
+                self.close()
+                raise RuntimeError(f"--perf-stat: perf_event_open failed: {os.strerror(error)} "
+                                   "(check /proc/sys/kernel/perf_event_paranoid)")
+            self.fds.append(fd)
+
+    def read(self):
+        values = []
+        for fd in self.fds:
+            value, enabled, running = struct.unpack("<QQQ", os.read(fd, 24))
+            values.append(value * enabled / running if running else 0.0)
+        return tuple(values)
+
+    def close(self):
+        for fd in self.fds:
+            os.close(fd)
+        self.fds = []
+
+
+T975 = (12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228,
+        2.201, 2.179, 2.160, 2.145, 2.131, 2.120, 2.110, 2.101, 2.093, 2.086)
+
+
+def t975(df):
+    """Two-sided 95% Student t quantile."""
+    return T975[df - 1] if df <= len(T975) else 1.96 + 2.4 / df
+
+
+def batch_means_interval(values):
+    """(mean, 95% half-width) by the method of batch means.
+
+    Adjacent values are averaged into batches (sqrt(n) of them once there are
+    16 or more values) before the standard error is taken, so positively
+    autocorrelated blocks widen the interval instead of narrowing it."""
+    n = len(values)
+    mean = statistics.fmean(values)
+    batches = n if n < 16 else max(4, math.isqrt(n))
+    size = n // batches
+    start = n - batches * size  # drop the oldest remainder
+    means = [statistics.fmean(values[start + i * size:start + (i + 1) * size])
+             for i in range(batches)]
+    return mean, t975(batches - 1) * statistics.stdev(means) / math.sqrt(batches)
 
 
 def settle_state(blocks, tolerance, min_blocks):
@@ -57,7 +274,9 @@ def settle_state(blocks, tolerance, min_blocks):
     when it holds at least min_blocks blocks, twice the standard error of the
     mean block speed (an approximate 95% interval) is within tolerance of the
     mean, and the means of its first and second halves differ by at most
-    tolerance (no drift). All ratios are relative to the window mean.
+    tolerance (no drift). All ratios are relative to the window mean. The
+    interval is a batch-means 95% interval (see batch_means_interval), which
+    stays honest when consecutive blocks are correlated.
     """
     discard = min(len(blocks), max(1, len(blocks) // 4))
     window = blocks[discard:]
@@ -69,10 +288,9 @@ def settle_state(blocks, tolerance, min_blocks):
         state["window_speed_percent"] = (
             sum(guest for _, guest in window) / 10 / sum(wall for wall, _ in window))
     if len(speeds) >= 2:
-        mean = statistics.fmean(speeds)
+        mean, interval = batch_means_interval(speeds)
         half = len(speeds) // 2
-        state["relative_interval"] = (
-            2 * statistics.stdev(speeds) / math.sqrt(len(speeds)) / mean)
+        state["relative_interval"] = interval / mean
         state["relative_drift"] = (
             statistics.fmean(speeds[-half:]) - statistics.fmean(speeds[:half])) / mean
         state["settled"] = (len(speeds) >= min_blocks
@@ -113,6 +331,7 @@ class WorkloadCapture:
         self.unattributed = {"steps": 0, "step_wall_seconds": 0.0,
                              "process_cpu_seconds": 0.0, "emulated_ms": 0}
         self.windows = []
+        self.cpu_scope = "total_process_all_threads"
 
     def _settle(self, entry):
         return settle_state(entry["_blocks"], self.settings["settle_tolerance"],
@@ -123,6 +342,16 @@ class WorkloadCapture:
         if self.pending is not None:
             raise RuntimeError("feed serial after each observed step")
         self.pending = (before, after, self.active)
+
+    def observe_unattributed(self, before, after):
+        """Charge a step known to straddle a boundary (e.g. the 1 ms steps
+        that complete a WORK line) to the unattributed totals."""
+        wall, cpu, guest = (after[i] - before[i] for i in range(3))
+        if all(math.isfinite(x) for x in (wall, cpu, guest)) and wall >= 0 and cpu >= 0 and guest >= 0:
+            self.unattributed["steps"] += 1
+            self.unattributed["step_wall_seconds"] += wall
+            self.unattributed["process_cpu_seconds"] += cpu
+            self.unattributed["emulated_ms"] += guest
 
     def _close(self, boundary, reason):
         if self.active is not None:
@@ -287,7 +516,7 @@ class WorkloadCapture:
                 if group["process_cpu_seconds"] else None)
         return {
             "sampling": dict(self.settings),
-            "cpu_scope": "total_process_all_threads",
+            "cpu_scope": self.cpu_scope,
             "measurement": "unthrottled_step_only_speed_capacity_not_actual_speed",
             "boundary_policy": "exclude_mixed_and_partial_line_steps",
             "boundary_uncertainty_emulated_ms": self.step_ms,
@@ -303,8 +532,20 @@ class WorkloadCapture:
         }
 
 
+JIT_DSO = re.compile(r"\[unknown\]|perf-\d+\.map|\[anon|//anon|memfd:|\[jit")
+
+
+def _dso(text):
+    match = re.search(r"\(([^()]*)\)\s*$", text)
+    return match[1] if match else ""
+
+
 def parse_perf_script(lines, windows):
-    """Attribute leaf and inclusive stacks only to interior step intervals."""
+    """Attribute leaf and inclusive stacks only to interior step intervals.
+
+    A leaf in an anonymous executable mapping (perf shows `[unknown]`, or the
+    JIT's /tmp/perf-PID.map when 86Box writes one) counts as dynarec-generated
+    code; jit_share is the fraction of a workload's samples there."""
     starts = [window[0] for window in windows]
     counts = {}
     current = None
@@ -321,6 +562,12 @@ def parse_perf_script(lines, windows):
         if current is not None:
             counts[current]["inclusive"].update(stack)
 
+    def leaf(symbol):
+        entry = counts[current]
+        entry["leaf"][symbol] += 1
+        if JIT_DSO.search(_dso(symbol)) or symbol.startswith("[unknown]"):
+            entry["jit"] += 1
+
     for line in lines:
         match = re.match(r"^\s*(\d+\.\d+):\s+(.*)$", line)
         if match:
@@ -332,10 +579,10 @@ def parse_perf_script(lines, windows):
             if index >= 0 and stamp < windows[index][1]:
                 current = windows[index][2]
                 entry = counts.setdefault(current, {"samples": 0, "leaf": Counter(),
-                                                    "inclusive": Counter()})
+                                                    "inclusive": Counter(), "jit": 0})
                 entry["samples"] += 1
                 if symbol:
-                    entry["leaf"][symbol] += 1
+                    leaf(symbol)
                     stack.add(symbol)
                 else:
                     leaf_pending = True
@@ -344,20 +591,35 @@ def parse_perf_script(lines, windows):
             symbol = symbol_text(line)
             stack.add(symbol)
             if leaf_pending:
-                counts[current]["leaf"][symbol] += 1
+                leaf(symbol)
                 leaf_pending = False
     flush()
     return {str(key): {"samples": value["samples"],
+                      "jit_samples": value["jit"],
+                      "jit_share": value["jit"] / value["samples"] if value["samples"] else None,
                       "leaf_hotpaths": value["leaf"].most_common(30),
                       "inclusive_hotpaths": value["inclusive"].most_common(30)}
             for key, value in counts.items()}
 
 
 class PerfRecorder:
-    def __init__(self, run_dir):
+    """perf record on the emulation thread, enabled only during sample windows.
+
+    Records at `frequency` Hz with the given call-graph mode (dwarf by default,
+    fp or none optional) on one TID when known, starting with events disabled
+    and switched on/off through perf's control FIFO, so perf.data holds sample
+    windows only. The report streams `perf script` instead of saving it."""
+
+    def __init__(self, run_dir, frequency=999, call_graph="dwarf"):
         self.directory = Path(run_dir)
         self.process = None
         self.command = None
+        self.frequency = int(frequency)
+        self.call_graph = call_graph
+        self.control = self.ack = None
+        self.enabled = False
+        self.pid = None
+        self.tid = None
 
     def _error(self, reason):
         log = self.directory / "perf-record.log"
@@ -365,53 +627,108 @@ class PerfRecorder:
         return RuntimeError(f"{reason}; perf permissions/events must be available. "
                             f"See {log}: {details[-4000:]}")
 
-    def start(self, pid):
+    def start(self, pid, tid=None):
         executable = shutil.which("perf")
         if executable is None:
             raise RuntimeError("--perf requested but perf is not installed")
-        self.command = [executable, "record", "-F", "99", "-g", "--user-callchains", "-p", str(pid),
-                        "--mmap-pages", "64",
-                        "-o", str(self.directory / "perf.data"), "--timestamp",
+        self.pid, self.tid = pid, tid
+        target = ["-t", str(tid)] if tid is not None else ["-p", str(pid)]
+        graph = ([] if self.call_graph == "none" else
+                 ["--call-graph", "dwarf,8192" if self.call_graph == "dwarf" else self.call_graph,
+                  "--user-callchains"])
+        control = []
+        if hasattr(os, "mkfifo"):
+            ctl, ack = self.directory / "perf-ctl.fifo", self.directory / "perf-ack.fifo"
+            for fifo in (ctl, ack):
+                if fifo.exists():
+                    fifo.unlink()
+                os.mkfifo(fifo, 0o600)
+            # O_RDWR keeps both ends open, so neither side blocks on open.
+            self.control = os.open(ctl, os.O_RDWR | os.O_NONBLOCK)
+            self.ack = os.open(ack, os.O_RDWR | os.O_NONBLOCK)
+            control = ["--control", f"fifo:{ctl},{ack}", "--delay", "-1"]
+        self.command = [executable, "record", "-F", str(self.frequency), *graph, *target,
+                        *control, "-o", str(self.directory / "perf.data"),
                         "--clockid", "mono"]
         with (self.directory / "perf-record.log").open("wb") as log:
             self.process = subprocess.Popen(self.command, stdout=log, stderr=log)
         time.sleep(0.25)
         self.check()
+        self.enabled = not control
+
+    def _command(self, word):
+        if self.control is None or self.process is None:
+            return
+        os.write(self.control, word.encode() + b"\n")
+        ready, _, _ = select.select([self.ack], [], [], 5)
+        if not ready:
+            self.check()
+            raise self._error(f"perf did not acknowledge '{word}'")
+        os.read(self.ack, 64)
+
+    def enable(self):
+        if not self.enabled:
+            self._command("enable")
+            self.enabled = True
+
+    def disable(self):
+        if self.enabled and self.control is not None:
+            self._command("disable")
+            self.enabled = False
 
     def check(self):
         if self.process is not None and self.process.poll() is not None:
             raise self._error(f"perf record exited unexpectedly ({self.process.returncode})")
 
+    def _close_fifos(self):
+        for name in ("control", "ack"):
+            fd = getattr(self, name)
+            if fd is not None:
+                os.close(fd)
+                setattr(self, name, None)
+        for fifo in ("perf-ctl.fifo", "perf-ack.fifo"):
+            (self.directory / fifo).unlink(missing_ok=True)
+
     def stop(self):
         if self.process is None:
             return
-        self.check()
-        self.process.send_signal(signal.SIGINT)
         try:
-            code = self.process.wait(timeout=15)
-        except subprocess.TimeoutExpired:
-            self.process.kill()
-            self.process.wait()
-            raise self._error("perf did not flush within 15 seconds")
-        if code not in (0, -signal.SIGINT, 128 + signal.SIGINT):
-            raise self._error(f"perf record failed ({code})")
+            self.check()
+            self.process.send_signal(signal.SIGINT)
+            try:
+                code = self.process.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait()
+                raise self._error("perf did not flush within 60 seconds")
+            if code not in (0, -signal.SIGINT, 128 + signal.SIGINT):
+                raise self._error(f"perf record failed ({code})")
+        finally:
+            self._close_fifos()
 
     def report(self, windows):
         data = self.directory / "perf.data"
         if not data.is_file() or data.stat().st_size == 0:
             raise self._error("perf record produced no nonempty perf.data")
-        script = self.directory / "perf.script"
-        command = [self.command[0], "script", "--ns", "-i",
-                   str(self.directory / "perf.data"), "-F", "time,ip,sym,dso"]
-        with script.open("w") as output, \
-                (self.directory / "perf-script.log").open("w") as errors:
-            result = subprocess.run(command, stdout=output, stderr=errors)
-        if result.returncode:
+        command = [self.command[0], "script", "--ns", "-i", str(data), "-F", "time,ip,sym,dso"]
+        with (self.directory / "perf-script.log").open("w") as errors:
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=errors,
+                                       text=True, errors="replace")
+            try:
+                hotpaths = parse_perf_script(process.stdout, windows)
+            finally:
+                process.stdout.close()
+                code = process.wait()
+        if code:
             raise RuntimeError("perf script failed; see perf-script.log")
-        with script.open() as source:
-            hotpaths = parse_perf_script(source, windows)
+        samples = sum(v["samples"] for v in hotpaths.values())
+        jit = sum(v["jit_samples"] for v in hotpaths.values())
+        perf_map = Path(f"/tmp/perf-{self.pid}.map")
         return {"status": "captured" if hotpaths else "no_attributed_samples",
                 "command": self.command, "script_command": command,
-                "clock": "CLOCK_MONOTONIC", "workloads_by_id": hotpaths,
-                "interior_step_windows": windows,
-                "data": str(self.directory / "perf.data"), "script": str(script)}
+                "frequency_hz": self.frequency, "call_graph": self.call_graph,
+                "thread": self.tid, "clock": "CLOCK_MONOTONIC", "workloads_by_id": hotpaths,
+                "attributed_samples": samples,
+                "jit_share": jit / samples if samples else None,
+                "perf_map": str(perf_map) if perf_map.exists() else None,
+                "interior_step_windows": windows, "data": str(data)}

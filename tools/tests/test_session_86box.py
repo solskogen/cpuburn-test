@@ -308,3 +308,20 @@ class WipeTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TextPollTest(unittest.TestCase):
+    def test_text_read_at_most_every_poll_interval(self):
+        api = FakeApi(lambda ms: (720, 400, "menu"))
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as tmp:
+            self.assertEqual(run_session(api, [], Path(tmp), 6000, text_poll_ms=2000), "done")
+        self.assertEqual(api.requests.count("info"), 6)
+        self.assertEqual(api.requests.count("text"), 3)
+
+    def test_resets_still_checked_without_text(self):
+        watch = Watch()
+        info = {"hard_resets": 0, "soft_resets": 0}
+        self.assertEqual(watch.alerts(info, None, text_read=False), [])
+        self.assertFalse(watch.graphical)
+        self.assertEqual(watch.alerts(dict(info, soft_resets=1), None, text_read=False),
+                         ["CPU reset (hard 0, soft 1)"])

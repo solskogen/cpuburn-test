@@ -18,13 +18,14 @@ from pathlib import Path
 import re
 import socket
 import struct
-import subprocess
 import sys
 import time
 import zlib
 
-from run_86box import (Automation, bios_f1_prompt, display_environment, edited_config,
-                       emulator_binary, refuse_running, rom_directory, stop_process, vm_config)
+from run_86box import (TRANSCRIPT_MODES, Automation, Transcript, bios_f1_prompt,
+                       display_environment, edited_config, emulator_binary, launch_emulator,
+                       positive, refuse_running, rom_directory, run_main, shutdown_emulator,
+                       signals_blocked, stop_process, vm_config)
 
 
 # Set-1 make codes; 0x100 marks an E0-prefixed key, as `key` takes them.
@@ -239,17 +240,20 @@ class Watch:
         self.resets = None
         self.last_words = ()
 
-    def alerts(self, info, text):
+    def alerts(self, info, text, text_read=True):
+        """text_read=False: the screen was not polled this sample; only CPU
+        resets are checked."""
         found = []
-        if text is None:
-            self.graphical = True
-        elif self.graphical:
-            found.append("text mode after a graphical screen")
-            self.graphical = False
-        words = tuple(w for w in ERROR_WORDS if text and w in text)
-        if words and words != self.last_words:
-            found.append("text shows " + ", ".join(repr(w) for w in words))
-        self.last_words = words
+        if text_read:
+            if text is None:
+                self.graphical = True
+            elif self.graphical:
+                found.append("text mode after a graphical screen")
+                self.graphical = False
+            words = tuple(w for w in ERROR_WORDS if text and w in text)
+            if words and words != self.last_words:
+                found.append("text shows " + ", ".join(repr(w) for w in words))
+            self.last_words = words
         resets = (info.get("hard_resets"), info.get("soft_resets"))
         if self.resets is not None and resets != self.resets:
             found.append(f"CPU reset (hard {resets[0]}, soft {resets[1]})")
@@ -257,22 +261,30 @@ class Watch:
         return found
 
 
-def run_session(api, commands, out, after_ms, slice_ms=1000, clock=time.monotonic, bios_f1=False):
+def run_session(api, commands, out, after_ms, slice_ms=1000, clock=time.monotonic, bios_f1=False,
+                text_poll_ms=0):
     """Play the script, then run after_ms more. Each request runs at most
     slice_ms of emulated time, so a sample is taken at least that often.
+    The screen is read with `text` at samples at least text_poll_ms of
+    emulated time apart (0: every sample).
     With bios_f1, F1 is pressed at a text-mode BIOS prompt asking for it."""
     watch = Watch()
     status = "done"
     last_f1 = -5000
+    last_text_ms = None
     with (out / "speed.jsonl").open("w") as speed, (out / "alerts.jsonl").open("w") as alerts:
         mark = None
 
         def sample():
-            nonlocal mark, last_f1
+            nonlocal mark, last_f1, last_text_ms
             info = api.request("info")
-            screen = api.request("text", allow_failure=True)
-            text = ("\n".join(bytes.fromhex(r).decode("cp437") for r in screen["chars"])
-                    if screen.get("ok") else None)
+            text_read = last_text_ms is None or info["ms"] - last_text_ms >= text_poll_ms
+            text = None
+            if text_read:
+                last_text_ms = info["ms"]
+                screen = api.request("text", allow_failure=True)
+                text = ("\n".join(bytes.fromhex(r).decode("cp437") for r in screen["chars"])
+                        if screen.get("ok") else None)
             row = {"wall": round(clock(), 3), "ms": info["ms"], "speed": info.get("speed_percent"),
                    "w": info.get("w"), "h": info.get("h")}
             if mark is not None:
@@ -283,7 +295,7 @@ def run_session(api, commands, out, after_ms, slice_ms=1000, clock=time.monotoni
                 api.request("key down 0x3b")
                 api.request("key up 0x3b")
                 last_f1 = info["ms"]
-            for alert in watch.alerts(info, text):
+            for alert in watch.alerts(info, text, text_read):
                 api.request(f"screenshot {out / ('alert-%d.png' % info['ms'])}", allow_failure=True)
                 alerts.write(json.dumps({"ms": info["ms"], "alert": alert}) + "\n")
                 alerts.flush()
@@ -399,6 +411,16 @@ def arguments():
                         help="replace hard disk NN's image (hdd_NN_fn) with an empty file of "
                              "the same size before starting: everything on it is lost")
     parser.add_argument("--wall-seconds", type=float, default=3600)
+    parser.add_argument("--startup-seconds", type=positive, default=120,
+                        help="host seconds for 86Box to open its automation socket (default 120)")
+    parser.add_argument("--request-seconds", type=positive, default=300,
+                        help="host seconds one automation request may take (default 300)")
+    parser.add_argument("--text-poll-ms", type=int, default=2000,
+                        help="emulated ms between screen 'text' reads for alerts (default 2000)")
+    parser.add_argument("--transcript", choices=TRANSCRIPT_MODES, default="compact",
+                        help="automation.jsonl.gz detail (default compact; see run_86box.py)")
+    parser.add_argument("--transcript-max-mb", type=positive, default=256,
+                        help="uncompressed MB before the transcript rotates (default 256)")
     return parser.parse_args()
 
 
@@ -478,16 +500,17 @@ def main():
                        "--rompath", str(roms), "--logfile", str(out / "emulator.log"), str(source)]
             environment = os.environ.copy()
             environment.update(display_environment())
-            emulator_process = connection = None
+            emulator_process = connection = api = None
+            transcript = Transcript(out, args.transcript, int(args.transcript_max_mb * 2 ** 20))
             started = time.monotonic()
             try:
                 with (out / "process.log").open("wb") as log:
-                    emulator_process = subprocess.Popen(command, cwd=source.parent, env=environment,
-                                                        stdout=log, stderr=log, start_new_session=True)
+                    emulator_process = launch_emulator(command, cwd=source.parent, env=environment,
+                                                       stdout=log, stderr=log)
                 while connection is None:
                     if emulator_process.poll() is not None:
                         raise RuntimeError(f"86Box exited {emulator_process.returncode}; see process.log")
-                    if time.monotonic() - started > 60:
+                    if time.monotonic() - started > args.startup_seconds:
                         raise TimeoutError("86Box automation socket startup timed out")
                     connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                     try:
@@ -496,34 +519,42 @@ def main():
                         connection.close()
                         connection = None
                         time.sleep(0.05)
-                with (out / "automation.jsonl").open("w") as transcript:
-                    api = Automation(connection, transcript, started + args.wall_seconds)
-                    result["info"] = api.request("info")
-                    if args.record_ms:
-                        (out / "frames").mkdir()
-                        api.request(f"record start {args.record_ms} {out / 'frames'}")
-                    if not args.held:
-                        api.request("release")
-                        if args.ff:
-                            api.request("ff on")
-                    result["status"] = run_session(api, commands, out, args.after_ms, bios_f1=args.bios_f1)
-                    if args.record_ms:
-                        result["frames"] = api.request("record stop").get("frames")
-                    api.request(f"screenshot {out / 'screen.png'}", allow_failure=True)
-                    result["final_info"] = api.request("info")
-                    result["registers"] = api.request("regs")
-                    api.request("hold")
-                    api.request("quit", allow_failure=True)
+                api = Automation(connection, transcript, started + args.wall_seconds,
+                                 args.request_seconds)
+                result["info"] = api.request("info")
+                if args.record_ms:
+                    (out / "frames").mkdir()
+                    api.request(f"record start {args.record_ms} {out / 'frames'}")
+                if not args.held:
+                    api.request("release")
+                    if args.ff:
+                        api.request("ff on")
+                result["status"] = run_session(api, commands, out, args.after_ms,
+                                               bios_f1=args.bios_f1,
+                                               text_poll_ms=args.text_poll_ms)
+                if args.record_ms:
+                    result["frames"] = api.request("record stop").get("frames")
+                api.request(f"screenshot {out / 'screen.png'}", allow_failure=True)
+                result["final_info"] = api.request("info")
+                result["registers"] = api.request("regs")
+                api.request("hold")
+                api.request("quit", allow_failure=True)
             except TimeoutError as error:
                 result["status"] = f"timeout: {error}"
+            except KeyboardInterrupt:
+                result["status"] = "interrupted"
+                raise
             finally:
-                if connection is not None:
-                    connection.close()
-                if emulator_process is not None:
-                    try:
-                        emulator_process.wait(timeout=15)
-                    except subprocess.TimeoutExpired:
-                        stop_process(emulator_process)
+                # A second signal waits until 86Box is stopped and the
+                # configuration (edited_config) restored.
+                with signals_blocked():
+                    if connection is not None:
+                        try:
+                            shutdown_emulator(api, emulator_process, 15)
+                        finally:
+                            connection.close()
+                    stop_process(emulator_process)
+                    result["transcript"] = transcript.close()
         if (out / "speed.jsonl").exists():
             result["worst_seconds"] = worst_seconds(out)
         alerts = out / "alerts.jsonl"
@@ -536,7 +567,11 @@ def main():
     except (OSError, RuntimeError, ValueError) as error:
         print(f"session_86box: {error}", file=sys.stderr)
         return 1
+    except KeyboardInterrupt:
+        print("session_86box: interrupted; 86Box stopped and the configuration restored",
+              file=sys.stderr)
+        return 130
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run_main(main))

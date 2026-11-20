@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import patch
 
 from run_86box import (arguments, emulator_binary, exit_status, inplace_vm,
-                       run_existing_vm, vm_config, vm_in_command)
+                       run_existing_vm, vm_config, vm_in_command, write_config)
 
 
 CONFIG = """; preserve this comment
@@ -88,6 +88,29 @@ class VMInputTests(unittest.TestCase):
                         raise error
                 self.assertEqual(source.read_text(), CONFIG)
                 self.assertFalse((root / "86box.cfg.cpuburn-backup").exists())
+
+    def test_floppy_turbo_and_headless_sound_are_temporary(self):
+        for headless in (False, True):
+            with self.subTest(headless=headless), \
+                    tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
+                root = Path(directory)
+                source = root / "86box.cfg"
+                source.write_text(CONFIG)
+                with inplace_vm(self.options(root, headless=headless), root / "test.img"):
+                    config = configparser.ConfigParser()
+                    config.read(source)
+                    self.assertEqual(config["Floppy and CD-ROM drives"]["fdd_01_turbo"], "1")
+                    self.assertEqual(config.get("General", "sound_muted", fallback=None),
+                                     "1" if headless else None)
+                self.assertEqual(source.read_text(), CONFIG)
+                (root / "run").mkdir()
+                write_config(SimpleNamespace(vm=root, config=None, memory_mb=None, dynarec=None,
+                                             headless=headless), root / "run")
+                written = configparser.ConfigParser()
+                written.read(root / "run/86box.cfg")
+                self.assertEqual(written["Floppy and CD-ROM drives"]["fdd_01_turbo"], "1")
+                self.assertEqual(written.get("General", "sound_muted", fallback=None),
+                                 "1" if headless else None)
 
     def test_backup_kept_until_restored_and_overrides_emulator_writes(self):
         with tempfile.TemporaryDirectory() as directory:

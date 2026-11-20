@@ -317,3 +317,97 @@ class PerfTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def capacity_run(levels, noise=0.0, seed=0, steps=12, slow_warm_in=True):
+    """A runner result whose sampled workloads run at the given capacity (%):
+    guest ms per host CPU second / 10. The warm-in steps run 10x slower."""
+    import random
+    rng = random.Random(seed)
+    workloads = []
+    for number, (name, level) in enumerate(levels.items()):
+        rows = []
+        for step in range(steps):
+            cpu = .25 * (1 + rng.uniform(-noise, noise))
+            if slow_warm_in and step < steps // 4:
+                cpu *= 10
+            rows.append([.25, cpu, cpu * level * 10])
+        workloads.append({"name": name, "id": number, "r": number + 1, "step_series": rows})
+    return {"status": "observed", "workload_capture": {"workloads": workloads,
+                                                       "cpu_scope": "emulation_thread_schedstat_ns"},
+            "tests": [{"name": name, "status": "PASS"} for name in levels]}
+
+
+class CapacityTests(unittest.TestCase):
+    def test_warm_in_is_excluded_and_ci_brackets_the_median(self):
+        from perf_report import capacity_section, warm_in_steps
+        self.assertEqual([warm_in_steps(n) for n in (1, 3, 4, 12)], [0, 0, 1, 3])
+        section = capacity_section([capacity_run({"a": 80, "b": 20}, noise=.1, seed=s)
+                                    for s in range(3)], replicates=200)
+        a, b = section["tests"]["a"], section["tests"]["b"]
+        self.assertAlmostEqual(a["median_percent"], 80, delta=4)
+        self.assertLessEqual(a["ci95_percent"][0], a["median_percent"])
+        self.assertGreaterEqual(a["ci95_percent"][1], a["median_percent"])
+        self.assertLess(a["ci95_percent"][0], a["ci95_percent"][1])
+        self.assertEqual((a["samples"], a["steps"]), (3, 27))
+        self.assertEqual((b["rank"], a["rank"]), (1, 2))
+        self.assertLess(b["z"], 0)
+        self.assertGreater(a["z"], 0)
+
+    def test_old_results_fall_back_to_whole_sample_capacity(self):
+        from perf_report import capacity_section
+        run = {"workload_capture": {"workloads": [
+            {"name": "a", "cpu_full_speed_capacity_percent": 42.0}]}}
+        test = capacity_section([run], replicates=20)["tests"]["a"]
+        self.assertEqual((test["median_percent"], test["ci95_percent"]), (42.0, [42.0, 42.0]))
+
+    def test_compare_verdicts_and_aa_floor(self):
+        from perf_report import aa_noise_floor, capacity_estimates, compare_estimates
+        fast = [capacity_run({"a": 100, "b": 50, "c": 30}, noise=.05, seed=s) for s in range(3)]
+        slow = [capacity_run({"a": 80, "b": 50, "c": 40}, noise=.05, seed=s + 10) for s in range(3)]
+        result = compare_estimates(capacity_estimates(fast, 200), capacity_estimates(slow, 200, 5))
+        verdicts = {name: t["verdict"] for name, t in result["tests"].items()}
+        self.assertEqual(verdicts, {"a": "faster", "b": "noise", "c": "slower"})
+        self.assertAlmostEqual(result["tests"]["a"]["delta_percent"], 25, delta=3)
+        # a wide noise floor turns a small change into noise
+        widened = compare_estimates(capacity_estimates(fast, 200), capacity_estimates(slow, 200, 5), 50)
+        self.assertEqual(widened["counts"], {"noise": 3})
+        missing = compare_estimates(capacity_estimates(fast[:1], 20), {})
+        self.assertEqual(missing["tests"]["a"]["verdict"], "missing_in_baseline")
+        floor = aa_noise_floor(fast + fast, 100)
+        self.assertEqual(floor["counts"], {"noise": 3})
+        self.assertGreaterEqual(floor["noise_floor_percent"], 0)
+        with self.assertRaises(ValueError):
+            aa_noise_floor(fast[:1])
+
+
+class SummaryTests(unittest.TestCase):
+    def test_summary_fields_with_and_without_optional_guest_output(self):
+        from perf_report import build_summary, fpuprobe
+        run = capacity_run({"a": 60, "b": 30})
+        run["tests"] = [
+            {"name": "a", "status": "PASS", "tags": '"int,alu"', "exc": "3", "irq": "0x10",
+             "harness_cyc": "1200"},
+            {"name": "b", "status": "FAIL"},
+            {"name": "c", "status": "SKIP"}]
+        run["hangs"] = [{"name": "d", "guest_ms": 600000}]
+        run["fpuprobe"] = fpuprobe("FPUPROBE backend=softfloat\nnoise\n")
+        run["perf"] = {"workloads_by_id": {"0": {"samples": 10, "jit_samples": 4,
+                                                 "leaf_hotpaths": [["exec386", 6], ["mem", 4]]}}}
+        summary = build_summary([run], replicates=50)
+        self.assertEqual(summary["format"], "cpuburn-summary/1")
+        self.assertEqual(summary["fpu_backend"], "softfloat")
+        tests = {t["name"]: t for t in summary["tests"]}
+        self.assertEqual([t["name"] for t in summary["tests"]][:2], ["b", "a"])
+        a = tests["a"]
+        self.assertEqual((a["status"], a["tags"], a["exc"], a["irq"], a["harness_cyc"]),
+                         ("PASS", ["int", "alu"], 3, 16, 1200))
+        self.assertEqual((a["rank"], a["fpu_backend"]), (2, "softfloat"))
+        self.assertAlmostEqual(a["capacity"]["median_percent"], 60)
+        self.assertEqual(a["perf"]["jit_share"], .4)
+        self.assertEqual(a["perf"]["top_symbols"][0], ("exec386", 6))
+        self.assertEqual(tests["b"]["status"], "FAIL")
+        self.assertIsNone(tests["b"]["tags"])
+        self.assertEqual((tests["c"]["status"], tests["c"]["capacity"]), ("SKIP", None))
+        self.assertEqual(tests["d"]["status"], "HANG")
+        self.assertEqual(json.loads(json.dumps(summary))["tests"][0]["name"], "b")

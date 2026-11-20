@@ -5,6 +5,8 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import random
+import re
 import statistics
 
 from qemu_smoke import fpu_backend, host_fpu_note, parse_log
@@ -29,6 +31,7 @@ def load_runs(path):
     run = parse_log(path.read_text(encoding="cp437"))
     run["done"] = any(line == "DONE" for line in
                       path.read_text(encoding="cp437").splitlines())
+    run["fpuprobe"] = fpuprobe(path.read_text(encoding="cp437"))
     return [run]
 
 
@@ -289,6 +292,308 @@ def compare_host(current, baseline, args):
         "regression" if pct > args.max_regression_percent else "ok")}
 
 
+CAPACITY_DEFINITION = ("guest seconds advanced per host CPU second of the 86Box emulation "
+                       "thread x 100 (speed % per host CPU second), from interior sample "
+                       "steps after the leading quarter (warm-in) of each sample")
+STATUS_ORDER = ("HANG", "FAULT", "FAIL", "PASS", "SKIP")
+
+
+def warm_in_steps(count):
+    """Leading steps of a sample left out of every capacity figure."""
+    return max(1, count // 4) if count >= 4 else 0
+
+
+def _percentile(values, fraction):
+    values = sorted(values)
+    if not values:
+        return None
+    position = (len(values) - 1) * fraction
+    low = math.floor(position)
+    high = min(low + 1, len(values) - 1)
+    return values[low] + (values[high] - values[low]) * (position - low)
+
+
+def block_bootstrap(guest, cpu, replicates, rng):
+    """Moving-block bootstrap replicates of sum(guest)/sum(cpu) x 100 / 1000.
+
+    Blocks of ceil(sqrt(n)) consecutive steps keep the autocorrelation of
+    neighbouring steps inside each resampled unit."""
+    n = len(guest)
+    length = max(1, math.ceil(math.sqrt(n)))
+    blocks = math.ceil(n / length)
+    starts = n - length + 1
+    prefix_g, prefix_c = [0.0], [0.0]
+    for g, c in zip(guest, cpu):
+        prefix_g.append(prefix_g[-1] + g)
+        prefix_c.append(prefix_c[-1] + c)
+    result = []
+    for _ in range(replicates):
+        total_g = total_c = 0.0
+        for _ in range(blocks):
+            start = rng.randrange(starts)
+            total_g += prefix_g[start + length] - prefix_g[start]
+            total_c += prefix_c[start + length] - prefix_c[start]
+        if total_c > 0:
+            result.append(total_g / 10 / total_c)
+    return result
+
+
+def sample_series(workload):
+    """Post-warm-in steps of one sampled workload: lists of wall, cpu, guest ms
+    and, with --perf-stat, cycles and instructions."""
+    rows = [row for row in workload.get("step_series") or [] if len(row) >= 3]
+    rows = rows[warm_in_steps(len(rows)):]
+    return rows
+
+
+def capacity_samples(runs, replicates=1000, seed=1):
+    """{name: [sample]} for every sampled workload of every run."""
+    rng = random.Random(seed)
+    tests = {}
+    for index, run in enumerate(runs):
+        capture = run.get("workload_capture") or {}
+        for workload in capture.get("workloads", []):
+            rows = sample_series(workload)
+            sample = {"run": index, "r": workload.get("r"), "id": workload.get("id"),
+                      "steps": len(rows)}
+            if rows:
+                guest = [row[2] for row in rows]
+                cpu = [row[1] for row in rows]
+                if sum(cpu) <= 0:
+                    continue
+                sample["capacity"] = sum(guest) / 10 / sum(cpu)
+                sample["wall_capacity"] = (sum(guest) / 10 / sum(row[0] for row in rows)
+                                           if sum(row[0] for row in rows) > 0 else None)
+                sample["replicates"] = block_bootstrap(guest, cpu, replicates, rng) or [
+                    sample["capacity"]]
+                if all(len(row) >= 5 for row in rows) and sum(row[3] for row in rows) > 0:
+                    sample["cycles"] = sum(row[3] for row in rows)
+                    sample["instructions"] = sum(row[4] for row in rows)
+            elif workload.get("cpu_full_speed_capacity_percent"):
+                # Older results: one whole-sample figure, no within-sample CI.
+                sample["capacity"] = workload["cpu_full_speed_capacity_percent"]
+                sample["wall_capacity"] = workload.get("full_speed_capacity_percent")
+                sample["replicates"] = [sample["capacity"]]
+            else:
+                continue
+            tests.setdefault(workload["name"], []).append(sample)
+    return tests
+
+
+def test_replicates(samples, replicates, rng):
+    """Two-level bootstrap of the median sample capacity: resample samples
+    (rounds and repeated runs), then a block-bootstrap replicate of each."""
+    result = []
+    for _ in range(replicates):
+        picks = [rng.choice(rng.choice(samples)["replicates"]) for _ in samples]
+        result.append(statistics.median(picks))
+    return result
+
+
+def capacity_estimates(runs, replicates=1000, seed=1):
+    """{name: (median, replicates, samples)}."""
+    rng = random.Random(seed + 1)
+    return {name: (statistics.median(s["capacity"] for s in samples),
+                   test_replicates(samples, replicates, rng), samples)
+            for name, samples in sorted(capacity_samples(runs, replicates, seed).items())}
+
+
+def capacity_section(runs, replicates=1000, seed=1, estimates=None):
+    estimates = estimates if estimates is not None else capacity_estimates(runs, replicates, seed)
+    tests = {}
+    for name, (median, reps, samples) in estimates.items():
+        cycles = sum(s.get("cycles", 0) for s in samples)
+        instructions = sum(s.get("instructions", 0) for s in samples)
+        walls = [s["wall_capacity"] for s in samples if s.get("wall_capacity")]
+        tests[name] = {
+            "median_percent": median,
+            "ci95_percent": [_percentile(reps, .025), _percentile(reps, .975)],
+            "samples": len(samples), "steps": sum(s["steps"] for s in samples),
+            "per_sample_percent": [round(s["capacity"], 3) for s in samples],
+            "wall_median_percent": statistics.median(walls) if walls else None,
+            "ipc": instructions / cycles if cycles else None}
+    ranked = sorted(tests, key=lambda name: tests[name]["median_percent"])
+    logs = [math.log(tests[n]["median_percent"]) for n in ranked if tests[n]["median_percent"] > 0]
+    mean = statistics.fmean(logs) if logs else 0
+    spread = statistics.pstdev(logs) if len(logs) > 1 else 0
+    for rank, name in enumerate(ranked, 1):
+        entry = tests[name]
+        entry["rank"] = rank
+        entry["z"] = ((math.log(entry["median_percent"]) - mean) / spread
+                      if spread and entry["median_percent"] > 0 else 0.0)
+    return {"definition": CAPACITY_DEFINITION, "bootstrap_replicates": replicates,
+            "seed": seed, "ci": "two-level bootstrap: samples, then moving blocks of steps",
+            "rank_order": "1 = lowest capacity (slowest) in this suite",
+            "z": "standardised log capacity against this suite's tests",
+            "tests": tests}
+
+
+def verdict(low, high, floor):
+    if low is None or high is None:
+        return "not_comparable"
+    if low > floor:
+        return "faster"
+    if high < -floor:
+        return "slower"
+    return "noise"
+
+
+def compare_estimates(current, baseline, floor=0.0):
+    """Faster/slower/noise per test: the bootstrap CI of current/baseline - 1
+    (percent) must clear +/- floor percent."""
+    tests = {}
+    for name in sorted(set(current) | set(baseline)):
+        if name not in current or name not in baseline:
+            tests[name] = {"verdict": "missing_in_" + ("current" if name not in current else "baseline")}
+            continue
+        (a, ra, _), (b, rb, _) = current[name], baseline[name]
+        ratios = [(x / y - 1) * 100 for x, y in zip(ra, rb) if y > 0]
+        low, high = _percentile(ratios, .025), _percentile(ratios, .975)
+        tests[name] = {"current_percent": a, "baseline_percent": b,
+                       "delta_percent": (a / b - 1) * 100 if b > 0 else None,
+                       "ci95_percent": [low, high], "verdict": verdict(low, high, floor)}
+    counts = {}
+    for entry in tests.values():
+        counts[entry["verdict"]] = counts.get(entry["verdict"], 0) + 1
+    return {"noise_floor_percent": floor, "counts": counts, "tests": tests,
+            "rule": "faster if the 95% CI of the capacity change lies above +floor, "
+                    "slower if below -floor, otherwise noise"}
+
+
+def aa_noise_floor(runs, replicates=1000, seed=1):
+    """A/A: alternate runs of one binary into two groups and compare them.
+    The floor is the 95th percentile of |change| over tests."""
+    if len(runs) < 2:
+        raise ValueError("A/A noise floor needs at least two runs of the same binary")
+    first = capacity_estimates(runs[0::2], replicates, seed)
+    second = capacity_estimates(runs[1::2], replicates, seed + 7)
+    comparison = compare_estimates(first, second, 0.0)
+    deltas = [abs(t["delta_percent"]) for t in comparison["tests"].values()
+              if t.get("delta_percent") is not None]
+    comparison["noise_floor_percent"] = _percentile(deltas, .95) if deltas else None
+    comparison["rule"] = ("A/A: even- versus odd-numbered runs of the same binary; "
+                          "noise_floor_percent is the 95th percentile of |change|")
+    return comparison
+
+
+def fpuprobe(text):
+    """FPUPROBE lines (fpu backend probe) as dicts."""
+    return [dict(re.findall(r'(\w+)=("[^"]*"|\S+)', line)) for line in text.splitlines()
+            if line.startswith("FPUPROBE ")]
+
+
+def _number(value):
+    try:
+        return int(value, 0)
+    except (TypeError, ValueError):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return value
+
+
+def build_summary(runs, replicates=1000, seed=1, compare=None, noise_floor=None,
+                  estimates=None):
+    """AI-facing per-test summary of one or more runner results (summary.json)."""
+    section = capacity_section(runs, replicates, seed, estimates)
+    names, tests = [], {}
+
+    def entry(name):
+        if name not in tests:
+            names.append(name)
+            tests[name] = {"name": name, "statuses": {}, "tags": None, "exc": None,
+                           "irq": None, "harness_cyc": None, "fpu_backend": None}
+        return tests[name]
+
+    global_fpu = None
+    for run in runs:
+        probes = run.get("fpuprobe") or []
+        for probe in probes:
+            target = probe.get("name") or probe.get("test")
+            backend = probe.get("backend")
+            if target:
+                entry(target)["fpu_backend"] = backend
+            elif backend:
+                global_fpu = backend
+        for test in run.get("tests", []):
+            item = entry(test["name"])
+            status = test.get("status", "UNKNOWN")
+            item["statuses"][status] = item["statuses"].get(status, 0) + 1
+            if test.get("tags"):
+                item["tags"] = test["tags"].strip('"').split(",")
+            for key in ("exc", "irq", "harness_cyc"):
+                if key in test:
+                    item[key] = _number(test[key])
+        for hang in run.get("hangs", []):
+            item = entry(hang.get("name") or "unknown")
+            item["statuses"]["HANG"] = item["statuses"].get("HANG", 0) + 1
+            item["hang"] = hang
+        perf = run.get("perf") or {}
+        by_id = perf.get("workloads_by_id") or {}
+        for workload in (run.get("workload_capture") or {}).get("workloads", []):
+            data = by_id.get(str(workload.get("id")))
+            if not data:
+                continue
+            item = entry(workload["name"])
+            merged = item.setdefault("_perf", {"samples": 0, "jit": 0, "leaf": {}})
+            merged["samples"] += data.get("samples", 0)
+            merged["jit"] += data.get("jit_samples", 0)
+            for symbol, count in data.get("leaf_hotpaths", []):
+                merged["leaf"][symbol] = merged["leaf"].get(symbol, 0) + count
+    for name in section["tests"]:
+        entry(name)
+    result = []
+    for name in names:
+        item = tests[name]
+        statuses = item["statuses"]
+        item["status"] = next((s for s in STATUS_ORDER if s in statuses),
+                              next(iter(statuses), "NOT_RUN"))
+        if item["fpu_backend"] is None:
+            item["fpu_backend"] = global_fpu
+        capacity = section["tests"].get(name)
+        item["capacity"] = ({key: capacity[key] for key in
+                             ("median_percent", "ci95_percent", "samples", "steps",
+                              "wall_median_percent")} if capacity else None)
+        item["rank"] = capacity["rank"] if capacity else None
+        item["z"] = capacity["z"] if capacity else None
+        item["ipc"] = capacity["ipc"] if capacity else None
+        merged = item.pop("_perf", None)
+        if merged:
+            item["perf"] = {"samples": merged["samples"],
+                            "jit_share": merged["jit"] / merged["samples"] if merged["samples"] else None,
+                            "top_symbols": sorted(merged["leaf"].items(),
+                                                  key=lambda kv: -kv[1])[:10]}
+        result.append(item)
+    result.sort(key=lambda t: (t["rank"] is None, t["rank"] or 0, t["name"]))
+    first = runs[0] if runs else {}
+    summary = {"format": "cpuburn-summary/1", "runs": len(runs),
+               "directories": [r.get("directory") for r in runs],
+               "statuses": [r.get("status") for r in runs],
+               "image_sha256": first.get("image_sha256"),
+               "emulator_sha256": first.get("emulator_sha256"),
+               "machine": first.get("machine"), "host": first.get("host"),
+               "cpu_scope": (first.get("workload_capture") or {}).get("cpu_scope"),
+               "fpu_backend": global_fpu, "capacity_definition": CAPACITY_DEFINITION,
+               "bootstrap_replicates": replicates, "tests": result}
+    if compare is not None:
+        summary["compare"] = compare
+    if noise_floor is not None:
+        summary["noise_floor"] = noise_floor
+    return summary
+
+
+def noise_floor_value(text):
+    """--noise-floor: a percentage, or a report/summary JSON with an A/A floor."""
+    try:
+        return float(text)
+    except ValueError:
+        data = json.loads(Path(text).read_text())
+        for key in ("capacity_noise_floor", "noise_floor"):
+            if isinstance(data.get(key), dict) and data[key].get("noise_floor_percent") is not None:
+                return float(data[key]["noise_floor_percent"])
+        raise ValueError(f"{text}: no noise_floor_percent found") from None
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("inputs", nargs="+", type=Path, help="runner JSON or complete serial logs")
@@ -304,12 +609,31 @@ def main():
                         help="explicitly compare different CPUs/machines/interpreter modes")
     parser.add_argument("--gate-host-time", action="store_true",
                         help="also gate host boot-to-DONE median (needs repeated independent boots)")
+    parser.add_argument("--compare-capacity", nargs="+", type=Path, metavar="BASELINE",
+                        help="runner result JSON of the baseline binary; A/B capacity verdicts "
+                             "(faster/slower/noise) from bootstrap CIs")
+    parser.add_argument("--aa", action="store_true",
+                        help="A/A noise floor: compare alternate input runs of one binary")
+    parser.add_argument("--noise-floor", type=noise_floor_value, default=0.0,
+                        help="percent change a CI must clear to count as faster/slower, or a "
+                             "report/summary JSON holding an A/A noise floor (default 0)")
+    parser.add_argument("--bootstrap", type=int, default=1000,
+                        help="bootstrap replicates for capacity CIs (default 1000)")
+    parser.add_argument("--seed", type=int, default=1, help="bootstrap seed (default 1)")
+    parser.add_argument("--summary", type=Path,
+                        help="also write the AI-facing summary.json (see doc/results.md)")
+    parser.add_argument("--gate-capacity", action="store_true",
+                        help="exit 1 when --compare-capacity finds a slower test")
     args = parser.parse_args()
     if (args.discard_rounds < 0 or args.min_samples < 1 or
             not math.isfinite(args.max_regression_percent) or args.max_regression_percent < 0):
         parser.error("invalid round/sample/regression limit")
     if args.gate_host_time and not args.baseline:
         parser.error("--gate-host-time requires --baseline")
+    if args.gate_capacity and not args.compare_capacity:
+        parser.error("--gate-capacity requires --compare-capacity")
+    if args.bootstrap < 10:
+        parser.error("--bootstrap needs at least 10 replicates")
     try:
         runs = [run for path in args.inputs for run in load_runs(path)
                 if args.cpu is None or run.get("cpu") == args.cpu]
@@ -322,6 +646,21 @@ def main():
             report["comparison"] = compare(report, baseline, args)
             report["correctness_comparison"] = correctness_changes(report, baseline)
             report["host_comparison"] = compare_host(report, baseline, args)
+        estimates = capacity_estimates(runs, args.bootstrap, args.seed)
+        report["capacity"] = capacity_section(runs, args.bootstrap, args.seed, estimates)
+        if args.aa:
+            report["capacity_noise_floor"] = aa_noise_floor(runs, args.bootstrap, args.seed)
+        if args.compare_capacity:
+            baseline_runs = [run for path in args.compare_capacity for run in load_runs(path)
+                             if args.cpu is None or run.get("cpu") == args.cpu]
+            report["capacity_comparison"] = compare_estimates(
+                estimates, capacity_estimates(baseline_runs, args.bootstrap, args.seed + 101),
+                args.noise_floor)
+        if args.summary:
+            args.summary.parent.mkdir(parents=True, exist_ok=True)
+            args.summary.write_text(json.dumps(build_summary(
+                runs, args.bootstrap, args.seed, report.get("capacity_comparison"),
+                report.get("capacity_noise_floor"), estimates), indent=2) + "\n")
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(report, indent=2) + "\n")
     except (OSError, ValueError, KeyError, TypeError) as error:
@@ -383,6 +722,30 @@ def main():
                   f"overhead={test['overhead_ms']}")
         print("Invocation times have 10ms quantization error per invocation; "
               "overhead is a residual, not precise framework profiling.")
+    capacity = report["capacity"]["tests"]
+    if capacity:
+        print("Capacity (speed % per host CPU second of the emulation thread, warm-in excluded):")
+        print("rank name median ci95_low ci95_high samples")
+        for name, entry in sorted(capacity.items(), key=lambda kv: kv[1]["rank"]):
+            low, high = entry["ci95_percent"]
+            print(f"{entry['rank']} {name} {entry['median_percent']:.1f} {low:.1f} {high:.1f} "
+                  f"{entry['samples']}")
+    print("Guest counter/op follows emulated time (86Box's timing model), not host cost; "
+          "capacity is the host-cost measure.")
+    if "capacity_noise_floor" in report:
+        floor = report["capacity_noise_floor"]["noise_floor_percent"]
+        print("A/A capacity noise floor: " + ("unavailable" if floor is None else f"{floor:.2f}%"))
+    if "capacity_comparison" in report:
+        comparison = report["capacity_comparison"]
+        print(f"Capacity comparison (noise floor {comparison['noise_floor_percent']}%): "
+              + " ".join(f"{k}={v}" for k, v in sorted(comparison["counts"].items())))
+        for name, entry in comparison["tests"].items():
+            if entry.get("delta_percent") is not None:
+                low, high = entry["ci95_percent"]
+                print(f"  {name} {entry['verdict']} {entry['delta_percent']:+.1f}% "
+                      f"[{low:+.1f}, {high:+.1f}]")
+            else:
+                print(f"  {name} {entry['verdict']}")
     if "host_comparison" in report:
         host = report["host_comparison"]
         print(f"Host boot-to-DONE comparison: {host['status']}"
@@ -391,6 +754,8 @@ def main():
         c["status"] == "regression" for c in report.get("comparison", []))
     if args.gate_host_time:
         bad |= report["host_comparison"]["status"] == "regression"
+    if args.gate_capacity:
+        bad |= report["capacity_comparison"]["counts"].get("slower", 0) > 0
     if bad:
         return 1
     if args.gate_host_time and report["host_comparison"]["status"] not in ("ok", "regression"):
