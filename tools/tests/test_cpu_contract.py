@@ -244,6 +244,11 @@ class CpuContractGuestTests(unittest.TestCase):
         runtime_breakdown(run)
         return run
 
+    def cpu1_accepted(self, run):
+        # sel1 handshake rows share the CONTROL list with cpu1.
+        return [row for row in run["cpu_control"]
+                if row.get("protocol") == "cpu1" and "accepted" in row][-1]
+
     def check_statuses(self, run, contract, mmx, now):
         self.assertEqual({t["name"]: t["status"] for t in run["tests"]}, {
             "cpu_model_contract": contract, "int_partial_boundaries": "PASS",
@@ -270,7 +275,7 @@ class CpuContractGuestTests(unittest.TestCase):
         contract = run["tests"][0]
         self.assertEqual(contract["got"], "00000480")
         self.assertEqual(contract["want"], "00000481")
-        self.assertEqual(run["cpu_control"][-1]["signature"], "00000481")
+        self.assertEqual(self.cpu1_accepted(run)["signature"], "00000481")
 
     def test_hidden_feature_still_executes_and_identification_fails(self):
         run = self.run_guest("pentium2,-mmx", "@cpu1 pentium2_deschutes internal accuracy\n")
@@ -300,11 +305,11 @@ class CpuContractGuestTests(unittest.TestCase):
         self.check_statuses(run, "FAIL", "PASS", "SKIP")
         expected = "benchmark" if run["build_info"][0]["benchmarks"] == "1" else "accuracy"
         self.assertEqual(run["conformance"][0]["mode"], expected)
-        self.assertEqual(run["cpu_control"][-1]["mode"], expected)
+        self.assertEqual(self.cpu1_accepted(run)["mode"], expected)
 
 
 @unittest.skipUnless(os.environ.get("CPUBURN_EXTENSION_IMAGE"),
-                     "set CPUBURN_EXTENSION_IMAGE to ONLY=pm_syscall,mmx_extended")
+                     "set CPUBURN_EXTENSION_IMAGE to ONLY=pm_syscall,pm_rt_syscall,mmx_extended,mmx_ext_kernel")
 class CpuExtensionGuestTests(unittest.TestCase):
     image_variable = "CPUBURN_EXTENSION_IMAGE"
     run_guest = CpuContractGuestTests.run_guest
@@ -312,7 +317,8 @@ class CpuExtensionGuestTests(unittest.TestCase):
     def test_amd_legacy_syscall_and_mmx_extensions(self):
         run = self.run_guest("phenom", "@cpu1 unknown auto accuracy\n")
         self.assertEqual({t["name"]: t["status"] for t in run["tests"]}, {
-            "cpu_model_contract": "SKIP", "pm_syscall": "PASS", "mmx_extended": "PASS",
+            "cpu_model_contract": "SKIP", "pm_syscall": "PASS", "pm_rt_syscall": "PASS",
+            "mmx_extended": "PASS", "mmx_ext_kernel": "PASS",
         })
         self.assertTrue(all(int(t.get("iterations", 0)) <= 1 for t in run["tests"]))
         self.assertEqual({f["name"]: f["status"] for f in run["features"]
@@ -322,7 +328,8 @@ class CpuExtensionGuestTests(unittest.TestCase):
     def test_unrelated_intel_cpu_skips_vendor_extensions(self):
         run = self.run_guest("pentium2", "@cpu1 pentium2_deschutes internal accuracy\n")
         self.assertEqual({t["name"]: t["status"] for t in run["tests"]}, {
-            "cpu_model_contract": "FAIL", "pm_syscall": "SKIP", "mmx_extended": "SKIP",
+            "cpu_model_contract": "FAIL", "pm_syscall": "SKIP", "pm_rt_syscall": "SKIP",
+            "mmx_extended": "SKIP", "mmx_ext_kernel": "SKIP",
         })
 
 

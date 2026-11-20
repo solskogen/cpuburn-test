@@ -38,8 +38,13 @@ class BuildTests(unittest.TestCase):
         (self.root / ".github/workflows/build.yml").write_text("name: test\n")
 
     def make(self, *args):
+        # Make exports command-line overrides such as `make guest-test BUILD=x`
+        # to recipes; none of the outer build's variables may leak in here.
         env = {key: value for key, value in os.environ.items()
-               if key not in ("CC", "LD", "NM", "OBJCOPY", "CROSS_COMPILE", "MAKEFLAGS", "MFLAGS")}
+               if key not in ("CC", "LD", "NM", "OBJCOPY", "CROSS_COMPILE", "MAKEFLAGS", "MFLAGS",
+                              "MAKELEVEL", "BUILD", "IMAGE", "SUITE", "ONLY", "BENCHMARKS",
+                              "OPT", "ROUNDS", "BURN_SECONDS", "WATCHDOG_SECONDS",
+                              "HEAVY_SCALE", "TEST_SECONDS", "NASM", "IS_CLANG")}
         return subprocess.run(["make", *args], cwd=self.root, env=env,
                               check=True, capture_output=True, text=True).stdout
 

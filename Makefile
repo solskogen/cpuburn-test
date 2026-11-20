@@ -157,7 +157,7 @@ guest-test:
 	$(MAKE) SUITE=full BUILD=$(GUEST)/contract IMAGE=$(GUEST)/contract.img \
 	    ONLY=int_partial_boundaries,mmx_alu,3dnow_float
 	$(MAKE) SUITE=full BUILD=$(GUEST)/extension IMAGE=$(GUEST)/extension.img \
-	    BENCHMARKS=0 ONLY=pm_syscall,mmx_extended
+	    BENCHMARKS=0 ONLY=pm_syscall,pm_rt_syscall,mmx_extended,mmx_ext_kernel
 	$(MAKE) SUITE=full BUILD=$(GUEST)/boot IMAGE=$(GUEST)/boot.img \
 	    BENCHMARKS=0 BURN_SECONDS=1 TEST_SECONDS=1 ONLY=
 	CPUBURN_CONTRACT_IMAGE=$(abspath $(GUEST)/contract.img) \
