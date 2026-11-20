@@ -766,7 +766,7 @@ class SelectionTests(unittest.TestCase):
 
     def test_cli(self):
         with patch("sys.argv", ["run_86box.py", "--profile", "mmx", "--only", "a,b",
-                                "--only", "c", "--skip", "d", "--aa"]):
+                                "--only", "c,a", "--skip", "d", "--aa"]):
             args = arguments()
         self.assertEqual((args.only, args.skip, args.resume_from, args.repeat),
                          (["a", "b", "c"], ["d"], None, 2))

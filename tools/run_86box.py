@@ -107,7 +107,8 @@ def selection_accepted(run, only=(), skip=(), resume_from=None):
 
 
 def flatten(lists):
-    return [name for names in lists or [] for name in names]
+    # The guest marks only the first occurrence of a repeated name as found.
+    return list(dict.fromkeys(name for names in lists or [] for name in names))
 
 
 def sampling_options(args):
