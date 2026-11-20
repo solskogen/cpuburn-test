@@ -251,6 +251,52 @@ against a C reference that never runs the generated code. They require 486.
 Two drafts were dropped because they ran far above full speed on every CPU
 tested and so found nothing: a span rasteriser and a copy-on-write fork.
 
+### Interpreter fallbacks and block exits
+
+`src/tests_int_ext.c` holds benchmarks for integer instructions that 86Box's
+new dynarec does not compile, and for code layouts that force extra block
+exits or page checks. An instruction the recompiler has no handler for
+(a `NULL` entry in the `recomp_opcodes*` tables of `src/codegen/codegen_ops.c`,
+or a `rop*` handler that returns 0) is emitted by `codegen.c` as
+`uop_CALL_INSTRUCTION_FUNC` to the interpreter function inside the compiled
+block. Each record is deterministic and checked against a reference that
+never uses the instruction under test (bit-serial division, digit-by-digit
+decimal, bit-loop rotates, C branches). References are computed once, and
+data is generated once per record before the timed repetitions. LAHF, SAHF,
+XLAT, CMC, CLC, STC, PUSHF and POPF are compiled, so no record treats them
+as fallbacks. 16-bit code segments are not covered here.
+
+| Record | 86Box path targeted | `ops` (unit) per invocation |
+|---|---|---:|
+| `int_cmov_select` | CMOVcc (`0F 40-4F` are `NULL` in `recomp_opcodes_0f`; interpreter `opCMOV*`, `cpu/x86_ops_mov.h`). MSVC6 `/G6`-style branchless min, max, select-by-bit and abs over 4,096 element pairs, 16 rounds. Requires CMOV. | 65,536 (`element`) |
+| `int_jcc_select` | The same work as `int_cmov_select` with Jcc around MOVs: compiled code with data-dependent block exits, for comparison. | 65,536 (`element`) |
+| `int_div32_itoa`, `int_div16_itoa`, `int_div8_digits` | DIV r32/r16/r8 (`ropF7_32`, `ropF7_16`, `ropF6` in `codegen_ops_misc.c` return 0 for `/6` and `/7`; interpreter `opF7_l_a32`, `opF7_w_a32`, `opF6_a32`). Repeated division by 10 until zero, as itoa does, over 1,024 dwords, 2,048 words or 4,096 bytes, 4 passes. | divisions (`div`) |
+| `int_idiv_hash` | IDIV r/m32, r/m16 and r/m8 after CDQ, CWD and CBW (same handlers), with signed divisors that never overflow; 1,024 elements, 8 passes. | 24,576 (`idiv`) |
+| `int_rcx_cl`, `int_rcx_imm` | RCL/RCR by CL or by immediate (`ropC0`, `ropC1_w`, `ropC1_l`, `ropD2`, `ropD3_w`, `ropD3_l` in `codegen_ops_shift.c` return 0; RCL/RCR by 1 are compiled). The interpreter macros in `cpu/x86_ops_shift.h` rotate one bit per loop pass, so cost grows with the count. A rotate-through-carry chain at 32, 16 and 8 bits with ADC between, CF carried across iterations; counts 1-31 from a table, or 7, 13, 5 and 3. OF is not checked. | 65,536 (`rotate`) |
+| `int_repne_scasb_strlen` | REPNE SCASB (the REPE/REPNE tables in `codegen_ops.c` hold only REP MOVS and REP STOS; interpreter `opREP_SCASB*` in `cpu/x86_ops_rep_dyn.h`). The MSVC `or ecx,-1; repne scasb; not ecx` strlen over 96 strings of 0-511 bytes, 8 passes. | bytes scanned (`byte`) |
+| `int_repne_scasb_memchr` | REPNE SCASB with short counts: memchr in 256 blocks of 64 bytes, the key at offsets 16-63; 16 passes. | bytes scanned (`byte`) |
+| `int_repe_cmpsb_memcmp`, `int_repe_cmpsd_memcmp` | REPE CMPSB and REPE CMPSD (`opREP_CMPSB*`, `opREP_CMPSL*`). memcmp over 64 pairs of 256-byte blocks with a random first mismatch or none; 8 passes. | bytes or dwords compared |
+| `int_rep_lods` | REP LODSB and REP LODSD (`opREP_LODSB*`, `opREP_LODSL*`): 4,096 bytes and 1,024 dwords, 16 passes. | 81,920 (`element`) |
+| `int_rep_movsd_aligned` | Compiled REP MOVSD (`codegen_ops_rep.c`, host routine from `build_rep_routine` in `codegen_backend_x86-64.c`): 256 aligned dwords inside one page, 256 copies. Baseline for the next records. | 65,536 (`dword`) |
+| `int_rep_movsd_misaligned` | As above with the destination at +1: the misaligned slow path (`rep_run_room` and per-element `rep_movsl_a32`). | 65,536 (`dword`) |
+| `int_rep_movsd_backward` | As above with DF=1 into a data page. | 65,536 (`dword`) |
+| `int_rep_movsd_page` | One REP MOVSD of a whole page (1,024 dwords) against the dynarec cycle limit (1,000 cycles, about 333 dwords on a 486), so the block exits and restarts the instruction; 64 copies. | 65,536 (`dword`) |
+| `int_rep_movsd_long` | One 64 KiB REP MOVSD: the cycle limit plus a new source and destination page every 4 KiB; 16 copies. | 262,144 (`dword`) |
+| `int_rep_movsd_codepage` | REP MOVSD into bytes 64-1,087 of a page whose first byte is a called `RET`, so the page holds compiled code: `rep_tracked_run` and `mem_write_raml_page` dirty tracking. The two sources differ so every byte changes. | 65,536 (`dword`) |
+| `int_rep_movsd_codepage_backward` | As above with DF=1, which `rep_tracked_run` rejects. | 65,536 (`dword`) |
+| `int_bcd_packed_daa_das` | DAA and DAS (`27`, `2F` are `NULL`; `opDAA`, `opDAS` in `cpu/x86_ops_bcd.h`). 64-digit packed BCD add and subtract with ADC/SBB, 64 operands, 4 passes. | 16,384 (`byte`) |
+| `int_bcd_ascii_aaa_aas` | AAA and AAS (`37`, `3F` are `NULL`; `opAAA`, `opAAS`): an unpacked accumulator plus or minus 32-digit ASCII numbers. Only AL's low nibble and CF are checked. | 16,384 (`digit`) |
+| `int_bcd_aam_aad` | AAM and AAD (`D4`, `D5` are `NULL`; `opAAM`, `opAAD`): split 0-99 into digits and join them again, 64 passes. | 6,400 (`aam_aad`) |
+| `int_rdtsc_rate` | RDTSC (`0F 31` is `NULL`; `opRDTSC`), eight per loop pass. Requires TSC. Only checks that the counter advanced. | 8,192 (`rdtsc`) |
+| `int_cpuid_rate` | CPUID leaf 0 (`0F A2` is `NULL`; `opCPUID`); every result must equal the first. Requires CPUID. | 1,024 (`cpuid`) |
+| `int_fallback_density_none`, `int_fallback_density_d4`, `int_fallback_density_d16`, `int_fallback_density_d64` | The cost of one helper call inside compiled code. 64 compiled register ALU ops (ADD, XOR, ROL imm, SUB) per loop pass, with a BOUND that never faults after every 4, 16 or 64 of them, or none. BOUND (`62`) is `NULL` and does not end the block (`codegen_op_ends_block`), unlike INTO. With the loop overhead each pass is more than 50 instructions (`MAX_INSTRUCTION_COUNT`), so every variant compiles as two blocks. 4,096 passes. | 262,144 (`alu_op`) |
+| `int_false_smc_same_chunk`, `int_false_smc_same_page`, `int_false_smc_other_page` | Data stores near hot code that never change it. A copied loop stores a changing dword each pass at byte 48 of its own page (same 64-byte chunk as the code), at byte 2,048 (same page) or in the next page. Targets `mem_write_raml_page` (`mem/mem.c`) dirty and code-present masks and the block-entry `dirty_mask` check in `cpu/386_dynarec.c` that calls `codegen_check_flush` (`codegen_block.c`). 16 calls of 4,096 passes. | 65,536 (`store`) |
+| `int_loop_page_split`, `int_loop_page_inside` | A 7-instruction ALU loop whose body crosses a 4 KiB boundary, or lies inside one page. A block on two pages (`CODEBLOCK_HAS_PAGE2`) leaves the fast entry test in `cpu/386_dynarec.c` and looks up the second page with `get_phys_noabrt` and checks `dirty_mask2` on every entry. 16 calls of 4,096 passes. | 65,536 (`iteration`) |
+| `int_jcc_data_dependent` | `test al,1; jz skip; inc ebx` over 4,096 random bytes (taken about half the time): a block exit on every element. 16 passes. | 65,536 (`element`) |
+| `int_flags_adc_sbb_chain` | 256-bit add then subtract with memory-destination ADC/SBB chains (lazy CF across eight limbs), 255 blocks, 16 passes; the sum telescopes to a C reference. | 65,280 (`limb_op`) |
+| `int_flags_pushf_lahf_setcc` | Flags read in different ways after ADD, SUB, XOR, INC and DEC: PUSHF, LAHF and SETcc, then a POPF of data flags read by SETcc and ADC. Edge operands included. Checked against a C flag model, with undefined flags masked. | 8,192 (`element`) |
+| `int_op16_prefixed` | 66h-prefixed 16-bit MOV, ADD, XOR, ROL, SUB, ADC, SHR and 16-bit stores in 32-bit code. The upper register halves must survive. | 32,768 (`element`) |
+
 
 ## Inventory and reading the tables
 
@@ -389,6 +435,7 @@ coverage unless explicitly qualified.
 | `corpus_integer_sequences` | 486 | Deterministic generated ALU instruction blocks, each in a fresh slot and run 64 times, against references computed once per block; 4,194,304 generated instructions at default scale, with checkpoint checks. |
 | `corpus_integer_regen` | 486 | The same blocks regenerated in one page and run 8 times each, as code rewritten faster than it is compiled; 4,194,304 instructions. |
 | `rw_jit_tiering`, `rw_exe_loader`, `rw_overlay`, `rw_decrypt_run`, `rw_thunks`, `rw_threaded_vm` | 486 | Real-world-style generated, loaded, patched and dispatched code; see [real-world-style code workloads](#real-world-style-code-workloads). |
+| `int_cmov_select`, `int_jcc_select`, `int_div32_itoa`, `int_div16_itoa`, `int_div8_digits`, `int_idiv_hash`, `int_rcx_cl`, `int_rcx_imm`, `int_repne_scasb_strlen`, `int_repne_scasb_memchr`, `int_repe_cmpsb_memcmp`, `int_repe_cmpsd_memcmp`, `int_rep_lods`, `int_rep_movsd_aligned`, `int_rep_movsd_misaligned`, `int_rep_movsd_backward`, `int_rep_movsd_page`, `int_rep_movsd_long`, `int_rep_movsd_codepage`, `int_rep_movsd_codepage_backward`, `int_bcd_packed_daa_das`, `int_bcd_ascii_aaa_aas`, `int_bcd_aam_aad`, `int_rdtsc_rate`, `int_cpuid_rate`, `int_fallback_density_none`, `int_fallback_density_d4`, `int_fallback_density_d16`, `int_fallback_density_d64`, `int_false_smc_same_chunk`, `int_false_smc_same_page`, `int_false_smc_other_page`, `int_loop_page_split`, `int_loop_page_inside`, `int_jcc_data_dependent`, `int_flags_adc_sbb_chain`, `int_flags_pushf_lahf_setcc`, `int_op16_prefixed` | 486; `int_cmov_select` CMOV, `int_rdtsc_rate` TSC, `int_cpuid_rate` CPUID | Interpreter fallbacks inside compiled blocks and code layouts that force block exits; see [interpreter fallbacks and block exits](#interpreter-fallbacks-and-block-exits). |
 
 The following four records share a 4 KiB page between a patched snippet and a
 hot loop. `k` is snippet calls per patch, `h` hot-loop calls per patch; each
