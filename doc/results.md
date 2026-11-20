@@ -102,7 +102,7 @@ include CPU-specific results and must not replace the individual assertions.
 reproducible when the invocation count is fixed, as in the accuracy suite.
 Timer, TSC, RTC and performance-counter readings are kept out of `sum` and
 appear only in `NOTE` lines. Results can still differ legitimately between
-FPU backends or CPU models (for example `fpu_trans` and `fpu_burn`), so
+FPU backends or CPU models (for example `fpu_trans` and `fpu_trig`), so
 compare `sum` only between runs on the same configuration.
 `op_unit` names the counted work where specified; older workloads retain the
 generic `operation` label. `timing_scope=checked_workload` (on `CFG`) explicitly includes
@@ -347,7 +347,9 @@ checks; do not treat emulator agreement as an arithmetic oracle.
 86Box configurations using a host-double x87 implementation can differ from
 80-bit x87 in precision, exponent range, denormal classification and exception
 delivery. Those are retained as assertion failures, not treated as a reason
-to crash the suite or remove its checks. Compare with a hardware-backed KVM
+to crash the suite or remove its checks. When the boot probe reports
+`FPUPROBE backend=host`, the failures caused by the 53-bit significand carry
+`backend=host` at the start of their failure text. Compare with a hardware-backed KVM
 run and the instruction's architectural semantics before changing either test
 or emulator.
 

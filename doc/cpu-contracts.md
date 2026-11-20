@@ -127,7 +127,10 @@ Legacy AMD SYSCALL/SYSRET checks both SCE-disabled #UD and enabled transitions,
 entry/exit selectors, unchanged ESP, return EIP and interrupt flags. MMX
 extensions have separate integer-reference arithmetic, shuffle/extract/insert,
 masked-store and non-temporal-store checks; they never run merely because
-baseline MMX is supported. K6 models 6/7's older SYSCALL feature bit is decoded.
+baseline MMX is supported. K6 models 6/7's older SYSCALL feature bit is decoded:
+AMD 20734 (rev. N, Table 11) gives 8000_0001h EDX=0080_05BFh (bit 10) for both
+models (the K6-2 has 8080_09BFh, bit 11), so bit 10 is accepted only for
+family 5 models 6 and 7; every later part must report bit 11.
 
 Other claims without behavioural witnesses remain visible UNTESTED.
 This is a regression tool with an explicit
@@ -246,7 +249,10 @@ CPU failures. Matrix generation does not establish that every selected board
 has installed firmware or boots the image. Some boards need additional BIOS
 setup; the runner's automated F1 handling cannot configure arbitrary firmware.
 Engine/backend mode is recorded as requested configuration: current automation
-does not independently prove translated-code execution or the actual FPU backend.
+does not independently prove translated-code execution. The guest's
+`FPUPROBE backend=` line and the `cpu_model_contract` `fpu_probe` note report
+the x87 behaviour it observed (host doubles, or bit-exact) next to the
+configured FPU.
 
 Use the per-configuration result files for regression comparisons. Keep CPU,
 FPU, engine, image, selected tests and build settings matched; retain every

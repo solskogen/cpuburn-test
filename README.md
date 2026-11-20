@@ -94,11 +94,21 @@ Reference run: Pentium II Deschutes 450 on the ASUS P3V4X, dynarec,
 round, raise flags or handle the 80-bit range like a real x87. About 70
 x87 tests fail for that reason alone. To check x87 conformance, run with
 `tools/run_86box.py --fpu-backend softfloat` (the "Softfloat FPU" machine
-setting); some machines always use softfloat. The guest cannot tell the
-two backends apart, so `run_86box.py` reads the backend from the VM
-configuration, stores it as `fpu_backend` in `result.json`, and prints a
-note when x87 tests failed on the host backend. `perf_report.py` repeats
-that note.
+setting); some machines always use softfloat. (These counts predate the
+split of `fpu_burn` into separate FPU workloads and the MMX/3DNow! kernel
+records, so current totals are slightly higher.)
+
+The guest identifies the backend itself: before the tests it prints
+`FPUPROBE backend=host|softfloat|native|none`, from 1/3 at 64-bit precision
+(a host double loses the low 11 significand bits) and FSIN of a large
+argument (a real x87 and softfloat reduce with a 66-bit pi, host libm
+reduces exactly). Bit-exact emulation cannot be told from silicon, so
+`softfloat` also covers real hardware and QEMU. Checks that a 53-bit
+significand cannot pass stay strict but start their failure text with
+`backend=host` on that backend; see [workloads](doc/workloads.md) for the
+probe and the labelled checks. `run_86box.py` also stores the configured
+backend as `fpu_backend` in `result.json` and prints a note when x87 tests
+failed on the host backend; `perf_report.py` repeats that note.
 
 With softfloat, current 86Box releases leave five failures that are not
 FPU-related:

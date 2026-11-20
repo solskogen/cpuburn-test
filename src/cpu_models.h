@@ -62,6 +62,10 @@ CPU_MODEL("winchip2", "CentaurHauls", 5, MODEL_BIT(8), MODEL_WINCHIP | REQ_3DNOW
 CPU_MODEL("winchip2a", "CentaurHauls", 5, MODEL_BIT(8), MODEL_WINCHIP | REQ_3DNOW)
 CPU_MODEL("k5_ssa5", "AuthenticAMD", 5, MODEL_BIT(0), MODEL_K5)
 CPU_MODEL("k5_5k86", "AuthenticAMD", 5, MODEL_BIT(1) | MODEL_BIT(2) | MODEL_BIT(3), MODEL_K5)
+/* K6 models 6 and 7 report SYSCALL in 8000_0001h EDX bit 10, not bit 11:
+ * AMD 20734 (rev. N, Table 11) lists EDX=0080_05BFh for both models, and
+ * the K6-2 8080_09BFh/8080_29BFh (bit 11). core.c accepts bit 10
+ * only for family 5 models 6/7, which is the documented case. */
 CPU_MODEL("k6_m6", "AuthenticAMD", 5, MODEL_BIT(6), MODEL_K6)
 CPU_MODEL("k6_m7", "AuthenticAMD", 5, MODEL_BIT(7), MODEL_K6)
 CPU_MODEL("k6_2", "AuthenticAMD", 5, MODEL_BIT(8), MODEL_K6 | REQ_3DNOW)

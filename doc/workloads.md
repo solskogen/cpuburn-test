@@ -54,6 +54,7 @@ Later AMD extended-MMX/SSE instructions are deliberately not included.
 | `3dnow_enhanced_float` | PFNACC/PFPNACC horizontal subtraction/mixed accumulation. | 6,144 |
 | `3dnow_word_convert` | PI2FW word selection and PF2IW truncation, signed saturation and sign extension into both dwords; poisoned unused input words and destination bits expose lane/preservation mistakes. | 6,144 |
 | `3dnow_swap` | PSWAPD swaps both dwords, including arbitrary bit patterns. | 3,072 |
+| `3dnow_kernel` | Register-resident PFADD/PFSUB/PFSUBR/PFMUL chains, 64 ops per iteration, 4,096 iterations, one FEMMS. Every lane stays an exact float32, so the checksum `1f37c0ee` does not depend on 3DNow! rounding. The only timed 3DNow! record. | 262,144 |
 | `cyrix_emmi_arithmetic` | PAVEB, PADDSIW, PMAGW, PDISTIB, PSUBSIW, PMULHRWC, PMULHRIW and PMACHRIW; rounding, saturation, implicit destinations and unchanged source registers. | 28,672 |
 | `cyrix_emmi_moves` | PMVZB/PMVNZB/PMVLZB/PMVGEZB byte masks, preserving unselected bytes, mask and source. | 8,192 |
 
@@ -155,9 +156,15 @@ steps: noncompletion is a reported failure, not an infinite spin.
 The embedded tables can be independently rechecked without floating-point
 arithmetic using `python tools/check_fp_edges.py` (exact integer/rational
 rounding and remainder identities).
-Negative-quotient condition bits are diagnostic only because their signed
-encoding is ambiguous in the reference wording; exact signed remainders and
-nonnegative quotient bits are still asserted.
+Every vector asserts the quotient condition bits as the low three bits of
+|Q| (C0=Q2, C3=Q0, C1=Q1), including negative quotients: the partial
+remainder works on magnitudes, so operand signs reach only the remainder's
+sign (softfloat, Bochs and QEMU's FPREM agree). `fprem1_v9` stays timed: its
+2^1000/3 needs about 16 partial FPREM1 steps, so each call is about 32,000
+FPREM1 instructions, well above the harness overhead. When the boot probe
+reports `backend=host`, a wrong FDIV result or FPREM remainder carries a
+`backend=host` prefix in its failure text (the check itself is unchanged);
+a quotient-bit-only mismatch is not a precision limit and is not labelled.
 
 `heavy_decode_align` sweeps offsets 0–63 and 4093–4095 with prefixed,
 variable-length i486 code and both branch paths. Each path is one call: the
@@ -272,6 +279,16 @@ A record is check-only when timing it says nothing about emulator speed:
     `fpu_fxsr`.
   - `mmx_x87_transitions`, `mmx_state`, `mmx_alias`, `mmx_exc`;
     `3dnow_reciprocal`, `3dnow_state`, `3dnow_swap`.
+- Records too small to time, or that time their C reference rather than the
+  instructions:
+  - `fpu_formats` (about 150 x87 operations), `fpu_exceptions` (six #MF and
+    three #NM per call, dominated by exception delivery) and `fpu_stack`.
+  - The one-op MMX and 3DNow! records `mmx_alu`, `mmx_shifts`,
+    `mmx_extended`, `mmx_burn`, `3dnow_float`, `3dnow_convert`,
+    `3dnow_integer`, `3dnow_enhanced_float` and `3dnow_word_convert`: each
+    case is MOVQ load, one operation, MOVQ store and EMMS followed by a
+    non-inlined C reference. The timed MMX/3DNow! records are the
+    register-resident `mmx_kernel_*` and `3dnow_kernel`.
   - Every `cyrix_emmi_*` record, `cyrix_cpuid_control`,
     `cyrix_smm_disabled`, `mediagx_cpuid`.
   - `int_flags_boundaries`, `int_partial_boundaries`, `int_divide_state`,
@@ -431,19 +448,50 @@ the count is not necessarily the number of assertions or lanes.
 | `fpu_round` | FPU | Rounding-control modes and integer conversion results. |
 | `fpu_trans` | FPU | Selected x87 transcendental identities using bounded tolerances, not full precision certification. |
 | `fpu_exceptions` | FPU | Selected masked/unmasked exception and status behavior. |
-| `fpu_stack` | FPU | Stack overflow/underflow, tags and status cases. |
+| `fpu_stack` | FPU | Stack overflow/underflow, tags and status cases. FFREEP (DF C1) is asserted to pop on P6-class CPUs; before family 6 it is undocumented, so a pop, FFREE without the pop or #UD is accepted and reported as `ffreep=`. |
 | `fpu_p6` | FPU + CMOV | P6 x87 conditional moves and comparisons/flags. |
 | `fpu_fxsr` | FPU + FXSR | FXSAVE/FXRSTOR x87 state round-trip; not SSE arithmetic. |
-| `fpu_burn` | FPU | Fixed-count x87 arithmetic, series and transcendental identities with checked references/tolerances; not a wall-clock burn. |
+| `fpu_mac` | FPU | 24x24 small-integer matrix product, 16 times, under PC53 with the k loop on the register stack (FLD/FMUL/FADDP); every partial sum is exact, so the FISTP results must match checksum `30b7cae9`. |
+| `fpu_mandel` | FPU | 48x32 Mandelbrot grid, 64 iterations, PC53, the whole iteration on the register stack. PC53 without overflow or denormals rounds like IEEE double, so 1,116 escaped pixels, 32,852 iterations and checksum `72f94ad3` are exact. |
+| `fpu_nbody` | FPU | Eight bodies on a line, softened force with FSQRT/FDIV, 128 steps, PC53, per-body force loop on the register stack. Positions must be within 64 ulps of a 60-digit reference rounded to double (IEEE double arithmetic lands within 5). |
+| `fpu_trig` | FPU | Sum over x=i/1024 of sin·cos (FSINCOS) + FPATAN + FSQRT, PC64, in one register-stack loop; within 2^-50 of the exact sum, plus the FSINCOS/FPATAN pi/4 identity within 2^-55 (2^-50 on TCG). |
+| `fpu_series` | FPU | Machin pi, e from 20 terms, Newton sqrt(7) and a Horner polynomial, PC53, on the register stack; within 12, 8 and 2 ulps of the correctly rounded doubles, Horner exact. |
 | `fpu_ftol` | FPU | Float-to-int as pre-SSE compilers emit it for every `(int)` cast: FNSTCW, force truncation, FLDCW, FISTP, FLDCW restore, plus a FISTP under round-to-nearest, so the rounding control changes twice per value. 8,192×`HEAVY_SCALE` values of the form i + 0.75, checked in bulk. `ops` counts conversions. |
 | `mmx_alu` | MMX | Seeded packed arithmetic, saturation, packing, compares and logical instructions against scalar lane references. |
 | `mmx_shifts` | MMX | Packed shifts, including counts beyond lane widths, checked against scalar references. |
 | `mmx_state` | MMX | MMX register/state and EMMS behavior. |
 | `mmx_alias` | MMX | MMX/x87 register aliasing and state effects. |
 | `mmx_exc` | MMX | Selected MMX exception conditions. |
-| `mmx_burn` | MMX | Fixed repeated packed instruction chains and reference checks. |
+| `mmx_burn` | MMX | Alpha blend (PUNPCK/PMULLW/PACKUSWB), PMADDWD and absolute byte difference on 32,768 random operand pairs against scalar references. |
+| `mmx_kernel_alu` | MMX | Register-resident: 64 add/sub/saturate/compare/logic/shift ops per iteration on mm0-mm7, 4,096 iterations, one EMMS, final checksum `8a5ba826`. No x87 instruction runs. |
+| `mmx_kernel_mul` | MMX | As above with PMULLW/PMULHW/PMADDWD chains, checksum `20ace29f`. |
+| `mmx_kernel_pack` | MMX | As above with PACKSSWB/PACKSSDW/PACKUSWB and PUNPCK, checksum `55823a65`. |
 | `mmx_extended` | MMX + MMXEXT | Selected extended MMX operations, forms and edge/seeded inputs against scalar references. |
 | `mmx_x87_transitions` | MMX + FPU | 2,048 checked MMX/x87 save/restore and EMMS transitions; tags can classify nonempty contents differently. |
+
+The `mmx_kernel_*`, `3dnow_kernel` and `fpu_mac`/`fpu_mandel`/`fpu_nbody`/
+`fpu_trig`/`fpu_series` checksums and references are recomputed by
+`python3 tools/check_fp_edges.py`, which simulates the block strings
+compiled into the guest. On 86Box, the "Softfloat FPU" setting makes every
+x87 instruction interpreted (`codegen_x87_interpreted()`), compiles no MMX
+(`recomp_opcodes_0f_no_mmx`) and leaves 3DNow! interpreted, so comparing the
+pure-MMX kernels between the host and softfloat backends shows that gating.
+
+**FPU backend probe.** Before any test, the guest prints
+`FPUPROBE backend=host|softfloat|native|none`. It divides 1 by 3 at 64-bit
+precision (significand `aaaaaaaaaaaaaaab`; a host-double x87 gives
+`...a800`) and takes FSIN of 2^62-0x9800 (x87 silicon and softfloat reduce
+with a 66-bit pi and give `bffe:8640e02231a959b8`; exact reduction through
+host libm gives `bffe:84f4f90fb9a5bb17`). `host` means the low significand
+bits were lost; `native` needs an exact result and a non-TCG hypervisor
+signature; otherwise exact results report `softfloat`, which includes real
+hardware and QEMU TCG (whose FSIN uses host libm, so its
+`NOTE test=cpu_model_contract fpu_probe ... fsin=exact_reduction`). That
+note gives the raw values next to the configured FPU. With `backend=host`,
+the checks a 53-bit significand cannot pass (`fpu_arith` thirds, `fpu_round`
+53-bit case, `fpu_formats` extended round-trips, `fpu_trans`/`fpu_trig`
+tolerances, FDIV/FPREM vectors) still FAIL, with `backend=host` at the start
+of their failure text.
 
 The FDIV rows each require FPU. The four names on each row independently
 repeat that vector 2,048 times at default scale; `rn`, `rd`, `ru`, `rz` mean
