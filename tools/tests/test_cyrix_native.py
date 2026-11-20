@@ -28,6 +28,8 @@ void kmemcpy(void *d, const void *s, u32 n) {
     for (u32 i = 0; i < n; i++) x[i] = y[i];
 }
 void kprintf(const char *format, ...) { (void)format; }
+const char *fpu_backend(void) { return "none"; }
+void fpu_backend_note(void) {}
 #include "cpu_contract.c"
 void _start(void) {
     u32 failed = 0;

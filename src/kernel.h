@@ -130,6 +130,8 @@ void t_fail(const char *what, int line);
 void t_failv(const char *what, int line, u32 got, u32 want);
 void t_skip(const char *reason);
 void t_note(const char *fmt, ...); /* prints "NOTE <testname> ..." line (data for the AI reader) */
+const char *fpu_backend(void); /* "host", "softfloat", "native" or "none" (tests_fpu.c probe) */
+void fpu_backend_note(void);
 void t_ops(u64 n);                 /* add n "operations" for ops/sec reporting */
 void t_work_unit(const char *unit); /* static token naming the counted work, not the timer */
 #define CHECK(c) do { if (!(c)) t_fail(#c, __LINE__); } while (0)

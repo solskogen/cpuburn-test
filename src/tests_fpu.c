@@ -6,24 +6,81 @@ static const ext80 eone={{0,0x80000000,0x3fff}}, etwo={{0,0x80000000,0x4000}},
 static void init(void) { __asm__ volatile("fninit" ::: "memory"); }
 static u16 status(void) { u16 sw; __asm__ volatile("fnstsw %0":"=m"(sw)); return sw; }
 static void control(u16 cw) { __asm__ volatile("fldcw %0"::"m"(cw):"memory"); }
-static void ext_check(const ext80 *a,const ext80 *b) {
-    CHECK_EQ(a->w[0],b->w[0]); CHECK_EQ(a->w[1],b->w[1]); CHECK_EQ(a->w[2]&0xffff,b->w[2]&0xffff);
-}
 static u32 ext_sum(u32 s,const ext80 *a) { return csum_mix(csum_mix(csum_mix(s,a->w[0]),a->w[1]),a->w[2]&0xffff); }
 static void show(const char *name,const ext80 *v) { t_note("%s=%04x:%08x%08x",name,v->w[2]&0xffff,v->w[1],v->w[0]); }
-/* Error bound: 2^-55 relative (absolute at zero), or 2^-50 for TCG
-   whose transcendental implementation rounds through host double precision. */
+
+/* Backend probe, run once from cpu_contract_init() before any test.
+ * 1/3 at 64-bit precision: significand aaaaaaaaaaaaaaab on silicon and
+ * in a software x87, aaaaaaaaaaaaa800 when ST is held as a host double.
+ * FSIN(2^62-0x9800): x87 reduction with its 66-bit pi gives
+ * -0.52449...(bffe:8640e02231a959b8); exact reduction (host libm, as
+ * 86Box's host backend and QEMU TCG use) gives -0.51938...(bffe:84f4f90f
+ * b9a5bb17). tools/check_fp_edges.py derives all three constants. */
+static const ext80 probe_third64={{0xaaaaaaab,0xaaaaaaaa,0x3ffd}},
+    probe_sin_x87={{0x31a959b8,0x8640e022,0xbffe}}, probe_sin_exact={{0xb9a5bb17,0x84f4f90f,0xbffe}};
+static const s64 probe_sin_arg=0x3fffffffffff6800ll;
+static ext80 probe_third, probe_sin;
+static u16 probe_sw;
+static const char *probe_backend, *probe_fsin="not_run";
 static int tcg(void) { return cpu.hv && !kmemcmp(cpu.hv_vendor,"TCGTCGTCGTCG",12); }
-static void near(const char *name,const ext80 *got,const ext80 *want) {
-    ext80 error={{0}}, tolerance={{0}}; u16 sw; s32 power=tcg()?-50:-55;
+static void probe_ops(void) {
+    static const s32 three=3;
+    __asm__ volatile("fninit; fld1; fidivl %3; fstpt %0; fildll %4; fsin; fnstsw %1; fstpt %2; fninit"
+                     : "=m"(probe_third),"=m"(probe_sw),"=m"(probe_sin) : "m"(three),"m"(probe_sin_arg) : "memory");
+}
+/* Same sign and exponent, significands within 2^24 (about 2^-40 relative). */
+static int probe_close(const ext80 *a,const ext80 *b) {
+    u64 x=((u64)a->w[1]<<32)|a->w[0], y=((u64)b->w[1]<<32)|b->w[0];
+    return (a->w[2]&0xffff)==(b->w[2]&0xffff) && (x>y?x-y:y-x)<=(1u<<24);
+}
+const char *fpu_backend(void) {
+    if(probe_backend) return probe_backend;
+    if(!cpu.has_fpu) return probe_backend="none";
+    if(guard_call(probe_ops)) { probe_fsin="fault"; return probe_backend="none"; }
+    probe_fsin=(probe_sw&0x400)?"out_of_range":probe_close(&probe_sin,&probe_sin_x87)?"x87_pi66":
+        probe_close(&probe_sin,&probe_sin_exact)?"exact_reduction":"other";
+    /* A guest cannot tell bit-exact emulation from silicon: only a hardware
+     * hypervisor signature makes the exact case "native". */
+    if(!(probe_third.w[0]&0x7ff)) probe_backend="host";
+    else if(cpu.hv && !tcg()) probe_backend="native";
+    else probe_backend="softfloat";
+    return probe_backend;
+}
+void fpu_backend_note(void) {
+    fpu_backend();
+    t_note("fpu_probe third=%04x:%08x%08x third_exact=%u fsin_2p62=%04x:%08x%08x fsin_sw=%04x fsin=%s",
+           probe_third.w[2]&0xffff,probe_third.w[1],probe_third.w[0],
+           probe_third.w[0]==probe_third64.w[0] && probe_third.w[1]==probe_third64.w[1] && (probe_third.w[2]&0xffff)==0x3ffd,
+           probe_sin.w[2]&0xffff,probe_sin.w[1],probe_sin.w[0],probe_sw,probe_fsin);
+}
+/* Checks a 53-bit host backend cannot pass stay strict; their failure text
+ * carries "backend=host" so the cause is visible in FAILDETAIL/TEST. */
+static int host_backend(void) { return fpu_backend()[0]=='h'; }
+static void ext_cmp(const ext80 *a,const ext80 *b,int limited,int line) {
+    static const char *const what[2][3]={
+        {"a->w[0] == b->w[0]","a->w[1] == b->w[1]","a->w[2]&0xffff == b->w[2]&0xffff"},
+        {"backend=host a->w[0] == b->w[0]","backend=host a->w[1] == b->w[1]","backend=host a->w[2]&0xffff == b->w[2]&0xffff"}};
+    const u32 got[3]={a->w[0],a->w[1],a->w[2]&0xffff}, want[3]={b->w[0],b->w[1],b->w[2]&0xffff};
+    int h=limited && host_backend();
+    for(unsigned i=0;i<3;++i) if(got[i]!=want[i]) t_failv(what[h][i],line,got[i],want[i]);
+}
+#define ext_check(a,b) ext_cmp(a,b,0,__LINE__)
+#define ext_check_host(a,b) ext_cmp(a,b,1,__LINE__)
+/* Error bound: 2^power relative (absolute at zero). near() uses 2^-55, or
+   2^-50 for TCG whose transcendental implementation rounds through host
+   double precision. A 53-bit host backend fails these, labelled. */
+static void near_pow(const char *name,const ext80 *got,const ext80 *want,s32 power) {
+    ext80 error={{0}}, tolerance={{0}}; u16 sw;
     const ext80 *scale=(want->w[1]|want->w[0])?want:&eone;
     __asm__ volatile("fldt %2; fldt %3; fsubrp %%st,%%st(1); fabs; fstpt %0;"
                      "fildl %4; fldt %5; fabs; fscale; fstpt %1; fstp %%st(0)"
                      : "=m"(error),"=m"(tolerance) : "m"(*got),"m"(*want),"m"(power),"m"(*scale) : "memory");
     __asm__ volatile("fldt %1; fldt %2; fcompp; fnstsw %0" : "=m"(sw) : "m"(tolerance),"m"(error) : "memory");
     show(name,got);
-    CHECK((sw&0x4500)==0x0100 || (sw&0x4500)==0x4000);
+    if(!((sw&0x4500)==0x0100 || (sw&0x4500)==0x4000))
+        t_fail(host_backend()?"backend=host relative error within 2^power":"relative error within 2^power",__LINE__);
 }
+static void near(const char *name,const ext80 *got,const ext80 *want) { near_pow(name,got,want,tcg()?-50:-55); }
 #define RESULT(code,want) do { u64 r; __asm__ volatile(code "\n fstpl %0" : "=m"(r) : "m"(a),"m"(b),"m"(f),"m"(d),"m"(i16),"m"(i32) : "memory"); CHECK(r==(want)); } while(0)
 static u32 fpu_arith(void) {
     s32 a=8,b=2,i32=2; s16 i16=2; u32 f=0x40000000; u64 d=0x4000000000000000ull;
@@ -78,7 +135,7 @@ static u32 fpu_arith(void) {
             ext80 e={{0}}; u32 s; u64 r;
             control(pc[i]);
             __asm__ volatile("fld1; fidivl %3; fsts %0; fstl %1; fstpt %2" : "=m"(s),"=m"(r),"=m"(e) : "m"(three) : "memory");
-            CHECK_EQ(s,0x3eaaaaab); CHECK(r==(i?0x3fd5555555555555ull:0x3fd5555560000000ull)); ext_check(&e,&thirds[i]);
+            CHECK_EQ(s,0x3eaaaaab); CHECK(r==(i?0x3fd5555555555555ull:0x3fd5555560000000ull)); ext_cmp(&e,&thirds[i],i==2,__LINE__);
         }
         control(0x037f);
     }
@@ -98,7 +155,7 @@ static u32 fpu_formats(void) {
     u32 sum=0; init();
     for(unsigned i=0;i<sizeof(singles)/sizeof(*singles);++i) { u32 r; __asm__ volatile("flds %1; fstps %0":"=m"(r):"m"(singles[i]):"memory"); CHECK_EQ(r,singles[i]); sum=csum_mix(sum,r); }
     for(unsigned i=0;i<sizeof(doubles)/sizeof(*doubles);++i) { u64 r; __asm__ volatile("fldl %1; fstpl %0":"=m"(r):"m"(doubles[i]):"memory"); CHECK(r==doubles[i]); sum=csum_mix(sum,(u32)r); }
-    for(unsigned i=0;i<sizeof(extended)/sizeof(*extended);++i) { ext80 r={{0}}; __asm__ volatile("fldt %1; fstpt %0":"=m"(r):"m"(extended[i]):"memory"); ext_check(&r,&extended[i]); sum=ext_sum(sum,&r); }
+    for(unsigned i=0;i<sizeof(extended)/sizeof(*extended);++i) { ext80 r={{0}}; __asm__ volatile("fldt %1; fstpt %0":"=m"(r):"m"(extended[i]):"memory"); ext_check_host(&r,&extended[i]); sum=ext_sum(sum,&r); }
     for(unsigned i=0;i<sizeof(ints)/sizeof(*ints);++i) {
         s64 r; __asm__ volatile("fildll %1; fistpll %0":"=m"(r):"m"(ints[i]):"memory"); CHECK(r==ints[i]);
         if(i<5) { s16 v=(s16)ints[i],o,p; __asm__ volatile("filds %2; fists %0; fistps %1":"=m"(o),"=m"(p):"m"(v):"memory"); CHECK_EQ((u16)o,(u16)v); CHECK_EQ((u16)p,(u16)v); }
@@ -112,7 +169,7 @@ static u32 fpu_formats(void) {
     {
         static const ext80 constants[]={{{0,0x80000000,0x3fff}},{{0,0,0}},{{0x2168c235,0xc90fdaa2,0x4000}},{{0x5c17f0bc,0xb8aa3b29,0x3fff}},{{0xcd1b8afe,0xd49a784b,0x4000}},{{0xfbcff799,0x9a209a84,0x3ffd}},{{0xd1cf79ac,0xb17217f7,0x3ffe}}};
         ext80 r={{0}};
-#define CONSTANT(n,k) __asm__ volatile(n "; fstpt %0":"=m"(r)::"memory"); ext_check(&r,&constants[k]);
+#define CONSTANT(n,k) __asm__ volatile(n "; fstpt %0":"=m"(r)::"memory"); ext_check_host(&r,&constants[k]);
         CONSTANT("fld1",0) CONSTANT("fldz",1) CONSTANT("fldpi",2) CONSTANT("fldl2e",3) CONSTANT("fldl2t",4) CONSTANT("fldlg2",5) CONSTANT("fldln2",6)
 #undef CONSTANT
     }
@@ -166,7 +223,7 @@ static u32 fpu_round(void) {
       u64 big24=0x4170000000000000ull,big53=0x4340000000000000ull; ext80 r={{0}};
       for(unsigned i=0;i<3;++i) {
           control(pc[i]); __asm__ volatile("fldl %1; fld1; faddp; fstpt %0":"=m"(r):"m"(big24):"memory"); ext_check(&r,&want24[i]);
-          __asm__ volatile("fldl %1; fld1; faddp; fstpt %0":"=m"(r):"m"(big53):"memory"); ext_check(&r,&want53[i]);
+          __asm__ volatile("fldl %1; fld1; faddp; fstpt %0":"=m"(r):"m"(big53):"memory"); ext_cmp(&r,&want53[i],i==2,__LINE__);
       }
     }
     init(); t_ops(70); return sum;
@@ -274,6 +331,11 @@ static u32 fpu_exceptions(void) {
    0xfff8000000000000); unmasked, the stack, TOP and tags are left alone and
    ES is set. Each case runs a few times so a recompiler sees it compiled. */
 #define STACK_INDEFINITE 0xfff8000000000000ull
+static u16 ffreep_sw;
+static const char *ffreep_outcome="not_run";
+static void ffreep_case(void) {
+    __asm__ volatile(".byte 0xd9,0xe8,0xd9,0xe8,0xdf,0xc1; fld1; fld1; fld1; fld1; fld1; fld1; fld1; fld1; fnstsw %0":"=m"(ffreep_sw)::"memory");
+}
 static unsigned empty_tags(u32 tw) { unsigned m=0; for(unsigned i=0;i<8;++i) if(((tw>>(2*i))&3)==3) m|=1u<<i; return m; }
 static u32 fpu_stack_cases(void) {
     u32 sum=0, env[7]; u16 sw; u64 a,b; static const u64 qint=0x0123456789abcdefull;
@@ -299,9 +361,17 @@ static u32 fpu_stack_cases(void) {
     /* masked FILD m64 onto a full stack: the indefinite, not the integer */
     init(); __asm__ volatile("fld1; fld1; fld1; fld1; fld1; fld1; fld1; fld1; fildll %2; fnstsw %0; fstpl %1":"=m"(sw),"=m"(a):"m"(qint):"memory");
     CHECK_EQ(sw&0x3a41,0x3a41); CHECK(a==STACK_INDEFINITE);
-    /* FFREEP ST(1) leaves both registers empty: eight pushes fit */
-    init(); __asm__ volatile(".byte 0xd9,0xe8,0xd9,0xe8,0xdf,0xc1; fld1; fld1; fld1; fld1; fld1; fld1; fld1; fld1; fnstsw %0":"=m"(sw)::"memory");
-    CHECK_EQ(sw&0x41,0);
+    /* FFREEP ST(1) (DF C1) leaves both registers empty: eight pushes fit.
+       AMD documents it from the K7 and P6-class parts execute it; before
+       family 6 it is undocumented, so FFREE without the pop (the eighth
+       push overflows) or #UD is also accepted there, and reported. */
+    init();
+    if(cpu_test_feature(REQ_P6)) { ffreep_case(); CHECK_EQ(ffreep_sw&0x41,0); ffreep_outcome="pop"; }
+    else {
+        int rc=guard_call(ffreep_case);
+        if(rc) { CHECK_EQ(rc,GUARD_EXC(6)); ffreep_outcome="ud"; }
+        else { CHECK((ffreep_sw&0x41)==0 || (ffreep_sw&0x41)==0x41); ffreep_outcome=(ffreep_sw&0x41)?"no_pop":"pop"; }
+    }
     /* FXAM of an empty register: C3 and C0, C1 its stale sign */
     init(); __asm__ volatile("fld1; fchs; ffree %%st(0); fxam; fnstsw %0":"=m"(sw)::"memory");
     CHECK_EQ(sw&0x4700,0x4300); CHECK_EQ(sw&0x41,0);
@@ -338,7 +408,7 @@ static u32 fpu_stack(void) {
         SKIP("TCG does not implement x87 stack faults; raw status reported");
     CHECK_EQ(overflow&0x241,0x241); CHECK_EQ(underflow&0x241,0x41);
     if(!tcg()) for(unsigned pass=0;pass<4;++pass) sum=fpu_stack_cases();
-    t_note("stack_cases=%08x",sum);
+    t_note("stack_cases=%08x ffreep=%s family=%u",sum,ffreep_outcome,cpu.family);
     return ((u32)overflow<<16)|underflow;
 }
 
@@ -390,89 +460,158 @@ static u32 fpu_fxsr(void) {
 #undef FXMEM
     init(); t_ops(40); return *(u32 *)(a+32);
 }
-static u64 from_int(s32 n) { u64 r; __asm__ volatile("fildl %1; fstpl %0":"=m"(r):"m"(n):"memory"); return r; }
-#define DBIN(name,op) static u64 name(u64 a,u64 b) { u64 r; __asm__ volatile("fldl %1; " op " %2; fstpl %0":"=m"(r):"m"(a),"m"(b):"memory"); return r; }
-DBIN(add,"faddl") DBIN(sub,"fsubl") DBIN(mul,"fmull") DBIN(divide,"fdivl")
-#undef DBIN
-static u64 root(u64 a) { u64 r; __asm__ volatile("fldl %1; fsqrt; fstpl %0":"=m"(r):"m"(a):"memory"); return r; }
 static void double_near(u64 got,u64 want,unsigned ulps) {
     CHECK((got>>63)==(want>>63)); CHECK((got>want?got-want:want-got)<=ulps);
 }
-static u64 arctan_series(u64 x) {
-    u64 x2=mul(x,x),term=x,sum=x;
-    for(s32 k=1;k<24;++k) { term=mul(term,x2); u64 v=divide(term,from_int(2*k+1)); sum=k&1?sub(sum,v):add(sum,v); }
-    return sum;
-}
-static u32 fpu_burn(void) {
-    const u64 one=0x3ff0000000000000ull,two=0x4000000000000000ull,half=0x3fe0000000000000ull;
-    u64 *a=arena_alloc(24*24*8,16),*b=arena_alloc(24*24*8,16),*c=arena_alloc(24*24*8,16);
+/* The former fpu_burn, split so each workload is timed on its own. Inner
+ * loops keep their state on the x87 stack; the known answers below were
+ * computed once on the host (tools/check_fp_edges.py re-derives them), so
+ * no reference arithmetic runs inside the timed region. */
+static u64 *fp_arena(unsigned n) { return arena_alloc(n*8,16); }
+/* 24x24 matrix product of small integers under PC53: every product and
+ * partial sum is exact, so the result is bit-exact on any backend. */
+static u32 fpu_mac(void) {
+    u64 *a=fp_arena(24*24),*b=fp_arena(24*24); s32 *c=arena_alloc(24*24*4,16);
     if(!a||!b||!c) SKIP("arena allocation unavailable");
-    u32 sum=0,escaped=0; init(); control(0x027f);
-    for(s32 i=0;i<24;++i) for(s32 j=0;j<24;++j) { a[i*24+j]=from_int((i+j)%7-3); b[i*24+j]=from_int((i*3+j)%5-2); }
+    init(); control(0x027f);
+    for(s32 i=0;i<24;++i) for(s32 j=0;j<24;++j) {
+        s32 va=(i+j)%7-3,vb=(i*3+j)%5-2;
+        __asm__ volatile("fildl %2; fstpl %0; fildl %3; fstpl %1":"=m"(a[i*24+j]),"=m"(b[i*24+j]):"m"(va),"m"(vb):"memory");
+    }
+    u32 sum=0;
     for(unsigned repeat=0;repeat<16;++repeat) {
         for(s32 i=0;i<24;++i) for(s32 j=0;j<24;++j) {
-            u64 acc=0; s32 exact=0;
-            for(s32 k=0;k<24;++k) {
-                acc=add(acc,mul(a[i*24+k],b[k*24+j])); exact+=((i+k)%7-3)*((k*3+j)%5-2);
-            }
-            c[i*24+j]=acc;
-            /* Exact integer products/sums are a separate known-answer oracle. */
-            CHECK(acc==from_int(exact)); sum=csum_mix(sum,(u32)acc^(u32)(acc>>32));
+            const u64 *pa=&a[i*24],*pb=&b[j]; u32 n=24;
+            __asm__ volatile("fldz\n\t"
+                "1: fldl (%0); fmull (%1); faddp\n\t"
+                "addl $8,%0; addl $192,%1; decl %2; jnz 1b\n\t"
+                "fistpl %3"
+                :"+r"(pa),"+r"(pb),"+r"(n),"=m"(c[i*24+j])::"memory","cc");
         }
+        sum=0; for(unsigned k=0;k<24*24;++k) sum=csum_mix(sum,(u32)c[k]);
+        CHECK_EQ(sum,0x30b7cae9u);
     }
-    t_ops(16*24*24*24*2);
+    t_ops(16*24*24*24*2); init(); return sum;
+}
+/* 48x32 Mandelbrot grid, 64 iterations, PC53: x87 PC53 arithmetic without
+ * overflow or denormals rounds exactly like IEEE double, so the per-pixel
+ * iteration counts and final points are bit-exact. */
+static u32 fpu_mandel(void) {
+    static const u64 four=0x4010000000000000ull,sixteenth=0x3fb0000000000000ull;
+    u32 sum=0,escaped=0,iterations=0; init(); control(0x027f);
     for(s32 py=0;py<32;++py) for(s32 px=0;px<48;++px) {
-        u64 cr=divide(from_int(px-32),from_int(16)),ci=divide(from_int(py-16),from_int(16));
-        u64 x=0,y=0; unsigned k;
-        for(k=0;k<64;++k) {
-            u64 xx=mul(x,x),yy=mul(y,y),magnitude=add(xx,yy);
-            if(magnitude>0x4010000000000000ull) break;
-            y=add(mul(two,mul(x,y)),ci); x=add(sub(xx,yy),cr);
-        }
+        s32 ci=py-16,cr=px-32; u32 k; u64 x,y;
+        __asm__ volatile(
+            "fildl %[ci]; fmull %[s]; fildl %[cr]; fmull %[s]; fldz; fldz\n\t"
+            "xorl %[k],%[k]\n\t"
+            "1: fld %%st(1); fmul %%st(0),%%st\n\t"     /* yy x y cr ci */
+            "fld %%st(1); fmul %%st(0),%%st\n\t"        /* xx yy x y cr ci */
+            "fld %%st(0); fadd %%st(2),%%st\n\t"        /* mag xx yy x y cr ci */
+            "fcompl %[four]; fnstsw %%ax; testb $0x45,%%ah; jz 2f\n\t"
+            "fsub %%st(1),%%st; fadd %%st(4),%%st; fstp %%st(1)\n\t"   /* nx x y cr ci */
+            "fxch %%st(1); fmul %%st(2),%%st; fadd %%st(0),%%st; fadd %%st(4),%%st; fstp %%st(2)\n\t"
+            "incl %[k]; cmpl $64,%[k]; jb 1b\n\t"
+            "jmp 3f\n\t"
+            "2: fstp %%st(0); fstp %%st(0)\n\t"
+            "3: fstpl %[x]; fstpl %[y]; fstp %%st(0); fstp %%st(0)"
+            :[k]"=&c"(k),[x]"=m"(x),[y]"=m"(y)
+            :[ci]"m"(ci),[cr]"m"(cr),[s]"m"(sixteenth),[four]"m"(four)
+            :"eax","memory","cc");
         if(k<64) ++escaped;
-        sum=csum_mix(csum_mix(sum,k),(u32)x^(u32)y); t_ops(k*9);
+        iterations+=k; sum=csum_mix(csum_mix(sum,k),(u32)x^(u32)y);
     }
-    CHECK(escaped>0 && escaped<48*32); t_note("mandelbrot escaped=%u pixels=%u",escaped,48*32);
-    u64 p=0,e=0,nr=0;
+    CHECK_EQ(escaped,1116u); CHECK_EQ(iterations,32852u); CHECK_EQ(sum,0x72f94ad3u);
+    t_ops(iterations*15); init(); return sum;
+}
+/* Eight bodies on a line with a softened 1/r^2 force, 128 steps of 1/1024,
+ * PC53. Compared with a 60-digit reference rounded to double (IEEE double
+ * arithmetic lands within 5 ulps); 64 ulps is the stated tolerance. */
+static u32 fpu_nbody(void) {
+    static const u64 dt=0x3f50000000000000ull,eighth=0x3fc0000000000000ull;
+    static const u64 want[8]={0xbfdeea917fd1a476ull,0xbfd72a858a72fefeull,0xbfcef2cb619bed18ull,0xbfbf4809403fd02eull,
+        0xbf66fed7f805fa32ull,0x3fbde596c337da30ull,0x3fce550b14e5fdfbull,0x3fd6ea917fd1a476ull};
+    u64 x[8],v[8],f[8]; u32 sum=0; init(); control(0x027f);
+    for(s32 i=0;i<8;++i) { s32 n=i-4; __asm__ volatile("fildl %1; fmull %2; fstpl %0":"=m"(x[i]):"m"(n),"m"(eighth):"memory"); v[i]=0; }
+    for(unsigned step=0;step<128;++step) {
+        for(unsigned i=0;i<8;++i) {
+            const u64 *p=x; u32 n=8;
+            /* j==i contributes an exact +0, as in the reference. */
+            __asm__ volatile("fldz\n\t"
+                "1: fldl (%0); fsubl %3\n\t"                   /* dx f */
+                "fld %%st(0); fmul %%st(0),%%st; fld1; faddp\n\t" /* r2 dx f */
+                "fld %%st(0); fsqrt; fmulp\n\t"                /* r3 dx f */
+                "fdivr %%st(1),%%st; faddp %%st,%%st(2); fstp %%st(0)\n\t"
+                "addl $8,%0; decl %1; jnz 1b\n\t"
+                "fstpl %2"
+                :"+r"(p),"+r"(n),"=m"(f[i]):"m"(x[i]):"memory","cc");
+        }
+        for(unsigned i=0;i<8;++i)
+            __asm__ volatile("fldl %2; fmull %3; faddl %0; fstl %0; fmull %3; faddl %1; fstpl %1"
+                :"+m"(v[i]),"+m"(x[i]):"m"(f[i]),"m"(dt):"memory");
+    }
+    for(unsigned i=0;i<8;++i) { double_near(x[i],want[i],64); sum=csum_mix(sum,(u32)x[i]^(u32)(x[i]>>32)); }
+    t_ops(128*(64*11+8*7)); init(); return sum;
+}
+/* Sum over x=i/1024, i=1..1024, of sin(x)cos(x)+atan(x)+sqrt(x) under PC64
+ * with FSINCOS/FPATAN/FSQRT; the exact sum rounded to 64 bits is
+ * 1495.670031442569..., checked to 2^-50 relative. */
+static u32 fpu_trig(void) {
+    static const ext80 want={{0xc7a40a0c,0xbaf570e5,0x4009}};
+    static const u64 inv1024=0x3f50000000000000ull,quarter=0x3fd0000000000000ull;
+    ext80 out={{0}}; u32 tmp,n=1; init();
+    __asm__ volatile("fldz\n\t"
+        "1: movl %1,%2; fildl %2; fmull %3\n\t"     /* x acc */
+        "fld %%st(0); fsincos; fmulp\n\t"            /* sc x acc */
+        "fld %%st(1); fld1; fpatan; faddp\n\t"       /* sc+atan x acc */
+        "fxch; fsqrt; faddp; faddp\n\t"
+        "incl %1; cmpl $1024,%1; jbe 1b\n\t"
+        "fstpt %0"
+        :"=m"(out),"+r"(n),"=m"(tmp):"m"(inv1024):"memory","cc");
+    near_pow("trig_sum",&out,&want,-50);
+    u32 sum=ext_sum(0,&out);
+    __asm__ volatile("fldl %1; fsincos; fmul %%st,%%st; fxch; fmul %%st,%%st; faddp; fsqrt; fld1; fpatan; fstpt %0":"=m"(out):"m"(quarter):"memory");
+    ext80 quarterpi=epi; quarterpi.w[2]-=2; near("whetstone_atan_identity",&out,&quarterpi);
+    t_ops(1024*13+10); init(); return ext_sum(sum,&out);
+}
+/* Machin pi, e from 20 factorial terms, Newton sqrt(7) and a Horner
+ * polynomial, PC53, all on the register stack. Tolerances are in ulps of
+ * the correctly rounded double; the Horner result is exact. */
+static u64 arctan_series(u64 x) {
+    u64 r; s32 d=1; u32 n=23;
+    __asm__ volatile("fldl %3; fldl %3; fmul %%st(0),%%st; fchs; fldl %3\n\t"  /* term -x2 sum */
+        "1: fmul %%st(1),%%st; addl $2,%1; fld %%st(0); fidivl %1; faddp %%st,%%st(3)\n\t"
+        "decl %2; jnz 1b\n\t"
+        "fstp %%st(0); fstp %%st(0); fstpl %0"
+        :"=m"(r),"+m"(d),"+r"(n):"m"(x):"memory","cc");
+    return r;
+}
+static u32 fpu_series(void) {
+    static const s32 three=3,five=5,eight=8,k239=239,seven=7; static const u64 half=0x3fe0000000000000ull;
+    u64 p=0,e=0,nr=0,h=0,a5,a239; u32 sum=0; init(); control(0x027f);
     for(unsigned repeat=0;repeat<128;++repeat) {
-        p=sub(mul(from_int(16),arctan_series(divide(one,from_int(5)))),mul(from_int(4),arctan_series(divide(one,from_int(239)))));
-        e=one; u64 term=one;
-        for(s32 i=1;i<=20;++i) { term=divide(term,from_int(i)); e=add(e,term); }
-        nr=from_int(3);
-        for(unsigned i=0;i<12;++i) nr=mul(half,add(nr,divide(from_int(7),nr)));
-        sum=csum_mix(sum,(u32)p^(u32)e^(u32)nr);
+        __asm__ volatile("fld1; fidivl %2; fstpl %0; fld1; fidivl %3; fstpl %1":"=m"(a5),"=m"(a239):"m"(five),"m"(k239):"memory");
+        a5=arctan_series(a5); a239=arctan_series(a239);
+        __asm__ volatile("fldl %1; fadd %%st(0),%%st; fadd %%st(0),%%st; fadd %%st(0),%%st; fadd %%st(0),%%st\n\t"
+            "fldl %2; fadd %%st(0),%%st; fadd %%st(0),%%st; fsubr %%st(1),%%st; fstpl %0; fstp %%st(0)"
+            :"=m"(p):"m"(a5),"m"(a239):"memory");
+        { s32 i=0; u32 n=20;
+          __asm__ volatile("fld1; fld1\n\t"                                 /* term e */
+            "1: incl %1; fidivl %1; fadd %%st,%%st(1); decl %2; jnz 1b\n\t"
+            "fstp %%st(0); fstpl %0":"=m"(e),"+m"(i),"+r"(n)::"memory","cc"); }
+        { u32 n=12;
+          __asm__ volatile("fildl %3\n\t"                                   /* nr=3 */
+            "1: fildl %4; fdiv %%st(1),%%st; fadd %%st(1),%%st; fmull %2; fstp %%st(1); decl %1; jnz 1b\n\t"
+            "fstpl %0":"=m"(nr),"+r"(n):"m"(half),"m"(three),"m"(seven):"memory","cc"); }
+        { s32 k=7;
+          __asm__ volatile("fildl %3\n\t"
+            "1: fmull %2; fiaddl %1; decl %1; jnz 1b\n\t"
+            "fstpl %0":"=m"(h),"+m"(k):"m"(half),"m"(eight):"memory","cc"); }
+        sum=csum_mix(sum,(u32)p^(u32)e^(u32)nr^(u32)(h>>32));
     }
     double_near(p,0x400921fb54442d18ull,12); double_near(e,0x4005bf0a8b145769ull,8); double_near(nr,0x40052a7fa9d2f8eaull,2);
-    t_note("series_pi=%llx series_e=%llx newton_sqrt7=%llx",p,e,nr); t_ops(128*(2*23*4+20*2+12*3+10));
-    for(unsigned repeat=0;repeat<8192;++repeat) {
-        u64 v=from_int(8);
-        for(s32 k=6;k>=0;--k) v=add(mul(v,half),from_int(k+1));
-        CHECK(v==0x400f600000000000ull); sum=csum_mix(sum,(u32)(v>>32));
-    }
-    t_ops(8192*14);
-    { u64 x[8],vel[8],force[8],dt=divide(one,from_int(1024));
-      for(s32 i=0;i<8;++i) { x[i]=divide(from_int(i-4),from_int(8)); vel[i]=0; }
-      for(unsigned step=0;step<128;++step) {
-          for(unsigned i=0;i<8;++i) {
-              force[i]=0;
-              for(unsigned j=0;j<8;++j) if(i!=j) {
-                  u64 dx=sub(x[j],x[i]),r2=add(mul(dx,dx),one),r3=mul(r2,root(r2));
-                  force[i]=add(force[i],divide(dx,r3));
-              }
-          }
-          for(unsigned i=0;i<8;++i) { vel[i]=add(vel[i],mul(force[i],dt)); x[i]=add(x[i],mul(vel[i],dt)); }
-      }
-      for(unsigned i=0;i<8;++i) { CHECK(((x[i]>>52)&0x7ff)<0x401); sum=csum_mix(sum,(u32)x[i]^(u32)(x[i]>>32)); }
-      t_ops(128*(56*7+8*4));
-    }
-    { ext80 out={{0}}; u64 quarter=0x3fd0000000000000ull; control(0x037f);
-      for(unsigned i=0;i<4096;++i) {
-          __asm__ volatile("fldl %1; fsincos; fmul %%st,%%st; fxch; fmul %%st,%%st; faddp; fsqrt; fld1; fpatan; fstpt %0":"=m"(out):"m"(quarter):"memory");
-          sum=ext_sum(sum,&out);
-      }
-      ext80 quarterpi=epi; quarterpi.w[2]-=2; near("whetstone_atan_identity",&out,&quarterpi); t_ops(4096*8);
-    }
-    init(); return sum;
+    CHECK(h==0x400f600000000000ull);
+    t_note("series_pi=%llx series_e=%llx newton_sqrt7=%llx",p,e,nr);
+    t_ops(128*(2*(5+23*5)+12+20*3+12*6+7*3)); init(); return sum;
 }
 /* Float-to-int as pre-SSE compilers emit it for every (int) cast (MSVC's
  * _ftol): save the control word, force truncation, FISTP, restore. Each value
@@ -510,9 +649,10 @@ static u32 fpu_ftol(void) {
 }
 
 const test_t tests_fpu[] = {
-    {"fpu_arith",fpu_arith,REQ_FPU, T_CHECK}, {"fpu_formats",fpu_formats,REQ_FPU},
+    {"fpu_arith",fpu_arith,REQ_FPU, T_CHECK}, {"fpu_formats",fpu_formats,REQ_FPU, T_CHECK},
     {"fpu_compare",fpu_compare,REQ_FPU, T_CHECK}, {"fpu_round",fpu_round,REQ_FPU, T_CHECK},
-    {"fpu_trans",fpu_trans,REQ_FPU, T_CHECK}, {"fpu_exceptions",fpu_exceptions,REQ_FPU},
-    {"fpu_stack",fpu_stack,REQ_FPU}, {"fpu_p6",fpu_p6,REQ_FPU|REQ_CMOV, T_CHECK}, {"fpu_fxsr",fpu_fxsr,REQ_FPU|REQ_FXSR, T_CHECK},
-    {"fpu_burn",fpu_burn,REQ_FPU}, {"fpu_ftol",fpu_ftol,REQ_FPU}, {0,0,0}
+    {"fpu_trans",fpu_trans,REQ_FPU, T_CHECK}, {"fpu_exceptions",fpu_exceptions,REQ_FPU, T_CHECK},
+    {"fpu_stack",fpu_stack,REQ_FPU, T_CHECK}, {"fpu_p6",fpu_p6,REQ_FPU|REQ_CMOV, T_CHECK}, {"fpu_fxsr",fpu_fxsr,REQ_FPU|REQ_FXSR, T_CHECK},
+    {"fpu_mac",fpu_mac,REQ_FPU}, {"fpu_mandel",fpu_mandel,REQ_FPU}, {"fpu_nbody",fpu_nbody,REQ_FPU},
+    {"fpu_trig",fpu_trig,REQ_FPU}, {"fpu_series",fpu_series,REQ_FPU}, {"fpu_ftol",fpu_ftol,REQ_FPU}, {0,0,0}
 };

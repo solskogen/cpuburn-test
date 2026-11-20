@@ -145,9 +145,12 @@ void cpu_contract_init(void) {
             configured ? "configured" : "detected",
             expected ? "known" : "unknown", cpu_required_features(),
             cpu_accuracy_mode() ? "accuracy" : "benchmark");
+    kprintf("FPUPROBE backend=%s\n", fpu_backend());
 }
 
 static u32 cpu_identity(void) {
+    t_note("configured_fpu=%s fpu_backend=%s", configured ? configured_fpu : "unconfigured", fpu_backend());
+    fpu_backend_note();
     if (!expected) SKIP("model_contract_unavailable");
     if (expected->required & REQ_AC) CHECK_EQ(cpu.is486, 1);
     if (expected->required & REQ_CPUID) CHECK_EQ(cpu.has_cpuid, 1);
