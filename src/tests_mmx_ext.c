@@ -329,6 +329,6 @@ const test_t tests_mmx_ext[] = {
     {"mmx_idct_row", mmx_idct_row, REQ_MMX, 0},
     {"mmx_yuv_rgb", mmx_yuv_rgb, REQ_MMX, 0},
     {"mmx_movd_pingpong", mmx_movd_pingpong, REQ_MMX, 0},
-    {"mmx_x87_switch", mmx_x87_switch, REQ_MMX | REQ_FPU, 0},
+    {"mmx_x87_switch", mmx_x87_switch, REQ_MMX | REQ_FPU, T_TAG_X87},
     {0, 0, 0, 0}
 };

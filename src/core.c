@@ -1455,7 +1455,7 @@ void kmain(void) {
         run_tests(tests_vendor, T_TAG_MMX);
         run_tests(tests_cyrix, T_TAG_IO);
         run_tests(tests_pmode, T_TAG_SEGLOAD | T_TAG_EXC);
-        run_tests(tests_pmode_ext, T_TAG_SEGLOAD | T_TAG_MODESW | T_TAG_EXC);
+        run_tests(tests_pmode_ext, 0);
         run_tests(tests_heavy_pmode, T_TAG_SEGLOAD | T_TAG_MODESW);
         /* Platform checks: mostly waiting on PIT/RTC edges, so never benchmarked. */
         run_checks(tests_chipset, T_TAG_IO);

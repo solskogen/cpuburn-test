@@ -50,6 +50,6 @@ static u32 pm_a20_toggle(void) {
 }
 
 const test_t tests_pmode_ext[] = {
-    { "pm_a20_toggle", pm_a20_toggle, 0 },
+    { "pm_a20_toggle", pm_a20_toggle, 0, T_TAG_IO },
     { 0, 0, 0 }
 };
