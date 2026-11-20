@@ -8,7 +8,7 @@ the following sections describe their checked behavior and limits.
 | Area | Source modules | Evidence and limits |
 |---|---|---|
 | Integer execution and translation | `src/tests_int.c`, `src/tests_corpus.c`, `src/tests_sweeps.c` | Arithmetic/defined flags, decoding, branches, SMC and code footprints; exhaustive only where explicitly stated, otherwise deterministic samples. |
-| x87 and MMX | `src/tests_fpu.c`, `src/tests_fp_edges.c`, `src/tests_mmx.c` | Results, formats, rounding, status/environment and scalar/exact references; not full x87 transcendental precision certification. |
+| x87 and MMX | `src/tests_fpu.c`, `src/tests_fpu_ext.c`, `src/tests_fp_edges.c`, `src/tests_mmx.c`, `src/tests_mmx_ext.c` | Results, formats, rounding, status/environment and scalar/exact references; not full x87 transcendental precision certification. |
 | AMD/Cyrix extensions | `src/tests_vendor.c` | Feature-gated baseline/enhanced 3DNow! and all twelve Cyrix EMMI opcodes; integer-only references, finite dyadic floating-point cases and documented reciprocal precision bounds. Not exhaustive floating-point range/rounding certification. |
 | Cyrix CPU controls | `src/tests_cyrix.c` | Model-qualified CCR4 CPUID/ID-flag controls and disabled-SMM opcode faults; saved configuration restored. GXm uses the `mediagxm` contract on ECS P5GX-M. Not full CCR/ARR or SMM entry/exit coverage. |
 | Privilege, exceptions and restart | `src/tests_pmode.c`, `src/tests_heavy_pmode.c`, `src/tests_priority.c`, `src/tests_restart_complex.c` | Protected-mode architectural transitions and selected fault precedence/restart cases; not every combination of instructions, exceptions or pending interrupts. |
@@ -621,6 +621,67 @@ memory forms). Both even and odd specified registers are exercised.
 | `cyrix_cpuid_control` | — | Two CCR4 CPUID disabled/enabled states, ID flag and #UD/vendor checks; documented Cyrix models only, with CCR3/4 restored. Unit `cpuid_control_state`. |
 | `cyrix_smm_disabled` | — | Model-qualified disabled-SMAC opcodes must #UD without changing operand bytes; unit `smm_disabled_opcode_case`, count varies by model. No SMM entry; locked state can skip. |
 | `mediagx_cpuid` | CPUID | Six GXm CPUID leaf cases checking documented fields; model-gated, reserved fields unasserted. Unit `cpuid_leaf_case`. |
+
+#### Targeted x87 and MMX records
+
+`src/tests_fpu_ext.c` and `src/tests_mmx_ext.c` hold fixed-count timed
+records, each aimed at one 86Box path: x87 forms with no dynarec handler
+(NULL in `src/codegen/codegen_ops.c`, so every instance leaves the block and
+calls the interpreter), compiled forms that fall back to a helper, and
+control-word changes that end the block in `x87_set_control_word`. The
+target column describes the x86-64 host tables. On ARM hosts, the 3DNow! ops
+are compiled and PMADDWD is not. With the
+softfloat x87 backend every x87, MMX and 3DNow! instruction is interpreted,
+so these records also measure that. Data are register-resident where
+possible. x87 data are exact dyadic values or small integers, so the
+host-double x87 gets exact results. Transcendental block sums are checked
+against host constants from a 200-bit mpmath computation, with a relative
+bound of 2^-30. Each MMX record compares against a scalar C reference that
+is built once and cached. `ops` counts the unit in the last column. Every
+`fpu_*` record also needs FPU.
+
+| Record | Extra requirements | 86Box target | Work / unit |
+|---|---|---|---|
+| `fpu_m80_move` | — | FLD/FSTP m80 (DB /5, /7): uncompiled | 8 tword values bounced between buffers; `m80_load_or_store` |
+| `fpu_fcomi_branch` | CMOV | FCOMI/FUCOMI(P) (DB/DF E8-F7): uncompiled | Threshold count by FCOMI+Jcc; `compare_branch` |
+| `fpu_fnstsw_sahf` | — | Compiled FCOMP+FNSTSW AX+SAHF baseline for the record above | Same kernel; `compare_branch` |
+| `fpu_fcmov` | CMOV | FCMOVcc (DA/DB C0-DF): uncompiled | Branch-free clamp, all eight FCMOVs; `clamp` |
+| `fpu_frndint` | — | FRNDINT (D9 FC): uncompiled | k/4 for k = -32..31, round to nearest even; `frndint` |
+| `fpu_frndint_floor` | — | FRNDINT plus FLDCW rounding swaps that end the block | libc floor()+ceil() pattern; `frndint` |
+| `fpu_const` | — | FLDPI/FLDL2E/FLDL2T/FLDLG2/FLDLN2 (D9 E9-ED) and FXAM (D9 E5): uncompiled | `constant_or_fxam` |
+| `fpu_trans_sin`, `fpu_trans_sincos`, `fpu_trans_ptan`, `fpu_trans_patan`, `fpu_trans_yl2x`, `fpu_trans_2xm1` | — | FSIN, FSINCOS, FPTAN, FPATAN, FYL2X, F2XM1 (D9 F0-FF row): uncompiled | 64 evaluations per block at x0 + k*h; `transcendental` |
+| `fpu_trans_scale` | — | FSCALE (D9 FD): uncompiled | 1.5 scaled by -8..7, exact sum; `fscale` |
+| `fpu_init_clex` | — | FNINIT/FNCLEX (DB E3/E2): uncompiled | A precision exception between them; `fninit_or_fnclex` |
+| `fpu_ctxsw` | — | FNSAVE/FRSTOR (DD /6, /4) and FNSTENV/FLDENV (D9 /6, /4): uncompiled | Round trips over a full stack; `state_save_or_restore` |
+| `fpu_fdiv_pc24`, `fpu_fdiv_pc53`, `fpu_fdiv_pc64` | — | Compiled FDIV (`fdiv_divide`) stays in the block only at 24/53-bit precision; at 64-bit it calls `x87_dyn_fdiv` | Same exact loop, only the precision control differs; `fdiv` |
+| `fpu_fdiv_span` | — | FDIV overlapped with ~20 integer instructions and FXCH, PC=24 | Quake-style perspective-correct span segments, checksum of fetched texels; `span_segment` |
+| `fpu_ftol_pc24` | — | FLDCW rounding toggles at PC=24 that end the block | Direct3D-era `_ftol` around each FISTP; `float_to_int` |
+| `fpu_ftol_magic` | — | Compiled FADD m32/FSTP m32 with no FLDCW | Magic-number add, for comparison; `float_to_int` |
+| `fpu_xform4` | — | Compiled m32 FMUL/FADD with FXCH scheduling | 4x4 matrix times 64 vec4 vertices; `flop` |
+| `fpu_int_conv_m16`, `fpu_int_conv_m32`, `fpu_int_conv_m64` | — | Compiled FILD/FISTP m16, m32 and m64 | FILD/FCHS/FISTP ping-pong over 64 integers; `int_load_or_store` |
+| `fpu_denormal_audio` | — | Denormal operands and results with #D/#U masked | Single-precision one-pole filter decaying from 2^-120 to zero; `sample` |
+| `fpu_mf_ne` | 486 | Unmasked #Z delivered as #MF (CR0.NE=1) at FWAIT | The handler clears the exception and FWAIT restarts; skipped if CR0.NE is clear; `fpu_exception` |
+| `fpu_mf_irq13` | 486 | FERR# to IRQ13 with CR0.NE=0, acknowledged at port F0h | One IRQ per exception; `fpu_exception` |
+| `fpu_fwait` | — | FWAIT before every x87 instruction | 8087-style sum of squares; `waited_x87_instruction` |
+| `mmx_shift_reg` | MMX | PSRL/PSRA/PSLL by register or memory count (0F D1-D3, E1-E2, F1-F3): uncompiled (`ropPSLLW` and the other shift handlers are never wired) | Counts 3, 9 and 17; `mmx_shift` |
+| `mmx_ext_kernel` | MMX + MMXEXT | PAVGB, PSADBW, PSHUFW, PMOVMSKB: uncompiled | 8x8 SAD motion search, 64 full-pel and 64 half-pel candidates; `sad_candidate` |
+| `3dnow_dot` | MMX + 3DNOW | PFACC, PMULHRW, PAVGUSB: uncompiled on x86 hosts; PFMUL/PFADD/PF2ID compiled | vec4 dot products plus packed rounding multiply and average; `vertex` |
+| `3dnow_ext_dot` | MMX + 3DNOWEXT | PI2FW, PF2IW, PSWAPD, PFNACC, PFPNACC: uncompiled on x86 hosts | Complex multiply; `complex_multiply` |
+| `mmx_idct_row` | MMX | Compiled PMADDWD/PSRAD/PACKSSDW | IDCT-style 8-point row transform, 64 rows; `row` |
+| `mmx_yuv_rgb` | MMX | Compiled PUNPCK*/PMULHW/PACKUSWB | YUV 4:2:2 to RGB, 4 pixels per step; `pixel` |
+| `mmx_movd_pingpong` | MMX | MOVD r32<->mm in a dependent chain | `movd` |
+| `mmx_x87_switch` | MMX + FPU | MMX block, EMMS, x87 block, repeated | Two state switches per step; `switch` |
+
+Notes:
+
+- There is no unmasked-#D variant of `fpu_denormal_audio`. An unmasked #D
+  aborts the load, so continuing needs either instruction emulation or a
+  restart based on FIP. Neither is safe and cheap enough for a timed loop.
+- `fpu_mf_irq13` unmasks IRQ2 and IRQ13 at the PICs, clears CR0.NE, and
+  restores the masks, CR0 and the hook afterwards. Its handler acknowledges
+  with an OUT to port F0h, then clears the status word with FNSTENV/FLDENV,
+  as DOS-era handlers did. QEMU deasserts IGNNE# only when the status word
+  is reloaded, so FNCLEX alone would lose every IRQ13 after the first.
 
 ### Protected mode, privilege and exceptions
 
