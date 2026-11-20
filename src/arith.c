@@ -8,6 +8,17 @@ u64 __udivmoddi4(u64 n, u64 d, u64 *rem) {
         __asm__ volatile("divl %0" :: "r"(0) : "eax", "edx", "cc");
         __builtin_unreachable();
     }
+    if (!(d >> 32)) {
+        /* Schoolbook division by a 32-bit divisor: two DIVLs, each with a
+         * high half below the divisor so the quotient fits 32 bits. */
+        u32 dv = (u32)d, hi = (u32)(n >> 32), qh = 0, ql, rl;
+        if (hi >= dv) {
+            __asm__("divl %4" : "=a"(qh), "=d"(hi) : "a"(hi), "d"(0), "rm"(dv) : "cc");
+        }
+        __asm__("divl %4" : "=a"(ql), "=d"(rl) : "a"((u32)n), "d"(hi), "rm"(dv) : "cc");
+        if (rem) *rem = rl;
+        return ((u64)qh << 32) | ql;
+    }
     for (int i = 63; i >= 0; i--) {
         u32 carry = (u32)(r >> 63);
         r = (r << 1) | ((n >> i) & 1);
