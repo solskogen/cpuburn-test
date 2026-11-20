@@ -69,7 +69,9 @@ typedef struct {
     u8 trunc_q, nearest_q;
 } rem_vector;
 
-/* Negative-Q flag encodings vary/are ambiguous in references; those bits are diagnostic only. */
+/* The quotient fields are the low three bits of |Q| (C0=Q2, C3=Q0, C1=Q1):
+ * FPREM/FPREM1 divide magnitudes, so the signs of the operands only set the
+ * sign of the remainder. tools/check_fp_edges.py re-derives every field. */
 static const rem_vector rem_vectors[] = {
     { "11/2", E(0x00000000,0xb0000000,0x4002), E(0x00000000,0x80000000,0x4000),
       E(0x00000000,0x80000000,0x3fff), E(0x00000000,0x80000000,0xbfff), 5, 6 },
@@ -78,11 +80,11 @@ static const rem_vector rem_vectors[] = {
     { "5/2 tie", E(0x00000000,0xa0000000,0x4001), E(0x00000000,0x80000000,0x4000),
       E(0x00000000,0x80000000,0x3fff), E(0x00000000,0x80000000,0x3fff), 2, 2 },
     { "-11/2", E(0x00000000,0xb0000000,0xc002), E(0x00000000,0x80000000,0x4000),
-      E(0x00000000,0x80000000,0xbfff), E(0x00000000,0x80000000,0x3fff), 0, 0 },
+      E(0x00000000,0x80000000,0xbfff), E(0x00000000,0x80000000,0x3fff), 5, 6 },
     { "11/-2", E(0x00000000,0xb0000000,0x4002), E(0x00000000,0x80000000,0xc000),
-      E(0x00000000,0x80000000,0x3fff), E(0x00000000,0x80000000,0xbfff), 0, 0 },
+      E(0x00000000,0x80000000,0x3fff), E(0x00000000,0x80000000,0xbfff), 5, 6 },
     { "-14/7 signed zero", E(0x00000000,0xe0000000,0xc002), E(0x00000000,0xe0000000,0x4001),
-      E(0x00000000,0x00000000,0x8000), E(0x00000000,0x00000000,0x8000), 0, 0 },
+      E(0x00000000,0x00000000,0x8000), E(0x00000000,0x00000000,0x8000), 2, 2 },
     { "-zero/3", E(0x00000000,0x00000000,0x8000), E(0x00000000,0xc0000000,0x4000),
       E(0x00000000,0x00000000,0x8000), E(0x00000000,0x00000000,0x8000), 0, 0 },
     { "max/7", E(0xffffffff,0xffffffff,0x7ffe), E(0x00000000,0xe0000000,0x4001),
@@ -96,6 +98,11 @@ static const rem_vector rem_vectors[] = {
 };
 
 #undef E
+
+/* FAILDETAIL/TEST text carries "backend=host" when the probe found a 53-bit
+ * host-double x87: these exact 64-bit results are beyond it (the check
+ * itself is not relaxed). */
+#define HOST_TEXT(s) (fpu_backend()[0] == 'h' ? "backend=host " s : s)
 
 static int same_ext(const ext80 *a, const ext80 *b) {
     return a->lo == b->lo && a->hi == b->hi && a->se == b->se;
@@ -130,7 +137,7 @@ static u32 fp_fdiv_vector(u32 index, u32 mode) {
         division_case(v, &got);
         if (!same_ext(&got, &v->rounded[mode])) {
             report_div_mismatch(index, mode, v, &got, &v->rounded[mode]);
-            t_fail("FDIV extended result differs from exact rational reference", __LINE__);
+            t_fail(HOST_TEXT("FDIV extended result differs from exact rational reference"), __LINE__);
             t_ops(i + 1);
             reset_fp();
             return sum;
@@ -146,11 +153,6 @@ static u32 fp_fdiv_vector(u32 index, u32 mode) {
 
 static u8 quotient_bits(u16 sw) {
     return (u8)(((sw >> 6) & 4u) | ((sw >> 13) & 2u) | ((sw >> 9) & 1u));
-}
-
-static int negative_quotient(const rem_vector *v) {
-    return ((v->dividend.se ^ v->divisor.se) & 0x8000) &&
-           (v->dividend.lo | v->dividend.hi | (v->dividend.se & 0x7fff));
 }
 
 static int remainder_case(const rem_vector *v, int nearest, ext80 *out,
@@ -229,14 +231,12 @@ static void report_rem_mismatch(unsigned index, int nearest, const rem_vector *v
 
 static u32 fp_fprem_vector(u32 index, int nearest) {
     const u32 iterations = 256u * HEAVY_SCALE;
-    u32 sum = 0, total_steps = 0, max_steps = 0, negative_q_count = 0;
-    u8 negative_q_flags_xor = 0;
+    u32 sum = 0, total_steps = 0, max_steps = 0;
     reset_fp();
     for (u32 i = 0; i < iterations; ++i) {
         const rem_vector *v = &rem_vectors[index];
         const ext80 *want = nearest ? &v->nearest_rem : &v->trunc_rem;
         u8 qwant = nearest ? v->nearest_q : v->trunc_q, qgot = 0;
-        int qbits_defined = !negative_quotient(v);
         u32 steps = 0;
         u16 sw = 0;
         ext80 got = {0, 0, 0};
@@ -251,17 +251,15 @@ static u32 fp_fprem_vector(u32 index, int nearest) {
         total_steps += steps + 1;
         if (steps + 1 > max_steps)
             max_steps = steps + 1;
-        if (!qbits_defined) {
-            negative_q_count++;
-            negative_q_flags_xor ^= qgot;
-        }
-        if (!same_ext(&got, want) || (qbits_defined && qgot != qwant)) {
+        if (!same_ext(&got, want) || qgot != qwant) {
             report_rem_mismatch(index, nearest, v, &got, want, qgot, qwant,
-                                qbits_defined, steps + 1, sw, 0);
-            t_fail(qbits_defined
-                       ? "FPREM remainder or positive quotient bits differ from exact reference"
-                       : "FPREM remainder differs from exact reference",
-                   __LINE__);
+                                1, steps + 1, sw, 0);
+            /* A wrong remainder is what a 53-bit host backend produces; a
+             * quotient-only mismatch is not a precision limit. */
+            if (!same_ext(&got, want))
+                t_fail(HOST_TEXT("FPREM remainder differs from exact reference"), __LINE__);
+            else
+                t_fail("FPREM quotient bits differ from exact reference", __LINE__);
             t_ops(i + total_steps);
             reset_fp();
             return sum;
@@ -271,9 +269,6 @@ static u32 fp_fprem_vector(u32 index, int nearest) {
     t_ops(iterations + total_steps);
     t_note("FPREM cases=%u nearest=%u vector=%u iteration_limit=2048 max_steps=%u partial_steps=%u seed=%08x independent_record=1",
            iterations, nearest, index, max_steps, total_steps, (u32)TEST_SEED);
-    if (negative_q_count)
-        t_note("FPREM negative_quotient_flags_unasserted=%u raw_flag_xor=%02x (encoding unspecified)",
-               negative_q_count, negative_q_flags_xor);
     reset_fp();
     return sum;
 }
@@ -306,8 +301,9 @@ static u32 rem1_invalid(void) { return remainder_class_check(3); }
     { "fprem1_v" #n, rem1_##n, REQ_FPU, T_CHECK },
 /* FDIV and the remainder vectors run far above full speed on every
  * emulated CPU, so they are correctness checks; vector 9's FPREM1 is the
- * one that is still timed. FDIV vectors 1-14 are in their own check-only
- * table. */
+ * one that is still timed: 2^1000/3 needs about 16 partial FPREM1 steps, so each
+ * call runs 2048 reductions (about 32k FPREM1) and is not dominated by the
+ * harness. FDIV vectors 1-14 are in their own check-only table. */
 const test_t tests_fp_edges[] = {
     DIV_TEST(0)
     REM_TEST(0) REM_TEST(1) REM_TEST(2) REM_TEST(3) REM_TEST(4) REM_TEST(5)
