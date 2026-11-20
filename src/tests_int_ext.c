@@ -283,9 +283,12 @@ static NOINLINE u32 call_code(u8 *p,u32 c,void *di) {
     __asm__ volatile("jmp 1f\n1: call *%3" : "=a"(r),"+c"(c),"+D"(di) : "b"(p) : "edx","memory","cc");
     return r;
 }
+/* code: 0 data-only pages (same speed whatever ran before), 1 call a RET on
+   the destination page before every copy, 2 run that RET only before the
+   copies, so they write a page whose translated code is already stale. */
 static u32 movsd_run(u32 dst_off,u32 ndw,int df,u32 reps,int code) {
     u32 span=(ndw*4+4096+4095)&~4095u;
-    u8 *base=arena_alloc(3*span,4096); if(!base) SKIP("arena_movsd");
+    u8 *base=code?arena_alloc(3*span,4096):arena_data_alloc(3*span,4096); if(!base) SKIP("arena_movsd");
     u8 *dst=base+dst_off,*src[2]={base+span,base+2*span};
     for(int k=0;k<2;k++) {
         stosd(src[k],k?0xa5c3a5c3u:0x5a3c5a3cu,ndw);
@@ -293,8 +296,9 @@ static u32 movsd_run(u32 dst_off,u32 ndw,int df,u32 reps,int code) {
     }
     if(code) base[0]=0xc3;
     for(int i=0;i<4;i++) dst[4*ndw+i]=0xee;
+    if(code==2) for(int i=0;i<8;i++) call_code(base,0,0);
     for(u32 r=0;r<reps;r++) {
-        if(code) call_code(base,0,0);
+        if(code==1) call_code(base,0,0);
         movsd(dst,src[r&1],ndw,df);
     }
     const u8 *last=src[(reps-1)&1];
@@ -310,6 +314,7 @@ static u32 int_rep_movsd_page(void) { return movsd_run(0,1024,0,64,0); }
 static u32 int_rep_movsd_long(void) { return movsd_run(0,16384,0,16,0); }
 static u32 int_rep_movsd_codepage(void) { return movsd_run(64,256,0,256,1); }
 static u32 int_rep_movsd_codepage_backward(void) { return movsd_run(64,256,1,256,1); }
+static u32 int_rep_movsd_stale_code(void) { return movsd_run(64,256,0,256,2); }
 
 /* ---- BCD (27 DAA, 2F DAS, 37 AAA, 3F AAS, D4 AAM, D5 AAD: NULL) ---- */
 extern u32 ie_daa_add(u8 *d,const u8 *a,const u8 *b,u32 n);
@@ -623,6 +628,7 @@ const test_t tests_int_ext[]={
     {"int_rep_movsd_long",int_rep_movsd_long,REQ_486},
     {"int_rep_movsd_codepage",int_rep_movsd_codepage,REQ_486,T_TAG_SMC},
     {"int_rep_movsd_codepage_backward",int_rep_movsd_codepage_backward,REQ_486,T_TAG_SMC},
+    {"int_rep_movsd_stale_code",int_rep_movsd_stale_code,REQ_486,T_TAG_SMC},
     {"int_bcd_packed_daa_das",int_bcd_packed_daa_das,REQ_486},
     {"int_bcd_ascii_aaa_aas",int_bcd_ascii_aaa_aas,REQ_486},
     {"int_bcd_aam_aad",int_bcd_aam_aad,REQ_486},

@@ -173,6 +173,7 @@ extern u32 arena_base, arena_size; /* usable, test-owned RAM above 1 MiB (physic
 extern u32 arena_end;               /* end of the arena; the 64 KiB above it is usable RAM nothing else touches */
 extern u32 ram_top;                /* highest usable address from E820/INT15 (bytes, capped 4 GiB-1) */
 void *arena_alloc(u32 size, u32 align); /* bump allocator; reset automatically before every test */
+void *arena_data_alloc(u32 size, u32 align); /* 256 KiB window never used for code (arena_alloc if no room) */
 int e820_claims(u32 base, u32 len); /* any enabled E820 record (of any type) overlaps [base, base+len) */
 extern u32 *pg_dir;                /* persistent page directory (identity 0..16 MiB, 4K pages, P|RW|US) */
 void paging_enable(void);

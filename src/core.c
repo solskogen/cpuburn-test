@@ -455,6 +455,10 @@ int ring3_call(void (*entry)(void), u32 stack_top) {
 u32 arena_base, arena_size, ram_top;
 static u32 arena_ptr;
 u32 arena_end;
+/* Data-only window above the 64 KiB tail: no record executes code there, so
+ * an emulator's per-page code state cannot carry over from earlier records. */
+#define ARENA_DATA_BYTES 0x40000u
+static u32 arena_data_base, arena_data_ptr;
 u32 *pg_dir;
 int paging_on;
 static int pg_built;
@@ -465,6 +469,14 @@ void *arena_alloc(u32 size, u32 align) {
     u32 p = (arena_ptr + align - 1) & ~(align - 1);
     if (p + size > arena_end || p + size < p) return NULL;
     arena_ptr = p + size;
+    return (void *)p;
+}
+
+void *arena_data_alloc(u32 size, u32 align) {
+    if (!arena_data_base) return arena_alloc(size, align);
+    u32 p = (arena_data_ptr + align - 1) & ~(align - 1);
+    if (p + size > arena_data_base + ARENA_DATA_BYTES || p + size < p) return NULL;
+    arena_data_ptr = p + size;
     return (void *)p;
 }
 
@@ -522,6 +534,10 @@ static void mem_init(void) {
     arena_base = best_base ? best_base : runtime_end;
     if (best_end > arena_base + 0x20000) {
         arena_end = best_end - 0x10000;
+        if (arena_end - arena_base > 0x10000 + 0x100000 + ARENA_DATA_BYTES) {
+            arena_end -= ARENA_DATA_BYTES;
+            arena_data_base = arena_end + 0x10000;
+        }
         arena_size = arena_end - arena_base - 0x10000;
     } else {
         arena_end = arena_base;
@@ -537,7 +553,7 @@ static void mem_init(void) {
     note_buf = (char *)(arena_base + 0x8000);
 }
 
-static void arena_reset(void) { arena_ptr = arena_base + 0x10000; }
+static void arena_reset(void) { arena_ptr = arena_base + 0x10000; arena_data_ptr = arena_data_base; }
 
 /* Kernel page-directory checksum, ignoring the accessed/dirty bits the CPU
  * sets: restore_state and paging_enable rebuild on a mismatch. */
