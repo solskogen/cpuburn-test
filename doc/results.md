@@ -5,27 +5,25 @@
 Example record (numbers are illustrative):
 
 ```text
-BEGIN r=1 name=workload phase=first
+CFG rounds=2 ... seed=86b04a21 ... suite=full timing_scope=checked_workload ms_resolution=10
 WORK phase=warmup r=1 id=1 name=workload
 WORK phase=sample r=1 id=1 name=workload
 WORK phase=end r=1 id=1 name=workload
 NOTE test=workload detail=value
-TEST r=1 name=workload status=PASS ms=30000 cyc=123456789 unit=tsc ops=100000000 sum=12345678 iterations=1000 warmup_ms=30 warmup_failed=0 failed_iterations=0 id=1 iteration_ops=100000
-RUNTIME scope=test r=1 id=1 name=workload total_ms=30120 warmup_ms=30 sample_ms=30000 overhead_ms=90 resolution_ms=10
-SUMMARY rounds=2 tests=100 pass=80 fail=0 skip=20 fault=0 ms=2500000
-RUNTIME scope=suite total_ms=2500000 warmup_ms=3000 sample_ms=2400000 overhead_ms=96000 suite_overhead_ms=1000 resolution_ms=10
+TEST r=1 name=workload status=PASS ms=30000 us=29987411 cyc=123456789 unit=tsc ops=100000000 sum=12345678 iterations=1000 invocations=1001 warmup_ms=30 warmup_failed=0 failed_iterations=0 id=1 iteration_ops=100000 ... total_ms=30120 overhead_ms=90 harness_cyc=2100000 harness_full=0 exc=2000 excv=14:2000 irq0=3012 tags=paging,exc fn=0012f870
+FILTER suite_selection=0 build_selection=0 runtime_selection=0
+SUMMARY rounds=2 tests=100 pass=80 fail=0 skip=20 fault=0 ms=2500000 warmup_ms=3000 sample_ms=2400000 overhead_ms=96000 suite_overhead_ms=1000
 DONE
 ```
 
-`RUNTIME` records show where **guest time** goes, measured with the guest's
-100 Hz timer on any host. Per test, `total_ms` covers the whole test,
+The runtime fields show where **guest time** goes, measured with the guest's
+100 Hz timer on any host (10 ms resolution). Per test, `total_ms` covers the whole test,
 including skip handling, notes and result output. `warmup_ms` and `sample_ms`
 time only the test invocations; `overhead_ms` is the remainder, including state
 restoration, arena reset, dispatch and serial output. Individual invocation
 times have 10 ms quantization error, which can accumulate across repetitions;
 for tiny tests, the remainder is not a precise measurement of framework cost.
-The suite record sums these, and `suite_overhead_ms` covers work between tests
-and the runtime records themselves. Use total durations to find which tests
+`SUMMARY` sums these, and `suite_overhead_ms` covers work between tests. Use total durations to find which tests
 dominate a full run before trimming anything. Guest time is not host cost;
 host CPU per workload comes from the 86Box runner. `perf_report.py` validates
 and prints the breakdown, including skips and failed tests. These records
@@ -36,6 +34,47 @@ COM1 log without QEMU or a host profiler. The report lists the ten longest
 test records and retains every runtime record in JSON. Older logs remain
 supported, with the breakdown marked
 unavailable. The guest totals exclude firmware boot and guest initialization.
+
+Log format changes: older logs had a `BEGIN` line per record (now only
+`WORK phase=warmup`), separate `RUNTIME scope=test|suite` lines (now the
+`total_ms`/`overhead_ms` fields of `TEST` and the totals on `SUMMARY`),
+`timing_scope`, `ms_resolution` and `seed` on every `TEST` (now on `CFG`)
+and a `FILTER name=... reason=...` line per filtered record (now one
+`FILTER suite_selection=N build_selection=N runtime_selection=N` count line).
+The shared parser (`tools/qemu_smoke.py`) reads both formats and gives the
+same records: it copies the `CFG` constants back onto executed records, the
+seed onto failed ones, and rebuilds the runtime records. Quoted values
+(`first="..."`, `FAILDETAIL ... check="..."`) escape `"` and `\` with `\`.
+
+Attribution fields on `TEST`, counted over all invocations of the record
+(warm-up included): `exc` exceptions and `excv` per vector (`vector:count`),
+`irq0` timer interrupts, `irq` other serviced IRQs, `spur` spurious IRQs,
+`guard` guard recoveries (a fault or watchdog unwinding to its guard);
+zero counts other than `irq0` are left out. `harness_cyc` is the time spent
+restoring kernel state after each invocation, in `unit` counts (TSC cycles,
+or 1,193,182 Hz PIT clocks), and `harness_full` how many of those restores
+had to reload the descriptor tables, segments, TR/LDTR and paging (after a
+fault, a timeout, or a test that left system state changed); the others only
+verify that nothing changed. `fn` is the test function's address in the
+kernel map (`build/kernel.map`). `tags` names the subsystems a record
+exercises (or `-`):
+
+| Tag | Meaning |
+| --- | --- |
+| `smc` | self-modifying or freshly written code |
+| `paging` | paging enabled, page tables or TLB |
+| `segload` | protected-mode segment/descriptor loads |
+| `exc` | expected CPU exceptions |
+| `irq` | hardware interrupts |
+| `io` | port I/O to chipset or devices |
+| `x87` | x87 FPU |
+| `mmx` | MMX/3DNow!/vendor SIMD |
+| `modesw` | mode switches (real/V86/protected) |
+| `rep` | string instructions with REP |
+
+Tags come from a default per test table (`kmain()` in `src/core.c`), the
+record's own `T_TAG_*` flags (`src/kernel.h`) and its name (`smc`, `irq`,
+`rep`); they are a filtering aid, not a complete description.
 
 `PASS` means the workload's assertions passed, **not** exhaustive ISA compliance.
 `SKIP` gives the reason a feature or safe test precondition is unavailable.
@@ -66,16 +105,17 @@ appear only in `NOTE` lines. Results can still differ legitimately between
 FPU backends or CPU models (for example `fpu_trans` and `fpu_burn`), so
 compare `sum` only between runs on the same configuration.
 `op_unit` names the counted work where specified; older workloads retain the
-generic `operation` label. `timing_scope=checked_workload` explicitly includes
+generic `operation` label. `timing_scope=checked_workload` (on `CFG`) explicitly includes
 operand/reference preparation, assertions, and any in-function enable/restore
 sequence. These are not isolated opcode latency measurements. Reports preserve
 these fields and refuse to pool or compare incompatible work units/scopes.
 `ms`, `cyc`, and 64-bit `ops` aggregate measured invocations, excluding warm-up.
-`iterations` counts measured invocations; `iteration_ops` is their constant
+`iterations` counts measured invocations and `invocations` all of them,
+including the warm-up; `iteration_ops` is their constant
 operation count, or zero if it varied. `failed_iterations` includes warm-up.
 On failure, the final `TEST` record also retains the first failing invocation:
 `failure_iteration=0` is warm-up, `1` is the first measured invocation,
-and `failure_phase` names the phase. `seed` repeats the configured seed.
+and `failure_phase` names the phase. The configured seed is on `CFG`.
 For `CHECK_EQ`, `got` and `want` retain the first mismatching 32-bit values
 even if the failure first occurs during quiet sampling. Plain `CHECK` has
 no automatic operand values; its expression and line are retained.
@@ -88,8 +128,11 @@ Repeated checks and failure counts are unchanged.
 
 `ops_constant=1` means measured invocations had one identical nonzero operation
 count. It is not a claim that different workloads count equivalent operations.
-`ms_resolution=10`, `ms_unresolved=1`, and `counter_unresolved=1` explicitly
-describe coarse or zero timing. Absence of a resolved duration is not zero
+`ms_resolution=10` (on `CFG`), `ms_unresolved=1`, and `counter_unresolved=1` explicitly
+describe coarse or zero timing. `us` is the measured time from `cyc`
+(TSC rate calibrated against the PIT, or PIT clocks), not summed 10 ms
+ticks; it is `0` without a calibrated counter. `sample_window_ms`, which
+decides when sampling stops, uses the same counter. Absence of a resolved duration is not zero
 cost. Reports retain per-record `measurement_notes` for unavailable/invalid
 timing, missing or inconsistent operation counts, and non-PASS results;
 these notes describe data quality, not master-versus-branch policy.

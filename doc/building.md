@@ -170,7 +170,9 @@ normal Makefile setting; it is logged with the scale in
 `CFG` so a failing vector can be reproduced. `ROUNDS` accepts 1–32. Larger
 scales on a slow 486 may need a larger `WATCHDOG_SECONDS`; a watchdog abort is
 a `FAULT`, not a successful shortened benchmark. The watchdog applies to each
-invocation, not the whole sustained window. A timeout inside a nested probe
+invocation, not the whole sustained window: `WATCHDOG_SECONDS` for the first
+(warm-up) invocation, then the larger of 5 seconds and 50 times the warm-up
+time, capped at `WATCHDOG_SECONDS`. A timeout inside a nested probe
 first returns to that probe's caller so the test can clean up; the test is
 then given two more seconds before it is abandoned, and either way it is
 reported as `FAULT`. `TEST_SECONDS` accepts 1–3600. The host runner does

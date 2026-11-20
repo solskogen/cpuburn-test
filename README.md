@@ -34,7 +34,10 @@ workload is emulated (benchmarks). It needs no guest OS or hard disk.
 - **Benchmarks only:** `make SUITE=benchmark` builds just the sampled
   workloads, leaving out check-only correctness records.
 - **Correctness only:** `make BENCHMARKS=0` removes timed harness repetition,
-  not test cases or assertions. See [accuracy-only builds](doc/coverage.md#accuracy-only-builds).
+  not test cases or assertions; each record still runs twice (a warm-up and
+  one checked invocation). A host can also pick records at boot without
+  rebuilding ([run-time selection](doc/running.md#select-records-at-run-time)).
+  See [accuracy-only builds](doc/coverage.md#accuracy-only-builds).
 
 ## Usage
 
@@ -50,7 +53,7 @@ make SUITE=accuracy          # every record checked once (same as BENCHMARKS=0)
 probes and records that run at least twice real time on every emulated CPU
 tested; see the
 [workload catalogue](doc/workloads.md#inventory-and-reading-the-tables)) and
-logs them as `FILTER ... reason=suite_selection`. `CFG` records the suite.
+counts them in `FILTER suite_selection=N`. `CFG` records the suite.
 `BENCHMARKS=0` still works; combining it with a conflicting `SUITE` is an error.
 
 Settings are not sticky: each `make` builds the image for the variables on

@@ -11,13 +11,16 @@ int kmemcmp(const void *a, const void *b, u32 n) {
 }
 static u32 kstrlen(const char *s) { u32 n = 0; while (s[n]) n++; return n; }
 /* ============================ output ============================ */
-static int ser_ok, ser_fail;
+static int ser_ok, ser_fail, ser_fifo = 1, ser_room;
 enum { NOTE_CAPACITY = 32768 };
 static char *note_buf;
 static u32 note_len;
 static int note_capture, note_overflow;
 static u16 *vga = (u16 *)0xB8000;
-static int vga_x, vga_y;
+/* Colour text scrolls by moving the CRTC start address over a ring of
+ * vga_rows rows (16 KiB, valid on CGA too) instead of copying the screen for
+ * every line; MDA's 4 KiB only holds one screen and keeps copying. */
+static int vga_x, vga_y, vga_top, vga_rows = 25;
 
 void post(u8 code) { outb(0x80, code); }
 
@@ -34,24 +37,37 @@ static void ser_init(void) {
     outb(0x3F8 + 3, 0x03);
     outb(0x3F8 + 2, 0xC7);
     outb(0x3F8 + 4, 0x03);
+    if ((inb(0x3F8 + 2) & 0xC0) == 0xC0) ser_fifo = 16; /* 16550A FIFO enabled */
     ser_ok = 1;
 }
 
+/* THRE means the whole transmit FIFO is empty: refill all of it per poll. */
 static void ser_putc(char c) {
     if (!ser_ok) return;
-    int n = 20000;
-    while (!(inb(0x3F8 + 5) & 0x20)) {
-        if (--n == 0) { if (++ser_fail >= 3) ser_ok = 0; return; }
+    if (!ser_room) {
+        u32 n = 400000;
+        while (!(inb(0x3F8 + 5) & 0x20)) {
+            if (--n == 0) { if (++ser_fail >= 3) ser_ok = 0; return; }
+        }
+        ser_fail = 0;
+        ser_room = ser_fifo;
     }
-    ser_fail = 0;
+    ser_room--;
     outb(0x3F8, (u8)c);
+}
+
+static void vga_start(u32 row) {
+    u32 a = row * 80;
+    outb(0x3D4, 0x0C); outb(0x3D5, (u8)(a >> 8));
+    outb(0x3D4, 0x0D); outb(0x3D5, (u8)a);
 }
 
 static void vga_init(void) {
     u16 crtc = bda_read16(0x63);
     if (crtc == 0x3B4) vga = (u16 *)0xB0000;
-    else vga = (u16 *)0xB8000;
+    else { vga = (u16 *)0xB8000; vga_rows = 8192 / 80; }
     for (int i = 0; i < 80 * 25; i++) vga[i] = 0x0720;
+    if (vga_rows > 25) vga_start(0);
 }
 
 static void vga_putc(char c) {
@@ -60,10 +76,14 @@ static void vga_putc(char c) {
     else if (c == '\t') { vga_x = (vga_x + 8) & ~7; }
     else { vga[vga_y * 80 + vga_x] = 0x0700 | (u8)c; vga_x++; }
     if (vga_x >= 80) { vga_x = 0; vga_y++; }
-    if (vga_y >= 25) {
-        for (int i = 0; i < 80 * 24; i++) vga[i] = vga[i + 80];
-        for (int i = 80 * 24; i < 80 * 25; i++) vga[i] = 0x0720;
-        vga_y = 24;
+    if (vga_y >= vga_top + 25) {
+        if (vga_y >= vga_rows) {
+            for (int i = 0; i < 80 * 24; i++) vga[i] = vga[i + (vga_y - 24) * 80];
+            vga_y = 24;
+            vga_top = 0;
+        } else vga_top++;
+        for (int i = 0; i < 80; i++) vga[vga_y * 80 + i] = 0x0720;
+        if (vga_rows > 25) vga_start(vga_top);
     }
 }
 
@@ -79,6 +99,15 @@ void kputc(char c) {
     vga_putc(c);
 }
 void kputs(const char *s) { while (*s) kputc(*s++); }
+/* Quoted serial value: '"' and '\\' are backslash-escaped. */
+static void put_quoted(const char *s) {
+    kputc('"');
+    for (; s && *s; s++) {
+        if (*s == '"' || *s == '\\') kputc('\\');
+        kputc(*s);
+    }
+    kputc('"');
+}
 
 static void put_num(u64 v, u32 base, int width, int zero, int neg, int upper) {
     char buf[24];
@@ -128,7 +157,9 @@ u8 exc_stack[16384] __attribute__((aligned(16)));
 static u8 df_stack[4096] __attribute__((aligned(16)));
 isr_hook_t int_hook[256];
 exc_rec_t g_exc;
-extern u32 g_guard;
+static u32 exc_vec_count[256]; /* per-vector exceptions, reset for every record */
+extern u32 g_guard, g_guard_unwinds;
+extern void guard_unwind_to(void);
 extern void df_task_entry(void);
 extern void ring3_tramp(void);
 u32 g_r3_entry, g_r3_stack;
@@ -218,7 +249,7 @@ static void ltr_main(void) {
 /* ============================ PIC / PIT / time ============================ */
 volatile u32 pit_ticks;
 int stamp_is_tsc;
-static volatile u32 spurious; /* diagnostic counter, inspectable from a debugger */
+static volatile u32 spurious, irq_other; /* spurious IRQ7/15; serviced IRQs other than IRQ0 */
 static volatile u32 lease_active_id;
 static void poll_lease(u32 id);
 
@@ -299,13 +330,27 @@ u64 stamp(void) {
         __asm__ volatile("" ::: "memory");
         return v;
     }
-    u32 t1, t2, k1, k2, d, c;
+    /* With interrupts off, a period that has ended but whose IRQ0 is still
+     * pending is not in pit_clocks yet while the counter has reloaded: add
+     * it, as pit_set_multiplier() does. IRR is read on both sides of the
+     * latch so a reload between them is retried, not misattributed. An
+     * emulator may reload the counter before it raises IRQ0 in the PIC
+     * (QEMU does so between translation blocks); that window would read up
+     * to one period back, so the result never goes below the last one. */
+    static u64 last;
+    u32 f = rd_eflags(), c, irr;
+    cli();
     do {
-        t1 = pit_ticks; k1 = pit_clocks; d = pit_div;
+        outb(0x20, 0x0A); /* OCW3: read IRR */
+        irr = inb(0x20) & 1;
         c = pit_latch();
-        t2 = pit_ticks; k2 = pit_clocks;
-    } while (t1 != t2 || k1 != k2);
-    return (u64)t1 * 11932 + k1 + (d - c);
+    } while ((inb(0x20) & 1) != irr);
+    u64 v = (u64)pit_ticks * 11932 + pit_clocks + (pit_div - c);
+    if (irr && !pit_irq_credited) v += pit_div;
+    if (v < last) v = last;
+    last = v;
+    wr_eflags(f);
+    return v;
 }
 
 /* ============================ exceptions ============================ */
@@ -323,9 +368,37 @@ static void fatal(regs_t *r) {
     for (;;) { cli(); hlt(); }
 }
 
-void df_handler_c(void) {
-    kprintf("FATAL double fault (last exc vec=%u err=%08x eip=%08x cr2=%08x)\nDONE\n", g_exc.vec, g_exc.err, g_exc.eip, g_exc.cr2);
-    for (;;) { cli(); hlt(); }
+/* The running record's outermost guard frame and a copy of its contents,
+ * taken when the test started, so a double fault can still unwind it. */
+static u32 g_scope_frame, g_scope_save[7];
+
+/* Runs in the #DF task. Inside a record, rewrite the main TSS so the task
+ * switch back resumes in guard_unwind_to and the record's guard_call returns
+ * GUARD_EXC(8); restore_state then rebuilds the rest. */
+void df_handler_c(u32 err) {
+    struct { u16 lim; u32 base; } __attribute__((packed)) g = { sizeof gdt - 1, (u32)gdt };
+    __asm__ volatile("lgdt %0" ::"m"(g));
+    if (!g_scope_frame) {
+        kprintf("FATAL double fault (last exc vec=%u err=%08x eip=%08x cr2=%08x)\nDONE\n", g_exc.vec, g_exc.err, g_exc.eip, g_exc.cr2);
+        for (;;) { cli(); hlt(); }
+    }
+    g_exc.count++;
+    exc_vec_count[8]++;
+    g_exc.vec = 8; g_exc.err = err; g_exc.eip = tss_main.eip; g_exc.cs = tss_main.cs; g_exc.eflags = tss_main.eflags;
+    wr_cr0(rd_cr0() & ~0x80000000u);
+    __asm__ volatile("jmp 1f\n1:" ::: "memory");
+    if (cr4_ok) wr_cr4(g_cr4_base);
+    kmemcpy((void *)g_scope_frame, g_scope_save, sizeof g_scope_save);
+    tss_main.eip = (u32)guard_unwind_to;
+    tss_main.eflags = 2;
+    tss_main.eax = GUARD_EXC(8);
+    tss_main.edx = tss_main.esp = g_scope_frame;
+    tss_main.cs = SEL_KCODE;
+    tss_main.ss = tss_main.ds = tss_main.es = tss_main.fs = tss_main.gs = SEL_KDATA;
+    tss_main.ldt = 0;
+    tss_main.cr3 = pg_dir ? (u32)pg_dir : rd_cr3();
+    gdt[5] &= ~(1ull << 41); /* the far jump needs a non-busy target */
+    gdt[6] &= ~(1ull << 41);
 }
 
 static void irq_dispatch(regs_t *r) {
@@ -335,6 +408,7 @@ static void irq_dispatch(regs_t *r) {
         outb(p, 0x0B);
         if (!(inb(p) & 0x80)) { spurious++; if (irq == 15) outb(0x20, 0x20); return; }
     }
+    if (irq) irq_other++;
     if (irq == 0) {
         u32 before = pit_ticks;
         pit_fast_ticks++;
@@ -362,6 +436,7 @@ void c_isr(regs_t *r) {
     u32 v = r->vec;
     if (v >= 0x20 && v < 0x30) { irq_dispatch(r); return; }
     g_exc.count++;
+    exc_vec_count[v]++;
     g_exc.vec = v; g_exc.err = r->err; g_exc.eip = r->eip; g_exc.cs = r->cs; g_exc.eflags = r->eflags;
     g_exc.cr2 = v == 14 ? rd_cr2() : g_exc.cr2;
     if (int_hook[v]) { int_hook[v](r); return; }
@@ -464,6 +539,15 @@ static void mem_init(void) {
 
 static void arena_reset(void) { arena_ptr = arena_base + 0x10000; }
 
+/* Kernel page-directory checksum, ignoring the accessed/dirty bits the CPU
+ * sets: restore_state and paging_enable rebuild on a mismatch. */
+static u32 pg_sum;
+static u32 pg_checksum(void) {
+    u32 v = 0;
+    for (int i = 0; i < 1024; i++) v = (v << 3 | v >> 29) + (pg_dir[i] & ~0x60u);
+    return v;
+}
+
 static void build_pagetables(void) {
     if (pg_built || !arena_size) return;
     pg_dir = (u32 *)arena_base;
@@ -481,10 +565,12 @@ static void build_pagetables(void) {
     }
     tss_df.cr3 = (u32)pg_dir;
     pg_built = 1;
+    pg_sum = pg_checksum();
 }
 
 void paging_enable(void) {
     if (paging_on) return;
+    if (pg_built && pg_checksum() != pg_sum) pg_built = 0;
     build_pagetables();
     if (!pg_built) return;
     wr_cr3((u32)pg_dir);
@@ -698,7 +784,11 @@ static int test_quiet;
 
 void t_fail(const char *what, int line) {
     if (!g_nfail) { g_fail_what = what; g_fail_line = line; g_fail_has_values = 0; }
-    if (g_nfail < 8 && !test_quiet) kprintf("FAILDETAIL test=%s line=%d check=%s\n", g_cur->name, line, what);
+    if (g_nfail < 8 && !test_quiet) {
+        kprintf("FAILDETAIL test=%s line=%d check=", g_cur->name, line);
+        put_quoted(what);
+        kputc('\n');
+    }
     if (g_nfail != ~0u) g_nfail++;
 }
 void t_failv(const char *what, int line, u32 got, u32 want) {
@@ -706,7 +796,11 @@ void t_failv(const char *what, int line, u32 got, u32 want) {
         g_fail_what = what; g_fail_line = line;
         g_fail_got = got; g_fail_want = want; g_fail_has_values = 1;
     }
-    if (g_nfail < 8 && !test_quiet) kprintf("FAILDETAIL test=%s line=%d check=%s got=%08x want=%08x\n", g_cur->name, line, what, got, want);
+    if (g_nfail < 8 && !test_quiet) {
+        kprintf("FAILDETAIL test=%s line=%d check=", g_cur->name, line);
+        put_quoted(what);
+        kprintf(" got=%08x want=%08x\n", got, want);
+    }
     if (g_nfail != ~0u) g_nfail++;
 }
 void t_skip(const char *reason) { g_skip_reason = reason; }
@@ -724,7 +818,11 @@ void t_note(const char *fmt, ...) {
     note_capture = 0;
 }
 
-static void test_tramp(void) { g_sum = g_cur->fn(); }
+static void test_tramp(void) {
+    g_scope_frame = g_guard;
+    kmemcpy(g_scope_save, (void *)g_guard, sizeof g_scope_save);
+    g_sum = g_cur->fn();
+}
 
 static const char *missing_req(u32 req) {
     static const struct { u32 bit; const char *name; } m[] = {
@@ -782,48 +880,99 @@ static const char *missing_req(u32 req) {
     return NULL;
 }
 
-static void restore_state(void) {
-    /* An IRQ return reloads segment selectors, so retire scratch selectors
-     * before invalidating their descriptors, with interrupts masked. A test
-     * that faulted or timed out may also have left its own GDTR/IDTR, LDTR or
-     * TR loaded, so reload the kernel's tables and selectors first. */
+/* Kernel system state as the last full restore left it: when an invocation
+ * returns normally and leaves all of it in place, restore_state() skips the
+ * descriptor-table, task-register and paging reloads (which empty the TLB and
+ * end the emulator's translated block) and only repairs the IDT and hooks in
+ * memory. */
+static struct sysregs { u32 cr0, cr3, cr4; u16 gdtr[3], idtr[3], tr, ldtr; } sys_base;
+static u64 gdt_base[GDT_ENTRIES], idt_base[256];
+static u32 restore_full;
+static u64 harness_cyc;
+
+static void sysregs_read(struct sysregs *r) {
+    r->cr0 = rd_cr0(); r->cr3 = rd_cr3(); r->cr4 = cr4_ok ? rd_cr4() : 0;
+    __asm__ volatile("sgdt %0; sidt %1; str %2; sldt %3"
+                     : "=m"(r->gdtr), "=m"(r->idtr), "=m"(r->tr), "=m"(r->ldtr));
+}
+static int dwords_differ(const void *a, const void *b, u32 n) {
+    u8 r;
+    __asm__ volatile("cld; repe cmpsl; setne %0" : "=q"(r), "+S"(a), "+D"(b), "+c"(n) :: "memory", "cc");
+    return r;
+}
+static int segs_flat(void) {
+    u32 cs, ds, es, fs, gs, ss;
+    __asm__ volatile("mov %%cs,%0; mov %%ds,%1; mov %%es,%2; mov %%fs,%3; mov %%gs,%4; mov %%ss,%5"
+                     : "=r"(cs), "=r"(ds), "=r"(es), "=r"(fs), "=r"(gs), "=r"(ss));
+    return (cs & 0xFFFF) == SEL_KCODE && (ds & 0xFFFF) == SEL_KDATA && (es & 0xFFFF) == SEL_KDATA &&
+           (fs & 0xFFFF) == SEL_KDATA && (gs & 0xFFFF) == SEL_KDATA && (ss & 0xFFFF) == SEL_KDATA;
+}
+static void dr7_clear_fn(void) { __asm__ volatile("mov %0,%%dr7" ::"r"(0) : "memory"); }
+static void apic_timer_mask_fn(void) { /* paging is off: the APIC base is physical */
+    u64 b = rdmsr(0x1B);
+    if (!(b & 0x800) || (b >> 32)) return;
+    volatile u32 *apic = (volatile u32 *)((u32)b & 0xFFFFF000u);
+    apic[0x320 / 4] |= 0x10000;
+    apic[0x380 / 4] = 0;
+}
+
+static void restore_state(u32 rc) {
+    u64 t0 = stamp();
+    struct sysregs now;
     cli();
-    load_tables();
-    for (int i = 0; i < 256; i++) int_hook[i] = 0;
     exc_expect_clear();
     g_wd_deadline = 0;
     g_r3_eflags = 0x2;
     if (pit_div != 11932) pit_set_multiplier(1);
-    idt_init();
-    for (int i = GDT_SCRATCH_FIRST; i < GDT_ENTRIES; i++) gdt[i] = 0;
-    __asm__ volatile("lldt %w0" ::"r"(0) : "memory");
-    gdt[6] &= ~(1ull << 41); /* task B may have been left busy */
-    ltr_main();
-    /* Leave paging before changing CR4 (PAE/PSE) or CR3, so no fetch walks a
-     * half-restored paging mode; then reapply the baseline CR0 (with PG if the
-     * kernel's paging is on). */
-    wr_cr0(rd_cr0() & ~0x80000000u);
-    __asm__ volatile("jmp 1f\n1:" ::: "memory");
-    if (cr4_ok) wr_cr4(g_cr4_base);
-    if (paging_on && pg_dir) wr_cr3((u32)pg_dir);
-    wr_cr0(g_cr0_base);
-    __asm__ volatile("jmp 1f\n1:" ::: "memory");
+    sysregs_read(&now);
+    if (!rc && !kmemcmp(&now, &sys_base, sizeof now) && segs_flat() &&
+        !dwords_differ(gdt, gdt_base, sizeof gdt / 4) &&
+        (!paging_on || pg_checksum() == pg_sum)) {
+        for (int i = 0; i < 256; i++) int_hook[i] = 0;
+        if (dwords_differ(idt, idt_base, sizeof idt / 4)) kmemcpy(idt, idt_base, sizeof idt);
+    } else {
+        /* An IRQ return reloads segment selectors, so retire scratch selectors
+         * before invalidating their descriptors, with interrupts masked. A test
+         * that faulted or timed out may also have left its own GDTR/IDTR, LDTR
+         * or TR loaded, so reload the kernel's tables and selectors first. */
+        load_tables();
+        for (int i = 0; i < 256; i++) int_hook[i] = 0;
+        idt_init();
+        for (int i = GDT_SCRATCH_FIRST; i < GDT_ENTRIES; i++) gdt[i] = 0;
+        __asm__ volatile("lldt %w0" ::"r"(0) : "memory");
+        gdt[6] &= ~(1ull << 41); /* task B may have been left busy */
+        ltr_main();
+        /* Leave paging before changing CR4 (PAE/PSE) or CR3, so no fetch walks a
+         * half-restored paging mode; then reapply the baseline CR0 (with PG if the
+         * kernel's paging is on). */
+        wr_cr0(rd_cr0() & ~0x80000000u);
+        __asm__ volatile("jmp 1f\n1:" ::: "memory");
+        if (rc || (paging_on && pg_checksum() != pg_sum)) {
+            /* An aborted test cannot have undone its changes: rebuild the
+             * kernel page tables, disarm breakpoints, mask the PIC back to
+             * IRQ0 only and stop a local APIC timer. */
+            if (guard_call(dr7_clear_fn)) guard_call(dr7_clear_fn); /* DR7.GD: #DB clears it */
+            outb(0x21, 0xFE);
+            outb(0xA1, 0xFF);
+            if (cpu.has_apic && cpu.has_msr) guard_call(apic_timer_mask_fn);
+            if (pg_built) { pg_built = 0; if (paging_on) build_pagetables(); }
+        }
+        if (cr4_ok) wr_cr4(g_cr4_base);
+        if (paging_on && pg_dir) wr_cr3((u32)pg_dir);
+        wr_cr0(g_cr0_base);
+        __asm__ volatile("jmp 1f\n1:" ::: "memory");
+        sysregs_read(&sys_base);
+        kmemcpy(gdt_base, gdt, sizeof gdt);
+        kmemcpy(idt_base, idt, sizeof idt);
+        restore_full++;
+    }
     if (cpu.has_fpu) __asm__ volatile("fninit");
     sti();
+    harness_cyc += stamp() - t0;
 }
 
 static u32 test_index;
 static u64 runtime_warmup_ms, runtime_sample_ms, runtime_overhead_ms;
-
-static void report_runtime(const char *name, u32 start, u32 warmup, u32 sample) {
-    u32 total = ms_now() - start;
-    u32 overhead = total - warmup - sample;
-    runtime_warmup_ms += warmup;
-    runtime_sample_ms += sample;
-    runtime_overhead_ms += overhead;
-    kprintf("RUNTIME scope=test r=%u id=%u name=%s total_ms=%u warmup_ms=%u sample_ms=%u overhead_ms=%u resolution_ms=10\n",
-            g_round, test_index, name, total, warmup, sample, overhead);
-}
 
 /* Host input extends the same checked run; an absent/dead controller never
  * leaves the floppy waiting forever. Frames are keyed to a unique workload. */
@@ -868,35 +1017,152 @@ static void poll_lease(u32 id) {
  * store the last test name as the tail of this string, and the Makefile's
  * ONLY check, which looks for each name as a whole string, would miss it. */
 static const char only_tests[] = ONLY;
-static int selected(const char *name) {
-    const char *p = only_tests;
-    if (!*p) return 1;
-    while (*p) {
-        const char *n = name;
+/* Offset of the item of comma list p equal to name, or -1. */
+static int list_find(const char *p, const char *name) {
+    for (const char *start = p; *p;) {
+        const char *item = p, *n = name;
         while (*n && *n == *p) { n++; p++; }
-        if (!*n && (!*p || *p == ',')) return 1;
+        if (!*n && (!*p || *p == ',')) return (int)(item - start);
         while (*p && *p != ',') p++;
         if (*p) p++;
     }
+    return -1;
+}
+static int selected(const char *name) { return !*only_tests || list_find(only_tests, name) >= 0; }
+
+/* Runtime selection (protocol sel1): "@sel1 <only> <skip> <from>", each a
+ * comma list of record names or "-". Names are checked against the suite by
+ * a dry pass over kmain's tables before the first round. */
+static char sel_buf[4097];
+static u8 sel_seen[4097];
+static const char *sel_only, *sel_skip, *sel_from;
+static int sel_dry;
+static u32 filt_suite, filt_build, filt_runtime;
+
+static void sel_fatal(const char *why) {
+    kprintf("FATAL %s selection control frame\nDONE\n", why);
+    for (;;) { cli(); hlt(); }
+}
+static u32 sel_count(const char *p) {
+    u32 n = p ? 1 : 0;
+    for (; p && *p; p++) n += *p == ',';
+    return n;
+}
+static void sel_control(void) {
+    u32 length = 0, deadline = ms_now() + 500;
+    int overflow = 0;
+    kputs("CONTROL protocol=sel1 ready=1\n");
+    while ((s32)(ms_now() - deadline) < 0) {
+        if (!(inb(0x3FD) & 1)) continue;
+        char c = inb(0x3F8);
+        if (c == '\r') continue;
+        if (c != '\n') {
+            if (length < sizeof sel_buf - 1) sel_buf[length++] = c;
+            else overflow = 1;
+            continue;
+        }
+        sel_buf[length] = 0;
+        if (overflow || length < 6 || kmemcmp(sel_buf, "@sel1 ", 6)) sel_fatal("invalid");
+        const char *field[3];
+        char *p = sel_buf + 6;
+        for (int i = 0; i < 3; i++) {
+            char *start = p;
+            int item = 0;
+            for (; *p && *p != ' '; p++) {
+                char x = *p;
+                if (x == ',' && item) item = 0;
+                else if ((x >= 'a' && x <= 'z') || (x >= 'A' && x <= 'Z') || (x >= '0' && x <= '9') || x == '_') item++;
+                else if (x != '-' || p != start || (p[1] && p[1] != ' ')) sel_fatal("invalid");
+                else item = -1; /* "-": empty list */
+            }
+            if (!item || *p != (i < 2 ? ' ' : 0)) sel_fatal("invalid");
+            if (*p) *p++ = 0;
+            field[i] = item < 0 ? NULL : start;
+        }
+        if (sel_count(field[2]) > 1) sel_fatal("invalid");
+        sel_only = field[0]; sel_skip = field[1]; sel_from = field[2];
+        sel_dry = 1; /* accepted once kmain's dry pass has checked the names */
+        return;
+    }
+    if (length || overflow) sel_fatal("incomplete");
+}
+static void sel_mark(const char *name) {
+    const char *lists[3] = { sel_only, sel_skip, sel_from };
+    for (int i = 0; i < 3; i++) {
+        int at = lists[i] ? list_find(lists[i], name) : -1;
+        if (at >= 0) sel_seen[lists[i] - sel_buf + at] = 1;
+    }
+}
+static void sel_check_names(void) {
+    const char *lists[3] = { sel_only, sel_skip, sel_from };
+    for (int i = 0; i < 3; i++) {
+        for (const char *p = lists[i]; p && *p; p++) {
+            if (!sel_seen[p - sel_buf]) sel_fatal("unknown record name in");
+            while (*p && *p != ',') p++;
+            if (!*p) break;
+        }
+    }
+    kprintf("CONTROL protocol=sel1 accepted=1 only=%u skip=%u from=%s\n",
+            sel_count(sel_only), sel_count(sel_skip), sel_from ? sel_from : "-");
+    sel_dry = 0;
+}
+/* from: skip records until that name; only/from do not apply to the CPU
+ * contract record, which build ONLY also keeps; an explicit skip does. */
+static int sel_filtered(const char *name, int exempt) {
+    int before_from = 0;
+    if (sel_from) {
+        if (list_find(sel_from, name) == 0) sel_from = NULL;
+        else before_from = 1;
+    }
+    if (sel_skip && list_find(sel_skip, name) >= 0) return 1;
+    return !exempt && (before_from || (sel_only && list_find(sel_only, name) < 0));
+}
+
+static const char *const tag_names[] = { "smc", "paging", "segload", "exc", "irq", "io", "x87", "mmx", "modesw", "rep" };
+static int name_has(const char *name, const char *word) {
+    for (; *name; name++) {
+        const char *a = name, *b = word;
+        while (*b && *a == *b) { a++; b++; }
+        if (!*b) return 1;
+    }
     return 0;
+}
+static void put_tags(u32 tags) {
+    const char *sep = " tags=";
+    for (u32 i = 0; i < sizeof tag_names / sizeof tag_names[0]; i++)
+        if (tags & (T_TAG_SMC << i)) { kputs(sep); kputs(tag_names[i]); sep = ","; }
+    if (*sep == ' ') kputs(" tags=-");
+}
+static u64 cyc_us(u64 cycles) { /* 0 if the counter rate is unknown */
+    if (!stamp_is_tsc) return cycles * 1000000 / 1193182;
+    return cpu.tsc_per_ms ? cycles * 1000 / cpu.tsc_per_ms : 0;
 }
 
 /* check_only (whole table, or T_CHECK per test): correctness records, never
- * benchmark-sampled and left out of SUITE=benchmark builds. */
-static void run_table(const test_t *t, int table_check_only) {
+ * benchmark-sampled and left out of SUITE=benchmark builds. table_tags is
+ * kmain's default T_TAG_* mask for the table; record flags add to it. */
+static void run_table(const test_t *t, int table_check_only, u32 table_tags) {
+    if (sel_dry) { for (; t->name; t++) sel_mark(t->name); return; }
     for (; t->name; t++) {
         int check_only = table_check_only || (t->flags & T_CHECK);
         ++test_index;
-        int suite_skip = SUITE_BENCHMARK && check_only;
-        if ((suite_skip || !selected(t->name)) && t != tests_cpu_contract) {
-            kprintf("FILTER name=%s id=%u req=%08x reason=%s\n",
-                    t->name, test_index, t->req,
-                    suite_skip ? "suite_selection" : "build_selection");
+        int exempt = t == tests_cpu_contract;
+        int runtime_skip = sel_filtered(t->name, exempt);
+        int suite_skip = SUITE_BENCHMARK && check_only && !exempt;
+        int build_skip = !exempt && !selected(t->name);
+        if (suite_skip || build_skip || runtime_skip) {
+            if (suite_skip) filt_suite++;
+            else if (build_skip) filt_build++;
+            else filt_runtime++;
             cpu_feature_result(t, "FILTERED");
             continue;
         }
         u32 runtime_start = ms_now();
         int accuracy_test = cpu_accuracy_mode() || t == tests_cpu_contract || check_only;
+        u32 tags = (table_tags | t->flags) & (T_TAG_REP * 2 - T_TAG_SMC);
+        if (name_has(t->name, "smc")) tags |= T_TAG_SMC;
+        if (name_has(t->name, "irq")) tags |= T_TAG_IRQ;
+        if (name_has(t->name, "rep_") || name_has(t->name, "_rep")) tags |= T_TAG_REP;
         g_cur = t;
         tot_tests++;
         post((u8)test_index);
@@ -906,10 +1172,10 @@ static void run_table(const test_t *t, int table_check_only) {
         g_work_unit = "operation";
         const char *miss = missing_req(t->req);
         const char *status;
-        u64 c0 = 0, c1 = 0, cycles = 0, operations = 0;
+        u64 c0 = 0, c1 = 0, cycles = 0, operations = 0, sample_c0 = 0, window_us = 0;
         u32 m0 = ms_now(), m1;
         u32 rc = 0;
-        u32 iterations = 0, sample_ms = 0, sum = 0, total_failures = 0;
+        u32 iterations = 0, invocations = 0, sample_ms = 0, sum = 0, total_failures = 0;
         u32 sample_start = 0, sample_window_ms = 0;
         u32 failed_iterations = 0, warmup_ms = 0, warmup_failed = 0;
         u64 iteration_ops = 0;
@@ -923,14 +1189,20 @@ static void run_table(const test_t *t, int table_check_only) {
             status = "SKIP";
             g_skip_reason = miss;
             tot_skip++;
-            kprintf("TEST r=%u name=%s status=SKIP reason=missing_%s id=%u req=%08x mode=%s\n",
+            u32 total = ms_now() - runtime_start;
+            runtime_overhead_ms += total;
+            kprintf("TEST r=%u name=%s status=SKIP reason=missing_%s id=%u req=%08x mode=%s total_ms=%u overhead_ms=%u",
                     g_round, t->name, miss, test_index, t->req,
-                    accuracy_test ? "accuracy" : "benchmark");
-            report_runtime(t->name, runtime_start, 0, 0);
+                    accuracy_test ? "accuracy" : "benchmark", total, total);
+            put_tags(tags);
+            kprintf(" fn=%08x\n", (u32)t->fn);
             cpu_feature_result(t, status);
             continue;
         }
-        kprintf("BEGIN r=%u name=%s phase=%s\n", g_round, t->name, g_round == 1 ? "first" : "repeat");
+        u32 exc0 = g_exc.count, irq0_0 = pit_fast_ticks, irq_0 = irq_other, spur0 = spurious;
+        u32 guard0 = g_guard_unwinds, full0 = restore_full;
+        kmemset(exc_vec_count, 0, sizeof exc_vec_count);
+        harness_cyc = 0;
         kprintf("WORK phase=warmup r=%u id=%u name=%s\n", g_round, test_index, t->name);
         lease_deadline = 0; lease_length = 0;
         for (;;) {
@@ -940,18 +1212,23 @@ static void run_table(const test_t *t, int table_check_only) {
             sti();
             g_wd_parent = g_guard;
             g_wd_fired = 0;
-            wd_arm(WATCHDOG_SECONDS * 100);
+            /* A sample has the warm-up's measure: 50 times that, at least 5 s. */
+            u32 wd_ticks = WATCHDOG_SECONDS * 100, wd_sample = warmup_ms * 5 > 500 ? warmup_ms * 5 : 500;
+            if (iterations && wd_sample < wd_ticks) wd_ticks = wd_sample;
+            wd_arm(wd_ticks);
             m0 = ms_now();
             c0 = stamp();
             rc = (u32)guard_call(test_tramp);
             c1 = stamp();
             m1 = ms_now();
+            g_scope_frame = 0;
             g_wd_deadline = 0;
+            invocations++;
             /* A timeout the test absorbed in a nested guard still faults it. */
             if (g_wd_fired) rc = GUARD_WATCHDOG;
             e_vec = g_exc.vec; e_err = g_exc.err; e_eip = g_exc.eip; e_cr2 = g_exc.cr2;
             note_capture = 0;
-            restore_state();
+            restore_state(rc);
             if (g_nfail) {
                 failed_iterations++;
                 if (!first_failure) {
@@ -975,6 +1252,7 @@ static void run_table(const test_t *t, int table_check_only) {
                 test_quiet = 1;
                 continue;
             }
+            if (iterations == 1) sample_c0 = c0;
             iterations++;
             sample_ms += m1 - m0;
             if (iterations == 2) iteration_ops = g_ops;
@@ -983,7 +1261,9 @@ static void run_table(const test_t *t, int table_check_only) {
             sum = csum_mix(sum, g_sum);
             if (c1 < c0) timing_invalid = 1;
             else cycles += c1 - c0;
-            sample_window_ms = ms_now() - sample_start;
+            /* The sample window runs on the cycle counter, not 10 ms ticks. */
+            window_us = c1 >= sample_c0 ? cyc_us(c1 - sample_c0) : 0;
+            sample_window_ms = window_us ? (u32)(window_us / 1000) : ms_now() - sample_start;
             if (rc || g_skip_reason) break;
 #if BENCHMARKS
             if (!accuracy_test && (sample_window_ms < TEST_SECONDS * 1000u ||
@@ -1002,33 +1282,51 @@ static void run_table(const test_t *t, int table_check_only) {
         else if (g_skip_reason) { status = "SKIP"; tot_skip++; }
         else { status = "PASS"; tot_pass++; }
         cpu_feature_result(t, status);
-        kprintf("TEST r=%u name=%s status=%s ms=%u cyc=%llu unit=%s ops=%llu sum=%08x",
-                g_round, t->name, status, sample_ms, cycles,
+        kprintf("TEST r=%u name=%s status=%s ms=%u us=%llu cyc=%llu unit=%s ops=%llu sum=%08x",
+                g_round, t->name, status, sample_ms, cyc_us(cycles), cycles,
                 stamp_is_tsc ? "tsc" : "pit", operations, sum);
-        kprintf(" iterations=%u warmup_ms=%u warmup_failed=%u failed_iterations=%u id=%u",
-                iterations ? iterations - 1 : 0, warmup_ms, warmup_failed, failed_iterations, test_index);
+        kprintf(" iterations=%u invocations=%u warmup_ms=%u warmup_failed=%u failed_iterations=%u id=%u",
+                iterations ? iterations - 1 : 0, invocations, warmup_ms, warmup_failed, failed_iterations, test_index);
         kprintf(" iteration_ops=%llu sample_window_ms=%u req=%08x mode=%s",
                 variable_ops ? 0 : iteration_ops, sample_window_ms, t->req,
                 accuracy_test ? "accuracy" : "benchmark");
-        kprintf(" op_unit=%s timing_scope=checked_workload", g_work_unit);
+        kprintf(" op_unit=%s", g_work_unit);
         if (rc) kprintf(" rc=%03x exc_vec=%u exc_err=%08x exc_eip=%08x cr2=%08x", rc, e_vec, e_err, e_eip, e_cr2);
         if (timing_invalid) kputs(" timing_invalid=counter_regressed");
-        kprintf(" ops_constant=%u ms_resolution=10", !variable_ops && iteration_ops != 0);
+        kprintf(" ops_constant=%u", !variable_ops && iteration_ops != 0);
         if (!sample_ms) kputs(" ms_unresolved=1");
         if (!cycles) kputs(" counter_unresolved=1");
         if (g_skip_reason) kprintf(" reason=%s", g_skip_reason);
         if (total_failures) {
-            kprintf(" nfail=%u first=\"%s\" line=%d failure_iteration=%u failure_phase=%s seed=%08x",
-                    total_failures, first_failure, first_line, first_iteration,
-                    first_iteration ? "sample" : "warmup", (u32)TEST_SEED);
+            kprintf(" nfail=%u first=", total_failures);
+            put_quoted(first_failure);
+            kprintf(" line=%d failure_iteration=%u failure_phase=%s",
+                    first_line, first_iteration, first_iteration ? "sample" : "warmup");
             if (first_has_values) kprintf(" got=%08x want=%08x", first_got, first_want);
         }
-        kputc('\n');
-        report_runtime(t->name, runtime_start, warmup_ms, sample_ms);
+        u32 total = ms_now() - runtime_start, overhead = total - warmup_ms - sample_ms;
+        runtime_warmup_ms += warmup_ms;
+        runtime_sample_ms += sample_ms;
+        runtime_overhead_ms += overhead;
+        kprintf(" total_ms=%u overhead_ms=%u harness_cyc=%llu harness_full=%u",
+                total, overhead, harness_cyc, restore_full - full0);
+        /* Attribution over all invocations; zero counts are left out. */
+        if (g_exc.count != exc0) {
+            kprintf(" exc=%u", g_exc.count - exc0);
+            const char *sep = " excv=";
+            for (u32 v = 0; v < 256; v++)
+                if (exc_vec_count[v]) { kprintf("%s%u:%u", sep, v, exc_vec_count[v]); sep = ","; }
+        }
+        kprintf(" irq0=%u", pit_fast_ticks - irq0_0);
+        if (irq_other != irq_0) kprintf(" irq=%u", irq_other - irq_0);
+        if (spurious != spur0) kprintf(" spur=%u", spurious - spur0);
+        if (g_guard_unwinds != guard0) kprintf(" guard=%u", g_guard_unwinds - guard0);
+        put_tags(tags);
+        kprintf(" fn=%08x\n", (u32)t->fn);
     }
 }
-static void run_tests(const test_t *t) { run_table(t, 0); }
-static void run_checks(const test_t *t) { run_table(t, 1); }
+static void run_tests(const test_t *t, u32 tags) { run_table(t, 0, tags); }
+static void run_checks(const test_t *t, u32 tags) { run_table(t, 1, tags); }
 
 static void core_ud_probe(void) { __asm__ volatile("ud2"); }
 static void core_watchdog_probe(void) { for (;;) { sti(); hlt(); } }
@@ -1063,10 +1361,32 @@ static u32 core_recovery_test(void) {
     return 4;
 }
 
+#ifdef CORE_DF_SELFTEST
+/* Scratch builds only (make CFLAGS_core=-DCORE_DF_SELFTEST, fresh BUILD): #GP through a
+ * not-present gate raises #NP during delivery, a double fault. Each record
+ * must end FAULT rc=108 and the suite must continue. */
+static u32 core_df_selftest(void) {
+    idt_set_gate(13, isr_stub[13], SEL_KCODE, 0x0E);
+    __asm__ volatile("mov %0,%%ds" ::"r"(0xFFF8) : "memory");
+    return 0;
+}
+#endif
+
 static const test_t tests_core[] = {
+#ifdef CORE_DF_SELFTEST
+    { "core_df_selftest_first", core_df_selftest, 0, T_CHECK },
+    { "core_df_selftest_again", core_df_selftest, 0, T_CHECK },
+#endif
     { "core_fault_watchdog_recovery", core_recovery_test, 0, T_CHECK },
     { NULL, NULL, 0 }
 };
+
+#ifdef CORE_DF_SELFTEST
+static const test_t tests_df_paged[] = { /* run with the kernel's paging on */
+    { "core_df_selftest_paged", core_df_selftest, 0, T_CHECK },
+    { NULL, NULL, 0 }
+};
+#endif
 
 /* ============================ main ============================ */
 void kmain(void) {
@@ -1088,6 +1408,7 @@ void kmain(void) {
         for (;;) { cli(); hlt(); }
     }
     cpu_control(ser_ok);
+    if (ser_ok) sel_control();
     cpu_detect();
     cpu_contract_init();
     cpu_probe_features();
@@ -1105,7 +1426,8 @@ void kmain(void) {
             cpu.ext_edx, cpu.has_3dnow, cpu.has_3dnowext, cpu.has_emmi);
     kprintf("MEM ram_top=%08x arena_base=%08x arena_size=%08x kernel_start=%08x kernel_end=%08x\n",
             ram_top, arena_base, arena_size, (u32)_kernel_start, (u32)_end);
-    kprintf("CFG rounds=%u burn_seconds=%u watchdog_seconds=%u heavy_scale=%u seed=%08x test_seconds=%u protocol=work1 benchmarks=%u suite=%s\n",
+    kprintf("CFG rounds=%u burn_seconds=%u watchdog_seconds=%u heavy_scale=%u seed=%08x test_seconds=%u protocol=work1 benchmarks=%u suite=%s"
+            " timing_scope=checked_workload ms_resolution=10\n",
             ROUNDS, BURN_SECONDS, WATCHDOG_SECONDS, HEAVY_SCALE, (u32)TEST_SEED, TEST_SECONDS, BENCHMARKS,
             SUITE_BENCHMARK ? "benchmark" : BENCHMARKS ? "full" : "accuracy");
     if (*only_tests) kprintf("CFG only=%s\n", only_tests);
@@ -1113,41 +1435,48 @@ void kmain(void) {
     if (cpu.is386) kprintf("WARN 386 detected: unsupported, results may be unreliable\n");
 
     u32 start_ms = ms_now();
-    for (g_round = 1; g_round <= ROUNDS; g_round++) {
+    /* With a sel1 selection, a first dry pass (as the last round, so burn
+     * is included) only checks its names against the suite. */
+    for (g_round = sel_dry ? ROUNDS : 1; g_round <= ROUNDS; g_round++) {
         paging_disable();
-        run_tests(tests_cpu_contract);
-        run_tests(tests_core);
-        run_tests(tests_int);
-        run_checks(tests_int_check);
-        run_tests(tests_corpus);
-        run_tests(tests_realworld);
-        run_tests(tests_fpu);
-        run_tests(tests_fp_edges);
-        run_checks(tests_fp_edges_check);
-        run_tests(tests_mmx);
-        run_tests(tests_vendor);
-        run_tests(tests_cyrix);
-        run_tests(tests_pmode);
-        run_tests(tests_heavy_pmode);
+        run_tests(tests_cpu_contract, 0);
+        run_tests(tests_core, T_TAG_EXC);
+        run_tests(tests_int, 0);
+        run_checks(tests_int_check, 0);
+        run_tests(tests_corpus, 0);
+        run_tests(tests_realworld, T_TAG_SMC);
+        run_tests(tests_fpu, T_TAG_X87);
+        run_tests(tests_fp_edges, T_TAG_X87);
+        run_checks(tests_fp_edges_check, T_TAG_X87);
+        run_tests(tests_mmx, T_TAG_MMX);
+        run_tests(tests_vendor, T_TAG_MMX);
+        run_tests(tests_cyrix, T_TAG_IO);
+        run_tests(tests_pmode, T_TAG_SEGLOAD | T_TAG_EXC);
+        run_tests(tests_heavy_pmode, T_TAG_SEGLOAD | T_TAG_MODESW);
         /* Platform checks: mostly waiting on PIT/RTC edges, so never benchmarked. */
-        run_checks(tests_chipset);
+        run_checks(tests_chipset, T_TAG_IO);
         paging_enable();
-        run_tests(tests_paging);
-        run_tests(tests_priority);
-        run_tests(tests_restart_complex);
-        run_tests(tests_heavy_paging);
-        run_tests(tests_mem);
-        run_tests(tests_sweeps);
-        run_tests(tests_sys);
-        run_tests(tests_heavy_state);
-        if (g_round == ROUNDS) run_tests(tests_burn);
+#ifdef CORE_DF_SELFTEST
+        run_tests(tests_df_paged, T_TAG_PAGING | T_TAG_EXC);
+#endif
+        run_tests(tests_paging, T_TAG_PAGING | T_TAG_EXC);
+        run_tests(tests_priority, T_TAG_PAGING | T_TAG_EXC);
+        run_tests(tests_restart_complex, T_TAG_PAGING | T_TAG_EXC);
+        run_tests(tests_heavy_paging, T_TAG_PAGING);
+        run_tests(tests_mem, 0);
+        run_tests(tests_sweeps, 0);
+        run_tests(tests_sys, 0);
+        run_tests(tests_heavy_state, T_TAG_IRQ);
+        if (g_round == ROUNDS) run_tests(tests_burn, 0);
+        if (sel_dry) { sel_check_names(); g_round = 0; }
     }
     u32 runtime_total = ms_now() - start_ms;
     cpu_feature_report();
-    kprintf("SUMMARY rounds=%u tests=%u pass=%u fail=%u skip=%u fault=%u ms=%u\n", ROUNDS, tot_tests, tot_pass, tot_fail, tot_skip, tot_fault,
+    kprintf("FILTER suite_selection=%u build_selection=%u runtime_selection=%u\n", filt_suite, filt_build, filt_runtime);
+    kprintf("SUMMARY rounds=%u tests=%u pass=%u fail=%u skip=%u fault=%u ms=%u", ROUNDS, tot_tests, tot_pass, tot_fail, tot_skip, tot_fault,
             runtime_total);
-    kprintf("RUNTIME scope=suite total_ms=%u warmup_ms=%llu sample_ms=%llu overhead_ms=%llu suite_overhead_ms=%llu resolution_ms=10\n",
-            runtime_total, runtime_warmup_ms, runtime_sample_ms, runtime_overhead_ms,
+    kprintf(" warmup_ms=%llu sample_ms=%llu overhead_ms=%llu suite_overhead_ms=%llu\n",
+            runtime_warmup_ms, runtime_sample_ms, runtime_overhead_ms,
             (u64)runtime_total - runtime_warmup_ms - runtime_sample_ms - runtime_overhead_ms);
     kprintf("DONE\n");
     post(0xFF);

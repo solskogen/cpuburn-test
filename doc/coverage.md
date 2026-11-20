@@ -93,7 +93,7 @@ different contracts cannot be pooled into one performance report.
 
 `FEATURE` records distinguish sampled PASS, FAIL, UNTESTED and NA. Missing
 witnesses, filtered tests, skipped coverage and unmapped CPUID claims are not
-passes. `FILTER` records retain tests omitted by `ONLY`. Strict system-state
+passes. The `FILTER` line counts tests omitted by suite, `ONLY` or run-time selection. Strict system-state
 checks cover TSC MSRs, MTRR/PAT/MCA state, MCE control, DE exceptions and PSE36
 address-bit/fault handling. AMD legacy SYSCALL/SYSRET and MMX integer
 extensions have separate behavioural witnesses and applicability gates.
@@ -145,8 +145,10 @@ is reported rather than treated as a benchmark failure.
 Exception guards, a separate double-fault stack, and a timer watchdog contain
 ordinary probing faults. **They cannot guarantee recovery from arbitrary
 hardware/emulator failures**, a broken interrupt controller, a hard lockup with
-interrupts disabled, or corruption of the kernel's own mappings. Double faults
-produce a fatal diagnostic and halt rather than continuing in an unknown state.
+interrupts disabled, or corruption of the kernel's own mappings. A double fault inside a test is
+handled by its own task: the test is unwound to its outermost guard and
+reported as `FAULT` (`rc=108`, vector 8), kernel state is rebuilt and the
+suite continues. A double fault outside a test produces a fatal diagnostic and halts.
 Real-hardware compatibility cannot be established solely by VM results.
 
 Legacy chipset tests necessarily exercise PIC/PIT/RTC state and owned CPU

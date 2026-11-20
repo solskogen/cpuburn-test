@@ -98,7 +98,7 @@ both raw-log parsing and JSON capture:
 |---|---|
 | `CONFORMANCE` | Expected/detected model, contract availability, minimum requirements and mode |
 | `PROBE` | Guarded instruction availability, not correctness |
-| `FILTER` | A registered test omitted by `ONLY`, distinct from an executed SKIP |
+| `FILTER` | Counts of registered tests omitted by suite, `ONLY` or run-time selection, distinct from an executed SKIP |
 | `FEATURE` | Required/detected/probed capability, witness, outcomes and filtered count |
 
 Feature `FAIL` means its witness or another test requiring that feature failed

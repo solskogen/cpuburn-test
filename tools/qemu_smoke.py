@@ -38,43 +38,97 @@ def host_fpu_note(tests, backend):
             "to check x87 conformance.")
 
 
+# key=value fields; a quoted value may contain spaces and \" or \\ escapes.
+FIELD = re.compile(r'(\w+)=("(?:[^"\\]|\\.)*"|\S+)')
+CFG_TIMING_FIELDS = ("timing_scope", "ms_resolution")
+
+
+def fields_of(line):
+    return dict(FIELD.findall(line))
+
+
+def unquote(value):
+    """Value of a quoted field without its quotes and escapes."""
+    if len(value) >= 2 and value[0] == value[-1] == '"':
+        return re.sub(r'\\(.)', r'\1', value[1:-1])
+    return value
+
+
 def parse_log(text):
+    """Parse a guest serial log. Accepts both the current format (runtime
+    totals in TEST/SUMMARY, timing constants in CFG, one FILTER summary) and
+    the older one (BEGIN, RUNTIME and per-record FILTER lines)."""
+    lines = text.splitlines()
     tests = []
     details = []
-    for line in text.splitlines():
-        if line.startswith("BEGIN "):
+    for line in lines:
+        if line.startswith("BEGIN ") or line.startswith("WORK phase=warmup "):
             details = []
         elif line.startswith("FAILDETAIL "):
             details.append(line)
         if line.startswith("TEST "):
-            fields = dict(re.findall(r'(\w+)=("[^"]*"|\S+)', line))
+            fields = fields_of(line)
             if details:
                 fields["failure_details"] = details
             tests.append(fields)
             details = []
-    summary = next((x for x in text.splitlines() if x.startswith("SUMMARY ")), "")
+    summary = next((x for x in lines if x.startswith("SUMMARY ")), "")
     counts = dict(re.findall(r"(\w+)=(\d+)", summary))
-    config_line = next((x for x in text.splitlines() if x.startswith("CFG ")), "")
+    config = {}
+    for line in lines:
+        if line.startswith("CFG "):
+            config = dict(re.findall(r"(\w+)=(\S+)", line))
+            break
+    # Constant per-record fields moved from TEST to CFG: put them back on the
+    # records (as the old format had them) and keep config comparable.
+    timing = {k: config.pop(k) for k in CFG_TIMING_FIELDS if k in config}
+    for test in tests:
+        if "op_unit" in test:  # an executed record, not a missing-feature SKIP
+            for key, value in timing.items():
+                test.setdefault(key, value)
+        if "nfail" in test and "seed" in config:
+            test.setdefault("seed", config["seed"])
+    runtime = [fields_of(line) for line in lines if line.startswith("RUNTIME ")]
+    if not runtime and summary and tests and all("total_ms" in t for t in tests):
+        runtime = runtime_from_records(tests, summary, timing.get("ms_resolution", "10"))
+    filters = [dict(re.findall(r"(\w+)=(\S+)", line))
+               for line in lines if line.startswith("FILTER ")]
+    control = [dict(re.findall(r"(\w+)=(\S+)", line))
+               for line in lines if line.startswith("CONTROL ")]
+    selection = next((c for c in control if c.get("protocol") == "sel1"
+                      and c.get("accepted") == "1"), None)
     return {"tests": tests, "summary": summary, "counts": counts,
-            "build_info": [dict(re.findall(r'(\w+)=("[^"]*"|\S+)', line))
-                           for line in text.splitlines() if line.startswith("BUILD ")],
-            "runtime_records": [dict(re.findall(r'(\w+)=("[^"]*"|\S+)', line))
-                                for line in text.splitlines()
-                                if line.startswith("RUNTIME ")],
-            "config": dict(re.findall(r"(\w+)=(\S+)", config_line)),
-            "cpu_control": [dict(re.findall(r"(\w+)=(\S+)", line))
-                            for line in text.splitlines() if line.startswith("CONTROL ")],
+            "build_info": [fields_of(line) for line in lines if line.startswith("BUILD ")],
+            "runtime_records": runtime,
+            "config": config,
+            "cpu_control": control,
+            "selection": selection,
             "conformance": [dict(re.findall(r"(\w+)=(\S+)", line))
-                            for line in text.splitlines() if line.startswith("CONFORMANCE ")],
+                            for line in lines if line.startswith("CONFORMANCE ")],
             "features": [dict(re.findall(r"(\w+)=(\S+)", line))
-                         for line in text.splitlines() if line.startswith("FEATURE ")],
+                         for line in lines if line.startswith("FEATURE ")],
             "probes": [dict(re.findall(r"(\w+)=(\S+)", line))
-                       for line in text.splitlines() if line.startswith("PROBE ")],
-            "filtered_tests": [dict(re.findall(r"(\w+)=(\S+)", line))
-                               for line in text.splitlines() if line.startswith("FILTER ")],
-            "fatal": any(x.startswith("FATAL") for x in text.splitlines()),
-            "cpu_info": [x for x in text.splitlines()
+                       for line in lines if line.startswith("PROBE ")],
+            "filtered_tests": [f for f in filters if "name" in f],
+            "filter_summary": next((f for f in filters if "name" not in f), None),
+            "fatal": any(x.startswith("FATAL") for x in lines),
+            "cpu_info": [x for x in lines
                          if x.startswith("CPU ") and "mhz=" not in x]}
+
+
+def runtime_from_records(tests, summary, resolution):
+    """Old-style RUNTIME records rebuilt from TEST total_ms/overhead_ms and
+    the SUMMARY runtime totals."""
+    records = [{"scope": "test", "r": t.get("r"), "id": t.get("id"), "name": t.get("name"),
+                "total_ms": t["total_ms"], "warmup_ms": t.get("warmup_ms", "0"),
+                "sample_ms": t.get("ms", "0"), "overhead_ms": t.get("overhead_ms", "0"),
+                "resolution_ms": resolution} for t in tests]
+    totals = dict(re.findall(r"(\w+)=(\d+)", summary))
+    keys = ("warmup_ms", "sample_ms", "overhead_ms", "suite_overhead_ms")
+    if "ms" in totals and all(k in totals for k in keys):
+        records.append({"scope": "suite", "total_ms": totals["ms"],
+                        **{k: totals[k] for k in keys}, "resolution_ms": resolution})
+    return records
 
 
 SUSTAINED_TIMEOUT = 8 * 3600

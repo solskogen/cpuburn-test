@@ -76,6 +76,18 @@ typedef struct test {
  * SUITE=benchmark builds. For workloads that run far above full speed on
  * every emulated CPU, so timing them finds no slowdown. */
 #define T_CHECK 1u
+/* Subsystem tags (TEST tags=): which 86Box area a record mainly exercises.
+ * kmain gives every table a default mask; per-record flags add to it. */
+#define T_TAG_SMC (1u << 16)     /* self-modifying code / code-page invalidation */
+#define T_TAG_PAGING (1u << 17)  /* page tables, TLB, CR3/CR4, page faults */
+#define T_TAG_SEGLOAD (1u << 18) /* descriptor loads, segment checks, far transfers */
+#define T_TAG_EXC (1u << 19)     /* exception/interrupt delivery */
+#define T_TAG_IRQ (1u << 20)     /* hardware IRQs, PIC/PIT/APIC timer */
+#define T_TAG_IO (1u << 21)      /* port I/O and chipset/device registers */
+#define T_TAG_X87 (1u << 22)     /* x87 FPU */
+#define T_TAG_MMX (1u << 23)     /* MMX/3DNow!/vendor SIMD */
+#define T_TAG_MODESW (1u << 24)  /* mode switches: ring, V86, task, real/protected */
+#define T_TAG_REP (1u << 25)     /* REP string instructions */
 
 /* Each module exports a NULL-terminated array; kmain owns the execution order.
  * Integer/corpus/FPU/protected-mode/chipset modules run with paging OFF.

@@ -247,7 +247,7 @@ round.
 
 **Check-only records** run as correctness checks: they are never
 benchmark-sampled (they report `mode=accuracy` in benchmark builds) and
-`make SUITE=benchmark` leaves them out (`FILTER ... reason=suite_selection`).
+`make SUITE=benchmark` leaves them out (counted in `FILTER suite_selection=N`).
 A record is check-only when timing it says nothing about emulator speed:
 
 - The `cs_*` platform records, which mostly wait on PIT/RTC edges.

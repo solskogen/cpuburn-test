@@ -2,7 +2,7 @@
 bits 32
 
 extern kmain, c_isr, __bss_start, _end, df_handler_c, tss_main_esp_init
-global _start, guard_call, guard_recover, guard_unwind, isr_stub, g_guard, df_task_entry
+global _start, guard_call, guard_recover, guard_unwind, guard_unwind_to, isr_stub, g_guard, g_guard_unwinds, df_task_entry
 
 section .text.start
 _start:
@@ -63,6 +63,7 @@ guard_unwind_to:
     mov fs, cx
     mov gs, cx
     mov ss, cx
+    inc dword [g_guard_unwinds]
     test edx, edx
     jnz .frame
     mov edx, [g_guard]
@@ -144,13 +145,17 @@ isr_stub:
 %endrep
 
 section .text
-; Double-fault task entry (runs on its own TSS/stack): print and halt.
+; Double-fault task entry (runs on its own TSS/stack). df_handler_c either
+; halts or rewrites the main TSS to resume in guard_unwind_to; the far jump
+; switches back to it, saving this task with EIP at the jump below, so the
+; next #DF starts here again with a balanced stack.
 df_task_entry:
     cld
-    call df_handler_c
-.h: cli
-    hlt
-    jmp .h
+    call df_handler_c         ; argument: the #DF error code pushed on entry
+    add esp, 4
+    jmp 0x28:0                ; SEL_TSS_MAIN
+    jmp df_task_entry
 
 section .bss
 g_guard: resd 1
+g_guard_unwinds: resd 1

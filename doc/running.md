@@ -186,6 +186,32 @@ appear, check the VGA screen for a BIOS prompt and ensure firmware enables
 COM1. For automatic handling of supported BIOS F1 prompts, use
 [`tools/run_86box.py --bios-f1`](#sustained-host-profiling).
 
+Every record runs at least twice: a warm-up invocation and then measured
+ones. In accuracy mode (`SUITE=accuracy`, `BENCHMARKS=0` or an accepted
+`@cpu1 ... accuracy` frame) and for check-only records there is exactly one
+measured invocation, so the second run exercises code an emulator has
+already compiled (dynamic recompiler) or cached. `TEST` reports
+`iterations=` (measured) and `invocations=` (all, including the warm-up).
+
+### Select records at run time
+
+After the `@cpu1` exchange (or when none arrived) the guest prints
+`CONTROL protocol=sel1 ready=1` and waits 500 ms for one line:
+
+```text
+@sel1 ONLY SKIP FROM
+```
+
+Each field is a comma-separated list of record names, or `-` for none;
+`FROM` is a single name. `ONLY` runs just those records (intersected with a
+build-time `ONLY=`), `SKIP` never runs them, and `FROM` skips records until
+that name is reached, to resume an interrupted run. `ONLY` and `FROM` do not
+remove the `cpu_model_contract` record; `SKIP` does. After checking every
+name against the suite the guest prints `CONTROL protocol=sel1 accepted=1
+only=N skip=N from=NAME|-`. A malformed frame, an unknown name or a partial
+line is `FATAL`; without input the image runs as built. Filtered records are
+counted in the `FILTER ... runtime_selection=N` line, not listed.
+
 ## Drive a VM and log its real-time speed
 
 `tools/session_86box.py` runs an existing VM in place, as `run_86box.py`
