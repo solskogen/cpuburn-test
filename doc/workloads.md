@@ -280,7 +280,8 @@ A record is check-only when timing it says nothing about emulator speed:
   - `mem_bandwidth`, `mem_cache_ctl`, `mem_lock`, `mem_text_print`,
     `mem_walk`, `pg_pae`, `pg_tlb_stress`.
   - `pm_alignment_check`, `pm_debug_regs`, `pm_gates_rings`, `pm_syscall`,
-    `pm_sysenter`, `pm_task_switch`, `pm_v86`, `priority_fetch_operand`,
+    `pm_sysenter`, `pm_task_switch`, `pm_v86`, `priority_alignment_page`,
+    `priority_fetch_operand`, `priority_lock_decode_page`,
     `priority_page_permissions`, `priority_privileged_page`,
     `priority_segment_page`.
   - `sys_cpuid_leaves`, `sys_cr_regs`, `sys_debug_extensions`,
@@ -288,7 +289,9 @@ A record is check-only when timing it says nothing about emulator speed:
     `sys_msr_rw`, `sys_msr_tsc`, `sys_mtrr_state`, `sys_pat_state`,
     `sys_rdpmc`, `sys_tsc`.
 - Pure correctness records added later: `int_cf_consumers`, a check of
-  carry-flag consumers, and `int_smc_alu_family_flags`.
+  carry-flag consumers, `int_smc_alu_family_flags`, and
+  `heavy_pm_irq_shadow_check`, whose waits for a pending IRQ0 depend on the
+  PIT phase.
 
 Records from 100% to 200% stay benchmarks, so a regression in them is still
 visible. In the source, check-only records carry `T_CHECK` in their table entry
@@ -541,19 +544,21 @@ arena memory and restore temporary descriptor/interrupt state.
 | `pm_v86` | 486 | Selected virtual-8086 transitions and instruction traps. |
 | `pm_sysenter` | SEP + MSR | SYSENTER/SYSEXIT state and privilege transitions using restored MSRs; additional runtime checks apply. |
 | `pm_syscall` | SYSCALL + MSR | AMD-style SYSCALL/SYSRET transitions and state; two counted operations. |
-| `pm_irq_nesting` | 486 | Nested interrupt/handler state and repeated software interrupt paths. |
+| `pm_int_nesting` | 486 | 50,000 software INT chains nested four deep (the handler issues INT again); each level checks the frame EIP, CS, IF and depth. `ops` counts 200,000 delivered INTs. |
 | `pm_debug_regs` | 486 | Debug-register, single-step and breakpoint traps; counted delivered traps. |
 | `heavy_pm_code_context` | 486 | 32,768 far calls alternating descriptor default operand size at identical code location. |
-| `heavy_pm_16bit` | 486 | 16-bit code/stack/address-size operations and near/far calls; aggregate instruction/transition count. |
-| `heavy_pm_huge_copy16` | 486 | Windows 98's 16-bit decompressor copy in 16-bit code: per byte LES of two far pointers kept in memory, ES put back from memory, and both stepped as huge pointers (ADD 1, SBB, AND 8 into the selector); checked against a reference. |
+| `heavy_pm_16bit` | 486 | 16-bit code/stack/address-size operations and near/far calls; aggregate instruction/transition count. Input windows and expected results are built once per invocation; each case moves the DS window. |
+| `heavy_pm_huge_copy16` | 486 | Windows 98's 16-bit decompressor copy in 16-bit code: per byte LES of two far pointers kept in memory, ES put back from memory, and both stepped as huge pointers (ADD 1, SBB, AND 8 into the selector); checked against a reference. Three of four cases cross a 64 KiB boundary in the source, destination or both, so the selector steps and the segment register reloads a new descriptor (`64KiB_selector_steps=`). |
 | `heavy_pm_ldt` | 486 | LDT/TI descriptors, segment use, limits and selected faults; aggregate operations. |
-| `heavy_pm_expand_down` | 486 | Expand-down segment and stack boundaries, legal accesses and faults. |
+| `heavy_pm_expand_down_faults` | 486 | Expand-down segment and stack boundaries; each case raises six #GP faults plus a ring-3 #SS round trip, so the fault machinery dominates. |
+| `heavy_pm_expand_down_loop` | 486 | Fault-free FS: loads, PUSH/POP and SS: stores inside expand-down FS and SS segments, with B=0 and B=1; 16,384×`HEAVY_SCALE` iterations of five accesses per B value, checked against a once-computed reference. `ops` counts accesses. |
 | `heavy_pm_call_gates` | 486 | Ring-3 call gates, parameter copying and RETF; 16,384 transitions at default scale, `ops` also counts parameter/return work. |
-| `heavy_pm_privilege` | 486 | Selected privileged instruction, gate and descriptor faults; aggregate operations. |
+| `heavy_pm_privilege_faults` | 486 | Selected privileged instruction, gate and descriptor faults; ten ring-3 calls and faults per case, so the fault machinery dominates. Aggregate operations. |
 | `heavy_pm_pvi` | VME | Protected-mode virtual interrupt flags and VIP faults; runtime CR4 support needed. |
 | `heavy_pm_vme` | VME | Virtual-8086 virtual flags and interrupt redirection/faults; runtime CR4 support needed. |
 | `heavy_pm_v86_monitor` | 486 | V86 code under a monitor, as DOS under EMM386 or a Win9x DOS box: at IOPL=0 without VME (CR4.VME is cleared for the run) every CLI, STI, PUSHF, POPF, INT 21h and IRET traps with #GP and is emulated against a virtual IF; the INT 21h handler does 16-bit ALU work through DS/ES. 1,024×`HEAVY_SCALE` iterations of 8 traps; trap counts per instruction, virtual-IF results and the ALU result are checked in bulk. `ops` counts traps. |
-| `heavy_pm_irq_shadows` | 486 | STI/IRET pending IRQ samples and MOV SS/POP SS debug-trap shadows, not all asynchronous IRQ ordering. |
+| `heavy_pm_ss_shadow_traps` | 486 | MOV SS/POP SS debug-trap shadows under TF; 2,048×`HEAVY_SCALE` checked cases. |
+| `heavy_pm_irq_shadow_check` | 486 | Check-only: STI/IRET shadows with a pending IRQ0, not all asynchronous IRQ ordering. |
 
 Each exception-priority record requires PAGING + 486 and executes 16,384
 cases at default scale, counted one per case. The tests compare defined fault
@@ -590,7 +595,7 @@ fault-time registers.
 | `pg_map_alias` | PAGING + 486 | Page mappings, remapping and alias coherence; 2,048 counted operations. |
 | `pg_faults` | PAGING + 486 | Access permissions, demand faults and REP restart; counted demand faults, not all memory accesses. |
 | `pg_accessed_dirty` | PAGING + 486 | Page accessed/dirty behavior; accessed bit on a fault is not required. |
-| `pg_tlb_stress` | PAGING + 486 | 65,536 checked accesses across virtual/physical page mappings; includes TLB stress. |
+| `pg_tlb_stress` | PAGING + 486 | Check-only: 65,536 accesses over 16 MiB of virtual mappings with an LCG step, CHECK and checksum per access and INVLPG every 256 accesses; its cycles/access note is not a TLB benchmark. |
 | `pg_global` | PAGING + PGE + P5 | Global-page behavior through CR3 reload; actual retention is optional. |
 | `pg_pse4m` | PAGING + 486 + PSE + MEM8M | 4 MiB mappings/permissions; high physical addresses above 4 GiB are not read. |
 | `pg_pae` | PAGING + 486 + PAE + MEM8M | PAE mappings, 2 MiB pages, aliases, A/D and faults; reserved PDPTE behavior is partly observational. |
@@ -601,11 +606,12 @@ fault-time registers.
 | `heavy_pg_ring3_pages` | PAGING + 486 | Ring-3 code reads 32 pages, enters ring 0 by INT and returns, 4,096 times a round for 8 rounds: every return to ring 3 after translations made at ring 0. |
 | `heavy_pg_split_fetch` | PAGING + 486 | Cross-page instruction fetch faults and restart state; counts fault cases. |
 | `heavy_pg_split_data` | PAGING + 486 | Cross-page data faults and restart state; counts fault cases. |
-| `heavy_pg_rep_restart` | PAGING + 486 | Partially completed forward/backward REP MOVSD and preserved state; counts MOVSD elements. |
+| `heavy_pg_rep_restart` | PAGING + 486 | Partially completed forward/backward REP MOVSD and preserved state; counts MOVSD elements. Only the faulting page is remapped per case. |
 | `heavy_pg_stack_restart` | PAGING + 486 | Split-stack PUSH/POP fault and restart; counts fault cases. |
 | `mem_walk` | PAGING | Walking bits, address alias and five patterns over up to 2 MiB owned RAM; `ops` counts pattern reads/writes. |
 | `mem_bandwidth` | PAGING | Read/write, REP copy/fill, pointer chase and strided work at multiple owned-RAM sizes; generic count combines accesses; individual notes include loop overhead. |
-| `mem_unaligned` | PAGING | Checked 1/2/4-byte accesses near ordinary and page boundaries; 2,304 aggregate operations. |
+| `mem_unaligned` | PAGING | Unaligned 1/2/4-byte stores and 2/4-byte loads at 256 offsets near ordinary and page boundaries, 16×`HEAVY_SCALE` passes; readbacks and final bytes (with guards) are checked by checksum against a once-computed reference. `ops` counts accesses. |
+| `mem_unaligned_page_split` | PAGING | The same accesses at offsets 4093–4095 where the second page maps to a non-adjacent physical frame, so each access needs two translations; 1,024×`HEAVY_SCALE` passes, final bytes and sentinel frames checked. |
 | `mem_lock` | PAGING + 486 | Locked arithmetic, XCHG/CMPXCHG, optional CX8 and INVLPG; 5,120 aggregate operations, not a multiprocessor test. |
 | `mem_cache_ctl` | PAGING + 486 + NOHV | Guarded WBINVD and bounded CR0.CD/NW windows with data and restoration checks; no explicit `t_ops` count. |
 | `heavy_decode_align` | PAGING + 486 | Prefixed variable-length code at 67 offsets and both branch paths, each path one call that loops in the generated code. |
@@ -636,7 +642,7 @@ invocation. Device/firmware and available memory may also cause skips.
 | `sys_msr_probe` | MSR | Selected model/feature-qualified MSR reads; one generic operation, many reads diagnostic or allowed to fault. |
 | `sys_msr_rw` | MSR + P6 + NOHV | Guarded selected MSR read/write/restore, including SYSENTER and unchanged PAT where applicable; not all MSRs. |
 | `sys_cr_regs` | 486 | CR0/2/3 and supported CR4 bits, selected debug-register checks and restoration; no explicit operation count. |
-| `sys_rdpmc` | P5 | Guarded performance counter reads and ring-3 restriction; skips unavailable/trapped counters. |
+| `sys_rdpmc` | P5 | Guarded performance counter reads and ring-3 restriction; skips CPU models without architected RDPMC (before Pentium MMX/Pentium Pro, K6-2 or 6x86MX) and trapped counters. |
 | `sys_msr_tsc` | MSR + TSC | One TSC MSR read bracketed by RDTSC. |
 | `sys_mtrr_state` | MTRR + MSR | Read and validate MTRR register inventory; `ops` is variable MTRR count + 1, not cache effects. |
 | `sys_pat_state` | PAT + MSR | Eight PAT types and unchanged write/readback; no cache-type effects. |
@@ -646,10 +652,10 @@ invocation. Device/firmware and available memory may also cause skips.
 | `sys_cpuid_leaves` | CPUID | CPUID leaf inventory and repeated consistency checks; 32 generic operations, not exhaustive leaf semantics. |
 | `sys_irq_timer` | — | Approximately 500 ms IRQ0 delivery against PIT/TSC; `ops` counts observed ticks. |
 | `sys_irq_rate_3800`, `sys_irq_rate_15700` | — | A checked integer workload while IRQ0 runs at 3.8 or 15.7 kHz (PIT divisors 314 and 76), as PC-speaker PCM and DOS sound code program it; the result must match a 100 Hz reference. Guest time stays exact across rate changes. With a TSC, more interrupts than possible fail; fewer are reported as `irq_rate_achieved=`, since a slow CPU or core may lose ticks it cannot service. `ops` counts loop iterations. |
-| `heavy_mix_transitions` | PAGING + 486 | Seeded integer/memory, page remaps, optional x87/MMX and interrupts; aggregate operation count depends on available features. |
+| `heavy_mix_transitions` | PAGING + 486 | Seeded integer/memory, page remaps, optional x87/MMX and interrupts; aggregate operation count depends on available features. INVLPG every iteration and a CR3 reload every eighth make it dominated by TLB refill in 86Box. |
 | `heavy_state_interrupt` | 486 | 32,768 software interrupt deliveries and checked register/optional FPU/MMX state; `ops` counts mixed state work. |
 | `heavy_x87_save_restore` | 486 + FPU | 65,536 FNSAVE/FRSTOR iterations at default scale; `ops` counts 18 operations per iteration. |
 | `heavy_fx_save_restore` | 486 + FXSR + FPU | 65,536 FXSAVE/FXRSTOR iterations at default scale; `ops` counts 40 operations per iteration. |
-| `heavy_apic_periodic` | PAGING + 486 + APIC | Periodic LAPIC timer with PIT deadline and EOI; at least 2,048 deliveries over at least two seconds; count varies, `ops` is deliveries + 5. |
-| `heavy_apic_oneshot` | PAGING + 486 + APIC | Rearm and check 1,024 one-shot LAPIC deliveries; `ops` is deliveries + 5. |
+| `heavy_apic_periodic_hlt` | PAGING + 486 + APIC | Periodic LAPIC timer with PIT deadline and EOI; at least 2,048 deliveries over at least two seconds; mostly HLT idle. Count varies, `ops` is deliveries + 5. |
+| `heavy_apic_oneshot_hlt` | PAGING + 486 + APIC | Rearm and check 1,024 one-shot LAPIC deliveries, mostly HLT idle; `ops` is deliveries + 5. |
 | `burn_mixed` | PAGING + 486 | Duration-bounded checked integer/CRC, optional x87/MMX, copy, optional page remaps, software interrupts and call/return; runs final round only. `ops` is a synthetic mixed estimate per iteration, not bytes or instructions; arena and watchdog affect work/duration. |
