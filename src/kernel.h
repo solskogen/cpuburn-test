@@ -111,6 +111,7 @@ extern const test_t tests_vendor[];
 extern const test_t tests_cpu_contract[];
 extern const test_t tests_cyrix[];
 extern const test_t tests_realworld[];
+extern const test_t tests_fpu_ext[], tests_mmx_ext[];
 void cpu_control(int serial_available);
 void cpu_contract_init(void);
 u32 cpu_required_features(void);

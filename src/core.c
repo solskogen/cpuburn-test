@@ -1447,9 +1447,11 @@ void kmain(void) {
         run_tests(tests_corpus, 0);
         run_tests(tests_realworld, T_TAG_SMC);
         run_tests(tests_fpu, T_TAG_X87);
+        run_tests(tests_fpu_ext, T_TAG_X87);
         run_tests(tests_fp_edges, T_TAG_X87);
         run_checks(tests_fp_edges_check, T_TAG_X87);
         run_tests(tests_mmx, T_TAG_MMX);
+        run_tests(tests_mmx_ext, T_TAG_MMX);
         run_tests(tests_vendor, T_TAG_MMX);
         run_tests(tests_cyrix, T_TAG_IO);
         run_tests(tests_pmode, T_TAG_SEGLOAD | T_TAG_EXC);
