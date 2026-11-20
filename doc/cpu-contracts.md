@@ -204,6 +204,12 @@ python3 tools/cpu_matrix.py --source ../86Box --output build/matrix-run \
   --emulator ../86Box/build/src/86Box --image floppy.img
 ```
 
+`--run` needs the 86Box binary from `--emulator` or the `CPUBURN_86BOX`
+environment variable. `--jobs N --cores 8-11` runs N configurations at once,
+each runner pinned to its own CPU from `--cores`; `results.json` keeps the
+selection order. `--resume` reuses an existing `results.json` from the same
+image and binary and runs only rows without a complete result.
+
 Use `--fpu-backend both` to expand FPU-equipped rows across host and softfloat
 implementations; `auto` preserves the usual host choice except on
 software-only boards. No-FPU rows are not duplicated by this choice.
@@ -215,7 +221,7 @@ build with `BENCHMARKS=1` and select `--mode benchmark`:
 ```sh
 make BENCHMARKS=1
 python3 tools/cpu_matrix.py --source ../86Box --output build/cpu-benchmarks \
-  --run --mode benchmark --family cx6x86mx
+  --run --mode benchmark --family cx6x86mx --emulator ../86Box/build/src/86Box
 ```
 
 Omitting `--engine` runs each available engine separately, with the same image

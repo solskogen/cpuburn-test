@@ -7,7 +7,9 @@ import unittest
 from unittest.mock import patch
 from types import SimpleNamespace
 
-from cpu_matrix import eligible, fields, make_matrix, number, preprocess, run_matrix, split_c, table, write_configs
+from cpu_matrix import (cores_list, emulator_path, eligible, fields, make_matrix, number, preprocess,
+                        run_matrix, split_c, table, write_configs)
+import os
 from qemu_smoke import parse_log
 from run_86box import cpu_control_accepted, cpu_control_frame
 
@@ -216,6 +218,81 @@ class CpuMatrixTests(unittest.TestCase):
             self.assertEqual(len(result["rows"]), 2)
             self.assertTrue(all(r["outcome"] == "infrastructure_error" and r["result_error"]
                                 for r in result["rows"]))
+
+    def runner_reply(self, root):
+        """subprocess.run stand-in: each call writes a passing result."""
+        calls = []
+
+        def run(command, **kw):
+            label = command[command.index("--label") + 1]
+            calls.append(command)
+            directory = root / ("run-" + label)
+            directory.mkdir()
+            (directory / "result.json").write_text(json.dumps({
+                "status": "pass", "tests": [{"name": "cpu_model_contract", "status": "PASS"}]}))
+            return SimpleNamespace(returncode=0, stdout=json.dumps({"directory": str(directory)}),
+                                   stderr="")
+        return calls, run
+
+    def test_parallel_jobs_pin_distinct_cores_and_keep_order(self):
+        cpus = [self.cpu(index=i, model_name=str(i)) for i in range(4)]
+        rows = make_matrix(cpus, [self.board()], all_speeds=True)
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
+            root = Path(directory)
+            image = root / "floppy.img"
+            image.write_bytes(b"fixture")
+            write_configs(rows, root)
+            calls, run = self.runner_reply(root)
+            args = SimpleNamespace(output=root, image=image, emulator=image, family=[], engine=None,
+                                   wall_seconds=10, rompath=None, jobs=2, cores=[13, 14])
+            with patch("cpu_matrix.subprocess.run", side_effect=run):
+                result = run_matrix(rows, args)
+            self.assertEqual([r["id"] for r in result["rows"]], [r["id"] for r in rows])
+            self.assertTrue(all(r["outcome"] == "pass" for r in result["rows"]))
+            self.assertLessEqual({c[c.index("--pin") + 1] for c in calls}, {"13", "14"})
+            self.assertLessEqual({r["core"] for r in result["rows"]}, {13, 14})
+            with self.assertRaisesRegex(ValueError, "needs --cores"):
+                run_matrix(rows, SimpleNamespace(**{**vars(args), "cores": None, "resume": True}))
+
+    def test_resume_reruns_only_incomplete_rows(self):
+        cpus = [self.cpu(index=i, model_name=str(i)) for i in range(3)]
+        rows = make_matrix(cpus, [self.board()], all_speeds=True)
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
+            root = Path(directory)
+            image = root / "floppy.img"
+            image.write_bytes(b"fixture")
+            write_configs(rows, root)
+            calls, run = self.runner_reply(root)
+            args = SimpleNamespace(output=root, image=image, emulator=image, family=[], engine=None,
+                                   wall_seconds=10, rompath=None)
+            with patch("cpu_matrix.subprocess.run", side_effect=run):
+                first = run_matrix(rows, args)
+            first["rows"][1]["outcome"] = "infrastructure_error"
+            (root / "results.json").write_text(json.dumps(first))
+            calls.clear()
+            with patch("cpu_matrix.subprocess.run", side_effect=lambda c, **kw: (
+                    calls.append(c), SimpleNamespace(returncode=1, stdout="", stderr="x"))[1]):
+                second = run_matrix(rows, SimpleNamespace(**vars(args), resume=True))
+            self.assertEqual(len(calls), 1)
+            self.assertIn(rows[1]["id"], calls[0])
+            self.assertEqual([r.get("resumed") for r in second["rows"]],
+                             [None if n == 1 else True for n in range(len(rows))])
+            image.write_bytes(b"other")
+            with self.assertRaisesRegex(ValueError, "image_sha256 differs"):
+                run_matrix(rows, SimpleNamespace(**vars(args), resume=True))
+
+    def test_emulator_comes_from_option_or_environment(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
+            binary = Path(directory) / "86Box"
+            binary.write_bytes(b"")
+            with patch.dict(os.environ, {"CPUBURN_86BOX": str(binary)}):
+                self.assertEqual(emulator_path(None), binary)
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaisesRegex(ValueError, "CPUBURN_86BOX"):
+                    emulator_path(None)
+                with self.assertRaisesRegex(ValueError, "not found"):
+                    emulator_path(str(binary) + ".missing")
+        self.assertEqual(cores_list("8-10,13,9"), [8, 9, 10, 13])
 
     def test_additive_coverage_and_filtered_inventory_are_retained(self):
         run = parse_log(

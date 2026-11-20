@@ -2,13 +2,17 @@
 """Enumerate 86Box CPU configurations; CPU tables are inventory, never an oracle."""
 import argparse
 import ast
+import concurrent.futures
 import configparser
 import hashlib
 import json
+import os
 from pathlib import Path
+import queue
 import re
 import subprocess
 import sys
+import threading
 
 ROOT = Path(__file__).resolve().parents[1]
 PREFERRED = ("486sp3", "486sp3g", "amis76", "p55t2p4", "p5a", "bf6",
@@ -317,10 +321,119 @@ def write_configs(rows, destination):
         row["config"] = str(path.resolve())
 
 
+EMULATOR_ENVIRONMENT = "CPUBURN_86BOX"
+# Outcomes that say nothing about the configuration: --resume runs them again
+INCOMPLETE = {"infrastructure_error", "interrupted"}
+
+
+def cores_list(text):
+    """--cores: comma-separated CPUs and ranges, e.g. 8-11,13."""
+    cores = []
+    for part in text.split(","):
+        first, dash, last = part.strip().partition("-")
+        try:
+            low, high = int(first), int(last if dash else first)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"not a CPU list: {text!r}") from None
+        if low < 0 or high < low:
+            raise argparse.ArgumentTypeError(f"not a CPU list: {text!r}")
+        cores += [c for c in range(low, high + 1) if c not in cores]
+    return cores
+
+
+def emulator_path(value):
+    """--emulator, else $CPUBURN_86BOX; there is no guessed default."""
+    value = value or os.environ.get(EMULATOR_ENVIRONMENT)
+    if not value:
+        raise ValueError(f"--run needs the 86Box binary: pass --emulator or set {EMULATOR_ENVIRONMENT}")
+    path = Path(value).expanduser()
+    if not path.is_file():
+        raise ValueError(f"86Box binary not found: {path} (from --emulator or {EMULATOR_ENVIRONMENT})")
+    return path
+
+
+def complete(entry):
+    """A previous entry --resume keeps: a runner result that was read."""
+    return (isinstance(entry, dict) and entry.get("outcome") not in INCOMPLETE | {None, "blocked"}
+            and "result" in entry and "result_error" not in entry
+            and Path(entry["result"]).is_file())
+
+
+def run_row(row, binary, image, args, mode, core=None):
+    command = [
+        sys.executable, str(ROOT / "tools/run_86box.py"), "--bios-f1",
+        "--emulator", str(binary), "--image", str(image), "--config", row["config"],
+        "--memory-mb", str(row["memory_kb"] // 1024),
+        "--expected-family-name", row["family_name"],
+        "--expected-model-name", row["model_name"],
+        "--expected-signature", hex(row["signature"]),
+        "--wall-seconds", str(args.wall_seconds), "--label", row["id"],
+    ]
+    if mode == "accuracy":
+        command.append("--accuracy")
+    if args.rompath:
+        command += ["--rompath", str(args.rompath)]
+    if core is not None:
+        command += ["--pin", str(core)]
+    process = subprocess.run(command, capture_output=True, text=True)
+    output = process.stdout.strip().splitlines()
+    entry = {**row, "returncode": process.returncode,
+             "stderr": process.stderr, "stdout": process.stdout}
+    if core is not None:
+        entry["core"] = core
+    try:
+        payload = json.loads(output[-1]) if output else None
+    except json.JSONDecodeError:
+        payload = None
+    if isinstance(payload, dict) and "directory" in payload:
+        result_path = Path(payload["directory"]) / "result.json"
+        if result_path.is_file():
+            entry["result"] = str(result_path)
+            try:
+                result = json.loads(result_path.read_text())
+                if not isinstance(result, dict) or not isinstance(result.get("status"), str):
+                    raise ValueError("runner result lacks a status")
+            except (OSError, ValueError) as error:
+                entry["result_error"] = str(error)
+            else:
+                entry["outcome"] = result["status"]
+                entry["counts"] = result.get("counts", {})
+                entry["features"] = result.get("features", [])
+                entry["contract_tests"] = [t for t in result.get("tests", [])
+                                           if t.get("name") == "cpu_model_contract"]
+                entry["conformance_coverage"] = result.get("conformance_coverage", {})
+                if mode == "benchmark" and result.get("mode") != "benchmark":
+                    entry["outcome"] = "benchmark_unavailable"
+                    entry["result_error"] = "guest did not confirm benchmark mode; use BENCHMARKS=1"
+                if (entry["outcome"] == "observed" and
+                        not result.get("correctness", {}).get("passed")):
+                    entry["outcome"] = "guest_failures"
+                if not any(t.get("status") == "PASS" for t in entry["contract_tests"]):
+                    if entry["outcome"] in ("pass", "observed"):
+                        entry["outcome"] = "unverified_identity"
+    if "outcome" not in entry:
+        entry["outcome"] = "infrastructure_error"
+    return entry
+
+
 def run_matrix(rows, args):
+    """Run the selected rows, --jobs at a time, each runner pinned to its own
+    CPU from --cores. results.json keeps the selection order and is rewritten
+    as each row finishes; --resume keeps rows whose result is complete."""
     results_path = args.output / "results.json"
-    if results_path.exists():
-        raise ValueError(f"{results_path} already exists; choose a fresh --output directory")
+    resume = getattr(args, "resume", False)
+    jobs = getattr(args, "jobs", 1) or 1
+    cores = list(getattr(args, "cores", None) or [])
+    if jobs < 1:
+        raise ValueError("--jobs must be at least 1")
+    if cores and len(cores) < jobs:
+        raise ValueError(f"--jobs {jobs} needs at least {jobs} CPUs in --cores")
+    if jobs > 1 and not cores:
+        raise ValueError("--jobs above 1 needs --cores, one CPU per job, so runs do not share a core")
+    if cores and not sys.platform.startswith("linux"):
+        raise ValueError("--cores pins runners and is supported on Linux only")
+    if results_path.exists() and not resume:
+        raise ValueError(f"{results_path} already exists; choose a fresh --output directory or --resume")
     image = args.image.resolve(strict=True)
     binary = args.emulator.resolve(strict=True)
     mode = getattr(args, "mode", "accuracy")
@@ -332,68 +445,63 @@ def run_matrix(rows, args):
         "fpu_backend_verification": "requested_configuration_only",
         "rows": [],
     }
-    for row in rows:
-        if args.family and row["family"] not in args.family:
-            continue
-        if args.engine and row["status"] == "ready" and row.get("dynarec") != args.engine:
-            continue
-        if row["status"] != "ready":
-            results["rows"].append({**row, "outcome": "blocked"})
-        else:
-            command = [
-                sys.executable, str(ROOT / "tools/run_86box.py"), "--bios-f1",
-                "--emulator", str(binary), "--image", str(image), "--config", row["config"],
-                "--memory-mb", str(row["memory_kb"] // 1024),
-                "--expected-family-name", row["family_name"],
-                "--expected-model-name", row["model_name"],
-                "--expected-signature", hex(row["signature"]),
-                "--wall-seconds", str(args.wall_seconds), "--label", row["id"],
-            ]
-            if mode == "accuracy":
-                command.append("--accuracy")
-            if args.rompath:
-                command += ["--rompath", str(args.rompath)]
-            process = subprocess.run(command, capture_output=True, text=True)
-            output = process.stdout.strip().splitlines()
-            entry = {**row, "returncode": process.returncode,
-                     "stderr": process.stderr, "stdout": process.stdout}
-            try:
-                payload = json.loads(output[-1]) if output else None
-            except json.JSONDecodeError:
-                payload = None
-            if isinstance(payload, dict) and "directory" in payload:
-                result_path = Path(payload["directory"]) / "result.json"
-                if result_path.is_file():
-                    entry["result"] = str(result_path)
-                    try:
-                        result = json.loads(result_path.read_text())
-                        if not isinstance(result, dict) or not isinstance(result.get("status"), str):
-                            raise ValueError("runner result lacks a status")
-                    except (OSError, ValueError) as error:
-                        entry["result_error"] = str(error)
-                    else:
-                        entry["outcome"] = result["status"]
-                        entry["counts"] = result.get("counts", {})
-                        entry["features"] = result.get("features", [])
-                        entry["contract_tests"] = [t for t in result.get("tests", [])
-                                                   if t.get("name") == "cpu_model_contract"]
-                        entry["conformance_coverage"] = result.get("conformance_coverage", {})
-                        if mode == "benchmark" and result.get("mode") != "benchmark":
-                            entry["outcome"] = "benchmark_unavailable"
-                            entry["result_error"] = "guest did not confirm benchmark mode; use BENCHMARKS=1"
-                        if (entry["outcome"] == "observed" and
-                                not result.get("correctness", {}).get("passed")):
-                            entry["outcome"] = "guest_failures"
-                        if not any(t.get("status") == "PASS" for t in entry["contract_tests"]):
-                            if entry["outcome"] in ("pass", "observed"):
-                                entry["outcome"] = "unverified_identity"
-            if "outcome" not in entry:
-                entry["outcome"] = "infrastructure_error"
-            results["rows"].append(entry)
-            print(f"{row.get('id', row['family'])}: {results['rows'][-1]['outcome']}", flush=True)
-        results_path.write_text(json.dumps(results, indent=2) + "\n")
-    if not results["rows"]:
+    previous = {}
+    if resume and results_path.exists():
+        try:
+            old = json.loads(results_path.read_text())
+        except ValueError as error:
+            raise ValueError(f"cannot resume from {results_path}: {error}") from None
+        for key in ("image_sha256", "emulator_sha256", "mode"):
+            if old.get(key) != results[key]:
+                raise ValueError(f"cannot resume: {key} differs from {results_path}")
+        previous = {r["id"]: r for r in old.get("rows", []) if complete(r) and "id" in r}
+    selected = [row for row in rows
+                if not (args.family and row["family"] not in args.family)
+                and not (args.engine and row["status"] == "ready" and row.get("dynarec") != args.engine)]
+    if not selected:
         raise ValueError("matrix selection is empty")
+    entries = [None] * len(selected)
+    pending = []
+    for number, row in enumerate(selected):
+        if row["status"] != "ready":
+            entries[number] = {**row, "outcome": "blocked"}
+        elif row.get("id") in previous:
+            entries[number] = {**previous[row["id"]], "resumed": True}
+        else:
+            pending.append(number)
+    lock = threading.Lock()
+
+    def save():
+        results["rows"] = [e for e in entries if e is not None]
+        results_path.write_text(json.dumps(results, indent=2) + "\n")
+
+    def finished(number, entry):
+        with lock:
+            entries[number] = entry
+            save()
+            print(f"{entry.get('id', entry['family'])}: {entry['outcome']}", flush=True)
+
+    save()
+    if jobs == 1:
+        for number in pending:
+            finished(number, run_row(selected[number], binary, image, args, mode,
+                                     cores[0] if cores else None))
+    else:
+        free = queue.Queue()
+        for core in cores[:jobs]:
+            free.put(core)
+
+        def work(number):
+            core = free.get()
+            try:
+                finished(number, run_row(selected[number], binary, image, args, mode, core))
+            finally:
+                free.put(core)
+
+        with concurrent.futures.ThreadPoolExecutor(jobs) as pool:
+            for future in [pool.submit(work, n) for n in pending]:
+                future.result()
+    save()
     return results
 
 
@@ -403,20 +511,29 @@ def main():
     parser.add_argument("--output", type=Path, default=ROOT / "build/cpu-matrix")
     parser.add_argument("--all-speeds", action="store_true", help="every CPU-table entry, not one per family")
     parser.add_argument("--define", action="append", default=[], help="enabled source-table preprocessor option")
-    parser.add_argument("--run", action="store_true", help="execute selected configurations sequentially")
+    parser.add_argument("--run", action="store_true", help="execute selected configurations (see --jobs)")
     parser.add_argument("--mode", choices=("accuracy", "benchmark"), default="accuracy",
                         help="matrix run mode; benchmarks require a BENCHMARKS=1 image")
     parser.add_argument("--family", action="append", default=[], help="select a family; repeatable")
     parser.add_argument("--engine", choices=("on", "off"), help="select requested dynarec mode")
     parser.add_argument("--fpu-backend", choices=("auto", "host", "softfloat", "both"), default="auto")
     parser.add_argument("--image", type=Path, default=ROOT / "floppy.img")
-    parser.add_argument("--emulator", type=Path, default=ROOT.parent / "86Box/build/src/86Box")
+    parser.add_argument("--emulator", help=f"86Box binary for --run (default ${EMULATOR_ENVIRONMENT})")
     parser.add_argument("--rompath", type=Path)
     parser.add_argument("--wall-seconds", type=float, default=1800)
+    parser.add_argument("--jobs", type=int, default=1,
+                        help="configurations to run at once, each pinned to its own --cores CPU")
+    parser.add_argument("--cores", type=cores_list,
+                        help="CPUs for the runners, e.g. 8-11,13 (needed with --jobs above 1)")
+    parser.add_argument("--resume", action="store_true",
+                        help="reuse --output's results.json: run only rows without a complete result")
     args = parser.parse_args()
     try:
-        if (args.output / "results.json").exists():
-            raise ValueError("output already contains execution results; choose a fresh --output directory")
+        if (args.output / "results.json").exists() and not args.resume:
+            raise ValueError("output already contains execution results; choose a fresh --output "
+                             "directory or --resume")
+        if args.run:
+            args.emulator = emulator_path(args.emulator)
         if any(not re.fullmatch(r"[A-Z][A-Z0-9_]*", d) for d in args.define):
             raise ValueError("defines must be simple uppercase identifiers")
         cpus, boards, provenance = read_inventory(args.source, args.define)

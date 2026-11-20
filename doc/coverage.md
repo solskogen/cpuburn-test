@@ -107,7 +107,7 @@ selection with actual CPU identity checks:
 python3 tools/cpu_matrix.py --source ../86Box --output build/cpu-matrix
 python3 tools/cpu_matrix.py --source ../86Box --all-speeds --output build/cpu-matrix-all
 python3 tools/cpu_matrix.py --source ../86Box --output build/cpu-matrix-run \
-  --run --family pentium_p55c --family k6_2p --engine on
+  --run --family pentium_p55c --family k6_2p --engine on --emulator ../86Box/build/src/86Box
 ```
 
 Generation does not require ROMs or start VMs. Execution uses local ROMs,
