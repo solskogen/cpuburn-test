@@ -220,6 +220,98 @@ state, emulator information and host elapsed time. The runner requires this
 binary. `--expect DONE` checks completion, **not zero assertion failures**:
 inspect `serial.log` and `SUMMARY`.
 
+## Capacity comparisons and summary.json
+
+Guest `cyc`/`ms` per operation follow **emulated** time: in 86Box they show
+the emulator's timing model, not how much host work a test costs. For
+emulator performance work use **capacity**: guest seconds advanced per host
+CPU second of 86Box's emulation thread, × 100 (speed % per host CPU second),
+from `workload_capture` in the 86Box runner's `result.json`.
+
+`perf_report.py` prints and saves a `capacity` section for runner results:
+
+- Per sample, the leading quarter of its interior steps (at least one, for
+  four or more steps) is left out as warm-in; capacity is the remaining guest
+  ms over the remaining emulation-thread CPU seconds.
+- Per test, `median_percent` is the median over samples (rounds and
+  `--repeat` runs), and `ci95_percent` a two-level bootstrap interval:
+  samples are resampled, then each sample's steps in moving blocks of
+  ⌈√n⌉ consecutive steps, so correlated neighbouring steps do not make the
+  interval falsely narrow. `--bootstrap N` (default 1000) and `--seed`.
+- `rank` orders the suite's tests from 1 (lowest capacity) up; `z` is the
+  test's log capacity standardised against the suite's tests.
+- Results from before step series fall back to
+  `cpu_full_speed_capacity_percent` per sample, without an interval.
+
+Compare two binaries (A/B), each with several runs, and establish the noise
+floor first with the same binary twice (A/A):
+
+```sh
+python3 tools/run_86box.py --vm "/path/to/VM" --emulator ./86Box-old --aa --pin 13 \
+  --output-dir build/aa
+python3 tools/run_86box.py --vm "/path/to/VM" --emulator ./86Box-new --repeat 3 --pin 13 \
+  --output-dir build/new
+python3 tools/perf_report.py build/new/repeat-*/result.json \
+  --compare-capacity build/aa/repeat-*/result.json \
+  --noise-floor build/aa/summary.json --summary build/compare-summary.json
+```
+
+`--compare-capacity BASELINE...` bootstraps current/baseline − 1 per test:
+**faster** when the 95% interval lies above `+floor` percent, **slower** when
+below `−floor`, otherwise **noise** (`missing_in_current`/`missing_in_baseline`
+when a test is absent). `--noise-floor` takes a percentage or a report or
+summary JSON holding an A/A floor; `--gate-capacity` exits 1 on any slower
+test. `--aa` (in `perf_report.py`, or `run_86box.py --aa`, which runs at least
+twice) compares even- against odd-numbered runs of one binary;
+`noise_floor_percent` is the 95th percentile of |change| over tests, and any
+A/B change smaller than that is not evidence. Keep host conditions equal
+(`--pin`, same governor; `host` and `host_state` are recorded).
+
+The runner writes `summary.json` into each run directory (and, with
+`--repeat`, one pooling all repeats in the parent); `perf_report.py --summary`
+writes the same format. It is meant for scripts and AI agents; fields that a
+guest image or option did not provide are `null`:
+
+```json
+{
+  "format": "cpuburn-summary/1",
+  "runs": 1, "directories": ["..."], "statuses": ["observed"],
+  "image_sha256": "...", "emulator_sha256": "...", "machine": {}, "host": {},
+  "cpu_scope": "emulation_thread_schedstat_ns",
+  "fpu_backend": "softfloat",
+  "capacity_definition": "...", "bootstrap_replicates": 1000,
+  "tests": [
+    {"name": "int_alu", "status": "PASS", "statuses": {"PASS": 2},
+     "capacity": {"median_percent": 412.5, "ci95_percent": [405.1, 420.3],
+                  "samples": 2, "steps": 37, "wall_median_percent": 398.0},
+     "rank": 1, "z": -1.2, "ipc": 1.9,
+     "tags": ["int", "alu"], "exc": 0, "irq": 312, "harness_cyc": 1840,
+     "fpu_backend": "softfloat",
+     "perf": {"samples": 4100, "jit_share": 0.71,
+              "top_symbols": [["codegen_timing_486", 310], ["[unknown] 0x7f3a1c2040", 95]]}}
+  ],
+  "compare": {"noise_floor_percent": 1.5, "counts": {"noise": 40, "slower": 1},
+              "tests": {"int_alu": {"current_percent": 412.5, "baseline_percent": 430.0,
+                                    "delta_percent": -4.1, "ci95_percent": [-5.0, -3.2],
+                                    "verdict": "slower"}}},
+  "noise_floor": {"noise_floor_percent": 1.5, "tests": {}}
+}
+```
+
+- `tests` is sorted by `rank` (slowest first); tests without capacity (SKIP,
+  accuracy-only images, `HANG`) follow by name.
+- `status` is the worst status seen over runs, in the order HANG, FAULT,
+  FAIL, PASS, SKIP; `statuses` counts each. `HANG` comes from the runner's
+  hang detector (`hangs` in `result.json`).
+- `tags`, `exc`, `irq` and `harness_cyc` are the `TEST` record's `tags=`,
+  `exc=`, `irq=` and `harness_cyc=` fields, when the image prints them.
+- `fpu_backend` comes from `FPUPROBE backend=...` lines (per test when the
+  line names one, otherwise for the whole run).
+- `perf` is present only with `--perf`: samples, `jit_share` (leaf in
+  generated code) and the ten top leaf symbols. `ipc` needs `--perf-stat`.
+- `compare` is present only with `--compare-capacity`, `noise_floor` only
+  with an A/A run.
+
 ## Interpreting emulator differences
 
 QEMU TCG and 86Box are not correctness oracles for each other. For example,
