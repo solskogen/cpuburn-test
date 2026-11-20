@@ -24,23 +24,18 @@ static u32 width_mask(u32 width) {
 }
 
 static u32 result_flags(u32 value, u32 width) {
-    u32 parity = 0;
-    for (u32 bit = 0; bit < 8; bit++) parity ^= (value >> bit) & 1;
-    return (parity ? 0 : C_PF) | (value ? 0 : C_ZF) |
+    u32 parity = value & 0xff;
+    parity ^= parity >> 4; parity ^= parity >> 2; parity ^= parity >> 1;
+    return ((parity & 1) ? 0 : C_PF) | (value ? 0 : C_ZF) |
            ((value >> (width - 1)) ? C_SF : 0);
 }
 
-/* Bit-serial arithmetic deliberately avoids using the instruction under test
- * as the reference for its result and carry/borrow. */
-static u32 add_bits(u32 a, u32 b, u32 cin, u32 width, u32 *carry) {
-    u32 result = 0, c = cin;
-    for (u32 bit = 0; bit < width; bit++) {
-        u32 x = (a >> bit) & 1, y = (b >> bit) & 1;
-        result |= (x ^ y ^ c) << bit;
-        c = (x & y) | (x & c) | (y & c);
-    }
-    *carry = c;
-    return result;
+/* The carry out comes from a 64-bit sum, not from the flags of an
+ * instruction of the width under test. */
+static u32 add_carry(u32 a, u32 b, u32 cin, u32 width, u32 *carry) {
+    u64 t = (u64)a + b + cin;
+    *carry = (u32)(t >> width) & 1;
+    return (u32)t & width_mask(width);
 }
 
 static void reference(snapshot_t *s, u32 *defined, instruction_t ins) {
@@ -55,7 +50,7 @@ static void reference(snapshot_t *s, u32 *defined, instruction_t ins) {
         else {
             u32 cin = (ins.op == 2 || ins.op == 3) ? old_cf : 0;
             if (ins.op == 11 || ins.op == 12) b = 1;
-            r = add_bits(a, sub ? (~b & mask) : b, sub ? !cin : cin, w, &carry);
+            r = add_carry(a, sub ? (~b & mask) : b, sub ? !cin : cin, w, &carry);
             if (sub) carry = !carry;
             overflow = (sub ? (a ^ b) : ~(a ^ b)) & (a ^ r) & sign;
         }
@@ -119,24 +114,25 @@ static void emit_snapshot(u8 **p, snapshot_t *output) {
     byte(p, 0xA3); dword(p, (u32)&output->flags); byte(p, 0x58);
 }
 
-static void synchronize(void) {
-    if (cpu.has_cpuid) {
-        u32 a, b, c, d;
-        cpuid(0, &a, &b, &c, &d);
-    } else __asm__ volatile("jmp 1f\n1:" ::: "memory");
-}
+/* A jump after the stores that wrote the code: what the 486 needs before it
+ * runs code just written (CPUID would end the block and is not compiled). */
+static void synchronize(void) { __asm__ volatile("jmp 1f\n1:" ::: "memory"); }
 
-static u32 instruction_corpus(void) {
-    u8 *storage = arena_alloc(8192, 4096);
-    if (!storage) SKIP("instruction corpus needs 8 KiB owned arena");
+/* Generates blocks of 32 random ALU instructions with four snapshots and
+ * runs each `runs` times. Block b goes at byte b&63 of slot b%slots, each
+ * slot slot_bytes long (0: every block in the same place). */
+static u32 corpus_run(u32 blocks, u32 runs, u32 slots, u32 slot_bytes) {
+    u32 storage_bytes = slot_bytes ? slots * slot_bytes : 8192;
+    u8 *storage = arena_alloc(storage_bytes, 4096);
+    if (!storage) SKIP("instruction corpus needs owned arena for its code");
     snapshot_t actual[C_POINTS], expected[C_POINTS], state;
     instruction_t sequence[C_LENGTH];
     u32 masks[C_POINTS], initial[4], rng = TEST_SEED, checksum = 0;
     u32 coverage[13][3] = {{0}};
-    const u32 blocks = HEAVY_SCALE * 2048u, reuses = 8;
     for (u32 block = 0; block < blocks; block++) {
         u32 vector_seed = rng, defined = C_FLAGS;
-        u8 *code = storage + (block & 63), *p = code;
+        u8 *slot = storage + (block % slots) * slot_bytes;
+        u8 *code = slot + (block & 63), *p = code;
         byte(&p, 0x9C); byte(&p, 0x53);
         for (u32 reg = 0; reg < 4; reg++) {
             initial[reg] = state.reg[reg] = next(&rng);
@@ -163,17 +159,17 @@ static u32 instruction_corpus(void) {
             }
         }
         byte(&p, 0x5B); byte(&p, 0x9D); byte(&p, 0xC3);
-        CHECK((u32)(p - storage) < 8192);
+        CHECK((u32)(p - slot) <= (slot_bytes ? slot_bytes : storage_bytes));
         synchronize();
-        for (u32 reuse = 0; reuse < reuses; reuse++) {
+        for (u32 run = 0; run < runs; run++) {
             ((void (*)(void))code)();
             for (u32 point = 0; point < C_POINTS; point++) {
                 int bad = ((actual[point].flags ^ expected[point].flags) & masks[point]) != 0;
                 for (u32 reg = 0; reg < 4; reg++)
                     bad |= actual[point].reg[reg] != expected[point].reg[reg];
                 if (bad) {
-                    t_note("seed=%08x vector_seed=%08x block=%u reuse=%u point=%u offset=%u flags=%08x/%08x mask=%08x",
-                           (u32)TEST_SEED, vector_seed, block, reuse, point,
+                    t_note("seed=%08x vector_seed=%08x block=%u run=%u point=%u slot=%u offset=%u flags=%08x/%08x mask=%08x",
+                           (u32)TEST_SEED, vector_seed, block, run, point, block % slots,
                            block & 63, actual[point].flags, expected[point].flags, masks[point]);
                     for (u32 reg = 0; reg < 4; reg++)
                         t_note("reg=%u initial=%08x got=%08x want=%08x", reg, initial[reg],
@@ -181,22 +177,32 @@ static u32 instruction_corpus(void) {
                     for (u32 i = 0; i <= point * 8 + 7; i++)
                         t_note("instruction=%u group=%u reg=%u width=%u operand=%08x",
                                i, sequence[i].op, sequence[i].reg, sequence[i].width, sequence[i].operand);
-                    t_fail("generated instruction sequence differs from bit-serial reference", __LINE__);
+                    t_fail("generated instruction sequence differs from reference", __LINE__);
                     return checksum;
                 }
             }
         }
         checksum = csum_mix(checksum, actual[C_POINTS - 1].reg[0]);
-        t_ops(C_LENGTH * reuses);
     }
     for (u32 op = 0; op < 13; op++)
         for (u32 width = 0; width < 3; width++) CHECK(coverage[op][width] != 0);
-    t_note("seed=%08x blocks=%u instructions_per_block=%u reuses=%u checkpoints=4 widths=8/16/32 groups=13 offsets=0..63 defined_flags_only=1",
-           (u32)TEST_SEED, blocks, C_LENGTH, reuses);
+    t_note("seed=%08x blocks=%u instructions_per_block=%u runs=%u slots=%u slot_bytes=%u checkpoints=4 widths=8/16/32 groups=13 offsets=0..63 defined_flags_only=1",
+           (u32)TEST_SEED, blocks, C_LENGTH, runs, slots, slot_bytes);
+    t_work_unit("generated_instruction");
+    t_ops((u64)blocks * runs * C_LENGTH);
     return checksum;
 }
 
+/* Each block in its own place in a 128 KiB ring and run 64 times, enough to
+ * pay for compiling it: generated code as a JIT makes it. */
+static u32 corpus_integer_sequences(void) { return corpus_run(HEAVY_SCALE * 256u, 64, 256, 512); }
+/* Every block in the same 8 KiB page, at one of 64 offsets, and run only 8
+ * times before the next overwrites it: code regenerated faster than a
+ * recompiler that waits for 8 runs (86Box) pays for compiling it. */
+static u32 corpus_integer_regen(void) { return corpus_run(HEAVY_SCALE * 2048u, 8, 1, 0); }
+
 const test_t tests_corpus[] = {
-    {"corpus_integer_sequences", instruction_corpus, REQ_486},
+    {"corpus_integer_sequences", corpus_integer_sequences, REQ_486},
+    {"corpus_integer_regen", corpus_integer_regen, REQ_486},
     {0, 0, 0}
 };
